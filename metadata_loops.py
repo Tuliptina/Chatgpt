@@ -17,7 +17,6 @@ TOKEN SAVINGS:
 """
 
 import os
-
 import json
 import re
 import hashlib
@@ -244,18 +243,22 @@ class MetadataExtractor:
     
     def extract_smart(self, content: str, category: str = "general") -> MetadataToken:
         """
-        Smart extraction using GPT-4o.
+        Smart extraction using GPT-4o and Native JSON Mode.
         More accurate but costs ~$0.001 per extraction.
         """
         if not self.openrouter_key:
             return self.extract_simple(content, category)
         
-        prompt = f"""Extract metadata from this text. Return ONLY JSON:
+        prompt = f"""Extract metadata from this text.
 
-TEXT: {content}
+TEXT: {content[:4000]}
 
-Return JSON:
-{{"keywords": ["max 5 key terms"], "summary": "max 15 word summary", "importance": 0.0-1.0}}"""
+Return ONLY a JSON object with this exact structure:
+{{
+  "keywords": ["max 5 key terms"],
+  "summary": "max 15 word summary",
+  "importance": 0.8
+}}"""
 
         try:
             response = requests.post(
@@ -268,7 +271,8 @@ Return JSON:
                     "model": "openai/gpt-4o-2024-11-20",  # Nov 2024 version - $2.5/M tokens
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.1,
-                    "max_tokens": 150
+                    "max_tokens": 150,
+                    "response_format": {"type": "json_object"}  # NATIVE JSON MODE
                 },
                 timeout=10
             )
@@ -277,15 +281,10 @@ Return JSON:
                 return self.extract_simple(content, category)
             
             data = response.json()
-            raw = data["choices"][0]["message"]["content"].strip()
+            raw = data["choices"][0]["message"]["content"]
             
-            # Parse JSON
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            
-            parsed = json.loads(raw.strip())
+            # Safe JSON parsing without regex
+            parsed = json.loads(raw)
             
             content_hash = hashlib.md5(content.encode()).hexdigest()[:8]
             
@@ -541,8 +540,6 @@ class LoopManager:
                     base_relevance = 0.0
                 
                 # === Boost: if ANY query word is a character/proper noun in full content ===
-                # This catches related memories (e.g. query mentions a character name →
-                # boost all memories that mention that character even if other keywords don't match)
                 if full_content_words:
                     for qw in query_words:
                         if len(qw) >= 4 and qw in full_content_words:
