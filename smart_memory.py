@@ -15,8 +15,8 @@ Query Types:
 """
 
 import os
-
 import re
+import tiktoken
 from typing import Tuple, List
 from dataclasses import dataclass
 from enum import Enum
@@ -88,8 +88,8 @@ class SmartMemory:
         r'\b(scene|chapter|dialogue|conversation|story|poem|script)\b',
     ]
     
-    # Named entity indicators (proper nouns, character names)
-    NAME_PATTERN = r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b'
+    # Named entity indicators (forces at least TWO capitalized words to avoid false positives like "Apple")
+    NAME_PATTERN = r'\b[A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b'
     
     def __init__(self):
         # Compile patterns for speed
@@ -314,12 +314,17 @@ class ContextWindowManager:
     
     def estimate_tokens(self, text: str) -> int:
         """
-        Estimate token count from text.
-        GPT-4o: ~1 token per 4 characters
+        Estimate token count accurately using tiktoken for GPT-4o.
         """
         if not text:
             return 0
-        return len(text) // 4
+        try:
+            # Use the specific encoding for GPT-4o
+            encoding = tiktoken.get_encoding("o200k_base")
+            return len(encoding.encode(text))
+        except Exception:
+            # Fallback if tiktoken fails
+            return len(text) // 4
     
     def estimate_messages_tokens(self, messages: List[dict]) -> int:
         """Estimate tokens for a list of messages"""
@@ -340,7 +345,7 @@ class ContextWindowManager:
         if estimated <= max_tokens:
             return text
         
-        # Calculate character limit
+        # Calculate character limit (rough fallback if tiktoken isn't strictly mapping 1:1 in reverse)
         char_limit = max_tokens * 4
         
         # Truncate with indicator
