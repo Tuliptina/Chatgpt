@@ -1,5 +1,8 @@
 streamlit
 requests
+httpx
+nest_asyncio
+pypdf
+tiktoken
 numpy
-PyPDF2
 python-docx
