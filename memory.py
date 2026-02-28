@@ -14,9 +14,24 @@ Layer 2: Cross-Session Memory (persistent, Mnemo or local vector storage)
 import json
 import os
 import numpy as np
+import tiktoken
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 import requests
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def estimate_tokens(text: str) -> int:
+    """Accurately estimate token count using GPT-4o's encoding."""
+    if not text:
+        return 0
+    try:
+        encoding = tiktoken.get_encoding("o200k_base")
+        return len(encoding.encode(text))
+    except Exception:
+        return len(text) // 4
 
 
 # =============================================================================
@@ -249,8 +264,9 @@ class EmbeddingProvider:
     def _hf_embedding(self, text: str) -> Optional[List[float]]:
         """Get embedding from HuggingFace Inference API"""
         try:
+            # UPDATED: Use the correct API inference feature extraction pipeline endpoint
             response = requests.post(
-                f"https://router.huggingface.co/hf-inference/models/{self.hf_model}",
+                f"https://api-inference.huggingface.co/pipeline/feature-extraction/{self.hf_model}",
                 headers={
                     "Authorization": f"Bearer {self.hf_key}",
                     "Content-Type": "application/json"
@@ -322,12 +338,10 @@ class ContextMemory:
         return self.summary, recent
     
     def get_token_estimate(self) -> int:
-        """Estimate tokens used by context"""
-        summary_tokens = len(self.summary) // 4
-        recent_tokens = sum(
-            len(ex["user"]) + len(ex["assistant"]) 
-            for ex in self.exchanges[-self.window_size:]
-        ) // 4
+        """Estimate tokens used by context (Updated to use Tiktoken)"""
+        summary_tokens = estimate_tokens(self.summary)
+        recent_text = " ".join([ex["user"] + " " + ex["assistant"] for ex in self.exchanges[-self.window_size:]])
+        recent_tokens = estimate_tokens(recent_text)
         return summary_tokens + recent_tokens
     
     def clear(self):
@@ -603,9 +617,10 @@ class TwoLayerMemory:
         return summary, recent_messages, cross_session_context
     
     def get_token_estimate(self) -> Dict:
-        """Estimate tokens for both layers"""
+        """Estimate tokens for both layers (Updated to use Tiktoken)"""
         context_tokens = self.context_memory.get_token_estimate()
-        cross_tokens = len(self.cross_session.retrieve("test")) // 4 if self.cross_session.enabled else 0
+        cross_text = self.cross_session.retrieve("test") if self.cross_session.enabled else ""
+        cross_tokens = estimate_tokens(cross_text)
         return {
             "context_memory": context_tokens,
             "cross_session": cross_tokens,
@@ -700,7 +715,7 @@ class MnemoMemoryManager:
         
         context_meta = {
             "cross_session_memories_used": memories_used,
-            "context_tokens_estimate": self.memory.context_memory.get_token_estimate() + len(cross_session_context) // 4,
+            "context_tokens_estimate": self.memory.context_memory.get_token_estimate() + estimate_tokens(cross_session_context),
             "has_summary": bool(summary),
             "mnemo_available": self.memory.mnemo.available
         }
