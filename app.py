@@ -9,6 +9,7 @@ Features:
 - NEW: Session Management (New Chat, Previous Sessions)
 - NEW: File Upload with Memory Extraction (Async + pypdf)
 - NEW: Native JSON Structured Outputs
+- NEW: Native Streamlit Dialog Modals (@st.dialog)
 """
 
 import streamlit as st
@@ -30,9 +31,7 @@ from context_engine import ContextEngine, store_with_context
 # CONFIGURATION
 # ============================================================================
 
-# API Keys - Load from Streamlit Secrets (NEVER hardcode!)
 def get_secret(key, default=""):
-    """Get secret from Streamlit Cloud or environment variable"""
     try:
         if hasattr(st, 'secrets') and key in st.secrets:
             return st.secrets[key]
@@ -78,6 +77,7 @@ When the user asks you to WRITE creatively (scenes, chapters, dialogue, prose):
 When in doubt about which mode: ask the user.
 
 Always acknowledge context from memory naturally."""
+
 
 # ============================================================================
 # SESSION MANAGEMENT (Persistent via Mnemo)
@@ -207,6 +207,55 @@ def delete_session(session_id):
             storage.delete_session(session_id)
     except Exception:
         pass
+
+
+# ============================================================================
+# NATIVE STREAMLIT DIALOGS
+# ============================================================================
+
+@st.dialog("Rename Session")
+def rename_session_dialog(session_id, current_title):
+    new_name = st.text_input("New name:", value=current_title, key=f"rename_input_{session_id}")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("💾 Save", use_container_width=True):
+            if new_name and new_name.strip():
+                if "custom_titles" not in st.session_state:
+                    st.session_state.custom_titles = {}
+                st.session_state.custom_titles[session_id] = new_name.strip()
+                for s in st.session_state.session_history:
+                    if s.get("id") == session_id:
+                        s["title"] = new_name.strip()
+                        break
+                save_current_session()
+            st.rerun()
+    with col2:
+        if st.button("❌ Cancel", use_container_width=True):
+            st.rerun()
+
+@st.dialog("Move Session")
+def move_session_dialog(session_id):
+    folders = list(st.session_state.session_folders.keys())
+    target_folder = st.selectbox("Move to:", folders, key=f"move_target_{session_id}")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("📂 Move", use_container_width=True):
+            for f in st.session_state.session_folders:
+                if session_id in st.session_state.session_folders[f]:
+                    st.session_state.session_folders[f].remove(session_id)
+            st.session_state.session_folders[target_folder].append(session_id)
+            st.rerun()
+    with col2:
+        if st.button("❌ Cancel", use_container_width=True):
+            st.rerun()
+
+@st.dialog("Copy Response")
+def copy_response_dialog(content):
+    st.markdown("**📋 Copy this text:**")
+    st.code(content, language=None)
+    if st.button("✅ Done", use_container_width=True):
+        st.rerun()
+
 
 # ============================================================================
 # FILE PROCESSING (Async + pypdf)
@@ -667,24 +716,26 @@ def main():
             st.session_state.session_folders = {"📁 Default": []}
         
         with st.expander("📂 Manage Folders", expanded=False):
-            new_folder = st.text_input("New folder name", key="new_folder_input", placeholder="e.g., Story Ideas")
-            if st.button("➕ Create Folder", key="create_folder"):
-                if new_folder and new_folder.strip():
-                    folder_name = f"📁 {new_folder.strip()}"
-                    if folder_name not in st.session_state.session_folders:
-                        st.session_state.session_folders[folder_name] = []
-                        st.success(f"Created {folder_name}")
-                        st.rerun()
+            with st.popover("➕ Create Folder"):
+                new_folder = st.text_input("New folder name", placeholder="e.g., Story Ideas")
+                if st.button("Create", use_container_width=True):
+                    if new_folder and new_folder.strip():
+                        folder_name = f"📁 {new_folder.strip()}"
+                        if folder_name not in st.session_state.session_folders:
+                            st.session_state.session_folders[folder_name] = []
+                            st.success(f"Created {folder_name}")
+                            st.rerun()
             
             folders = list(st.session_state.session_folders.keys())
             if len(folders) > 1:
-                folder_to_delete = st.selectbox("Delete folder", [""] + [f for f in folders if f != "📁 Default"], key="del_folder")
-                if folder_to_delete and st.button("🗑️ Delete Folder", key="delete_folder_btn"):
-                    st.session_state.session_folders["📁 Default"].extend(
-                        st.session_state.session_folders.get(folder_to_delete, [])
-                    )
-                    del st.session_state.session_folders[folder_to_delete]
-                    st.rerun()
+                with st.popover("🗑️ Delete Folder"):
+                    folder_to_delete = st.selectbox("Delete folder", [""] + [f for f in folders if f != "📁 Default"])
+                    if folder_to_delete and st.button("Delete", type="primary", use_container_width=True):
+                        st.session_state.session_folders["📁 Default"].extend(
+                            st.session_state.session_folders.get(folder_to_delete, [])
+                        )
+                        del st.session_state.session_folders[folder_to_delete]
+                        st.rerun()
         
         sessions = st.session_state.get("session_history", [])
         
@@ -720,63 +771,18 @@ def main():
                                     load_session(session_id)
                                     st.rerun()
                             with col2:
+                                # Trigger Rename Dialog
                                 if st.button("✏️", key=f"rename_{session_id}", help="Rename"):
-                                    st.session_state.renaming_session = session_id
-                                    st.rerun()
+                                    rename_session_dialog(session_id, title)
                             with col3:
+                                # Trigger Move Dialog
                                 if st.button("📂", key=f"move_{session_id}", help="Move to folder"):
-                                    st.session_state.moving_session = session_id
-                                    st.rerun()
+                                    move_session_dialog(session_id)
                             with col4:
                                 if st.button("🗑️", key=f"del_{session_id}"):
                                     delete_session(session_id)
                                     st.rerun()
                         st.caption("")
-                
-                if st.session_state.get("renaming_session"):
-                    sid = st.session_state.renaming_session
-                    current_title = next((s.get("title", "New Chat") for s in st.session_state.session_history if s.get("id") == sid), "New Chat")
-                    with st.container():
-                        st.markdown("---")
-                        new_name = st.text_input("New name:", value=current_title, key="rename_input")
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            if st.button("💾 Save", key="save_rename", use_container_width=True):
-                                if new_name and new_name.strip():
-                                    if "custom_titles" not in st.session_state:
-                                        st.session_state.custom_titles = {}
-                                    st.session_state.custom_titles[sid] = new_name.strip()
-                                    for s in st.session_state.session_history:
-                                        if s.get("id") == sid:
-                                            s["title"] = new_name.strip()
-                                            break
-                                    save_current_session()
-                                st.session_state.renaming_session = None
-                                st.rerun()
-                        with col2:
-                            if st.button("❌ Cancel", key="cancel_rename", use_container_width=True):
-                                st.session_state.renaming_session = None
-                                st.rerun()
-                
-                if st.session_state.get("moving_session"):
-                    sid = st.session_state.moving_session
-                    with st.container():
-                        st.markdown("---")
-                        folders = list(st.session_state.session_folders.keys())
-                        target_folder = st.selectbox("Move to:", folders, key="move_target")
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            if st.button("📂 Move", key="confirm_move"):
-                                for f in st.session_state.session_folders:
-                                    if sid in st.session_state.session_folders[f]:
-                                        st.session_state.session_folders[f].remove(sid)
-                                st.session_state.session_folders[target_folder].append(sid)
-                                st.session_state.moving_session = None
-                                st.rerun()
-                        with col2:
-                            if st.button("❌ Cancel", key="cancel_move"):
-                                st.session_state.moving_session = None
-                                st.rerun()
             else:
                 st.caption("No previous sessions")
         
@@ -1078,19 +1084,9 @@ def main():
                         if memory_info:
                             st.caption(" | ".join(memory_info))
                 with col2:
+                    # Trigger Copy Dialog natively instead of managing session state blocks
                     if st.button("📋", key=f"copy_{idx}", help="Copy response"):
-                        st.session_state.show_copy_modal = idx
-                        st.session_state.copy_content = message["content"]
-    
-    if st.session_state.get("show_copy_modal") is not None:
-        with st.container():
-            st.markdown("---")
-            st.markdown("**📋 Copy this text:**")
-            st.code(st.session_state.copy_content, language=None)
-            if st.button("✅ Done", key="close_copy"):
-                st.session_state.show_copy_modal = None
-                st.session_state.copy_content = None
-                st.rerun()
+                        copy_response_dialog(message["content"])
     
     if prompt := st.chat_input("What's on your mind?"):
         st.session_state.messages.append({"role": "user", "content": prompt})
