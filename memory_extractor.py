@@ -6,7 +6,6 @@ and store them in Mnemo memory system.
 """
 
 import os
-
 import requests
 import json
 from typing import List, Dict, Optional
@@ -51,10 +50,14 @@ Rules:
 3. Each fact should be self-contained
 4. Skip generic/obvious statements
 
-Return ONLY a JSON array:
-[{{"category": "CHARACTER", "content": "description"}}, ...]
+Return ONLY a JSON object containing an array called "memories". Example format:
+{{
+  "memories": [
+    {{"category": "CHARACTER", "content": "description"}}
+  ]
+}}
 
-If nothing important to extract, return: []"""
+If nothing important to extract, return: {{"memories": []}}"""
 
         try:
             response = requests.post(
@@ -68,12 +71,13 @@ If nothing important to extract, return: []"""
                     "messages": [
                         {
                             "role": "system", 
-                            "content": "You extract important facts from creative writing conversations. Return ONLY valid JSON arrays. No explanations."
+                            "content": "You extract important facts from creative writing conversations. Return ONLY a valid JSON object. No explanations."
                         },
                         {"role": "user", "content": extraction_prompt}
                     ],
                     "temperature": 0.2,
-                    "max_tokens": 1000
+                    "max_tokens": 1000,
+                    "response_format": {"type": "json_object"} # NATIVE JSON MODE
                 },
                 timeout=30
             )
@@ -82,16 +86,11 @@ If nothing important to extract, return: []"""
                 return []
             
             data = response.json()
-            raw = data["choices"][0]["message"]["content"].strip()
+            raw = data["choices"][0]["message"]["content"]
             
-            # Clean markdown code blocks if present
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            raw = raw.strip()
-            
-            memories = json.loads(raw)
+            # Direct JSON loading - no more regex or string splitting needed!
+            parsed = json.loads(raw)
+            memories = parsed.get("memories", [])
             return memories if isinstance(memories, list) else []
             
         except Exception as e:
@@ -211,7 +210,9 @@ User: I want to add a new character - Dr. Clara Hendricks, a rogue physicist who
 """
     
     print(f"Test conversation length: {len(test_conv)} chars")
-    memories = extractor.extract_memories(test_conv, session_id="test_session")
+    
+    # Removed the invalid session_id keyword argument from the test call
+    memories = extractor.extract_memories(test_conv)
     print(f"Extracted {len(memories)} memories")
     for mem in memories:
         print(f"  - {mem}")
