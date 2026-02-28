@@ -1,7 +1,7 @@
-import os
 #!/usr/bin/env python3
 """Test auto memory extraction feature"""
 
+import os
 import requests
 import json
 
@@ -23,53 +23,56 @@ def extract_memories_with_gpt(conversation):
 CONVERSATION:
 """ + conversation + """
 
-Extract facts as JSON array with category and content:
+Extract facts in these categories:
 - CHARACTER: Names, traits, relationships
 - PLOT: Events, twists, conflicts  
 - SETTING: Locations, time periods
 - THEME: Themes, symbols
 - STYLE: Writing preferences
 
-Return ONLY valid JSON: [{"category": "...", "content": "..."}]
-If nothing to extract, return: []"""
+Return ONLY a valid JSON object containing an array called "memories". Example format:
+{"memories": [{"category": "CHARACTER", "content": "description"}]}
 
-    response = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_KEY}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model": "openai/gpt-4o-2024-11-20",
-            "messages": [
-                {"role": "system", "content": "Extract facts as JSON. No explanations."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.2,
-            "max_tokens": 1000
-        },
-        timeout=30
-    )
-    
-    data = response.json()
-    usage = data.get("usage", {})
-    cost = (usage.get("prompt_tokens", 0) * 2.5 + usage.get("completion_tokens", 0) * 15) / 1_000_000
-    
-    raw = data["choices"][0]["message"]["content"].strip()
-    
-    # Clean markdown
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    raw = raw.strip()
-    
+If nothing to extract, return: {"memories": []}"""
+
     try:
-        memories = json.loads(raw)
-        return memories, cost
-    except Exception:
-        print(f"Parse error: {raw[:200]}")
-        return [], cost
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "openai/gpt-4o-2024-11-20",
+                "messages": [
+                    {"role": "system", "content": "Extract facts as a JSON object. No explanations."},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.2,
+                "max_tokens": 1000,
+                "response_format": {"type": "json_object"}  # NATIVE JSON MODE
+            },
+            timeout=30
+        )
+        
+        if response.status_code != 200:
+            print(f"API Error: {response.status_code} - {response.text}")
+            return [], 0.0
+            
+        data = response.json()
+        usage = data.get("usage", {})
+        cost = (usage.get("prompt_tokens", 0) * 2.5 + usage.get("completion_tokens", 0) * 15) / 1_000_000
+        
+        raw = data["choices"][0]["message"]["content"]
+        
+        # Direct JSON loading - no more regex or string splitting needed!
+        parsed = json.loads(raw)
+        memories = parsed.get("memories", [])
+        return memories if isinstance(memories, list) else [], cost
+        
+    except Exception as e:
+        print(f"Extraction error: {e}")
+        return [], 0.0
 
 
 def store_in_mnemo(memories):
