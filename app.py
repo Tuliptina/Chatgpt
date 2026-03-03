@@ -25,7 +25,7 @@ from memory import MnemoMemoryManager
 from metadata_loops import LoopManager, LoopConfig
 from smart_memory import SmartMemory, ContextWindowManager
 from persistent_storage import PersistentStorage
-from context_engine import ContextEngine, store_with_context
+from context_engine import ContextEngine
 
 # ============================================================================
 # CONFIGURATION
@@ -416,41 +416,6 @@ def extract_memories_from_file(content, filename, openrouter_key, hf_key):
     
     return unique_memories, total_cost
 
-def store_file_memories(memories, hf_key, session_id=None):
-    stored = 0
-    headers = {
-        "Authorization": f"Bearer {hf_key}",
-        "Content-Type": "application/json"
-    }
-    
-    for mem in memories:
-        try:
-            category = mem.get("category", "FACT").upper()
-            content = mem.get("content", "")
-            
-            if not content:
-                continue
-            
-            metadata = {"category": category, "source": "file_upload"}
-            if session_id:
-                metadata["session_id"] = session_id
-            
-            response = requests.post(
-                f"{MNEMO_URL}/add",
-                headers=headers,
-                json={
-                    "content": f"[{category}] {content}",
-                    "metadata": metadata
-                },
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                stored += 1
-        except Exception:
-            continue
-    
-    return stored
 
 # ============================================================================
 # MEMORY EXTRACTION (from conversations)
@@ -511,7 +476,7 @@ Return ONLY a JSON object containing an array called "memories". Example format:
     except Exception:
         return [], 0
 
-def store_memories_in_mnemo(memories, hf_key, session_id=None):
+def store_memories_in_mnemo(memories, hf_key, session_id=None, source=None):
     stored = 0
     headers = {
         "Authorization": f"Bearer {hf_key}",
@@ -529,6 +494,8 @@ def store_memories_in_mnemo(memories, hf_key, session_id=None):
             metadata = {"category": category}
             if session_id:
                 metadata["session_id"] = session_id
+            if source:
+                metadata["source"] = source
             
             response = requests.post(
                 f"{MNEMO_URL}/add",
@@ -810,7 +777,7 @@ def main():
                         if memories:
                             with st.spinner("Storing to memory loops..."):
                                 current_session = st.session_state.get("current_session_id")
-                                stored = store_file_memories(memories, hf_key, session_id=current_session)
+                                stored = store_memories_in_mnemo(memories, hf_key, session_id=current_session, source="file_upload")
                             
                             facts = [m for m in memories if m.get("category") in ("CHARACTER", "PLOT", "SETTING", "THEME", "FACT")]
                             context = [m for m in memories if m.get("category") in ("CONTEXT", "CLARIFICATION", "RELATIONSHIP", "INSTRUCTION")]
@@ -976,39 +943,9 @@ def main():
         
         st.divider()
         
-        with st.expander("🏥 Memory Health", expanded=False):
+        with st.expander("🧠 Memory Consolidation", expanded=False):
             if "context_engine" in st.session_state and "loop_manager" in st.session_state:
-                health = st.session_state.context_engine.degradation.get_health_report(st.session_state.loop_manager)
-                st.metric("Health", health['health_score'])
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.caption(f"📊 Items: {health['total_items']}")
-                    st.caption(f"🔍 Low relevance: {health['low_relevance_items']}")
-                with col2:
-                    st.caption(f"😴 Never accessed: {health['never_accessed_items']}")
-                    st.caption(f"🗑️ Prune candidates: {health['prune_candidates']}")
-                
-                if health['potential_duplicates'] > 0:
-                    st.caption(f"👯 Duplicates: {health['potential_duplicates']}")
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("🔄 Run Decay", use_container_width=True):
-                        result = st.session_state.context_engine.degradation.apply_decay(st.session_state.loop_manager)
-                        if result.get("skipped"):
-                            st.info(result.get("reason", "Skipped"))
-                        else:
-                            st.success(f"Decayed {result.get('decayed_items', 0)} items")
-                with col2:
-                    if st.button("🧹 Prune Stale", use_container_width=True):
-                        result = st.session_state.context_engine.degradation.prune_memories(st.session_state.loop_manager, dry_run=False)
-                        st.success(f"Pruned {result.get('pruned', 0)} items")
-                        st.rerun()
-                
-                st.markdown("---")
-                st.markdown("**🧠 Memory Consolidation**")
-                st.caption("Analyze memories & generate deep context")
+                st.caption("Analyze memories & generate deep context entries")
                 
                 last_consol = st.session_state.get("last_consolidation")
                 if last_consol:
@@ -1053,12 +990,6 @@ def main():
         st.session_state.context_manager = ContextWindowManager(loop_manager=st.session_state.loop_manager)
     else:
         st.session_state.context_manager.set_loop_manager(st.session_state.loop_manager)
-    
-    msg_count = len(st.session_state.get("messages", []))
-    if msg_count > 0 and msg_count % 50 == 0:
-        if "last_maintenance" not in st.session_state or st.session_state.last_maintenance != msg_count:
-            st.session_state.context_engine.maintenance(st.session_state.loop_manager, apply_decay=True, prune=False)
-            st.session_state.last_maintenance = msg_count
     
     st.session_state.memory_manager.toggle_cross_session(cross_session_enabled)
     
@@ -1165,8 +1096,6 @@ def main():
                 else:
                     cost_tracker = CostTracker()
                     msg_cost = cost_tracker.add_usage(input_tokens, output_tokens)
-                    
-                    st.session_state.memory_manager.process_turn(prompt, response)
                     
                     if not skip_loops_for_this_query:
                         try:
