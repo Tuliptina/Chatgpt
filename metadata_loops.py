@@ -16,6 +16,7 @@ import requests
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
+from mnemo_client import MnemoClient
 
 
 # =============================================================================
@@ -146,7 +147,7 @@ class MetadataLoop:
 # =============================================================================
 
 class MetadataExtractor:
-    """Extracts compressed metadata from full content."""
+    """Extracts compressed metadata from full content using GPT-4o."""
 
     def __init__(self, openrouter_key: str = None):
         self.openrouter_key = openrouter_key
@@ -215,7 +216,6 @@ class MetadataExtractor:
             return self.extract_simple(content, category)
 
 
-
 # =============================================================================
 # LOOP MANAGER
 # =============================================================================
@@ -223,23 +223,14 @@ class MetadataExtractor:
 class LoopManager:
     """
     Manages metadata loops for token-efficient context injection.
-
-    COST COMPARISON:
-    - Old method (summarize context): 500-2000 tokens per turn
-    - Loop method: 100-300 tokens per turn
-    - Savings: 60-85% token reduction!
+    Integrates securely with the Mnemo backend via MnemoClient.
     """
 
-    def __init__(self, openrouter_key: str = None, hf_key: str = None,
-                 mnemo_url: str = "https://athelaperk-mnemo-mcp.hf.space"):
+    def __init__(self, mnemo_client: MnemoClient, openrouter_key: str = None):
+        self.mnemo = mnemo_client
         self.openrouter_key = openrouter_key
-        self.hf_key = hf_key
-        self.mnemo_url = mnemo_url.rstrip('/')
-        self.headers = {
-            "Authorization": f"Bearer {hf_key}",
-            "Content-Type": "application/json"
-        }
         self.extractor = MetadataExtractor(openrouter_key)
+        
         self.loops: Dict[str, MetadataLoop] = {}
         self.content_cache: Dict[str, str] = {}
         self._MAX_CACHE_SIZE = 200
@@ -249,56 +240,9 @@ class LoopManager:
                 id=f"loop_{category}", name=category.title(), category=category
             )
 
-    # =========================================================================
-    # MNEMO INTEGRATION
-    # =========================================================================
-
-    def _mnemo_search(self, query: str, limit: int = 10) -> List[Dict]:
-        """Search Mnemo for relevant memories"""
-        try:
-            response = requests.post(
-                f"{self.mnemo_url}/search", headers=self.headers,
-                json={"query": query, "limit": limit}, timeout=10
-            )
-            if response.status_code == 200:
-                return response.json().get("results", [])
-            return []
-        except Exception:
-            return []
-
-    def _mnemo_get(self, memory_id: str) -> Optional[str]:
-        """Get full content from Mnemo"""
-        try:
-            response = requests.get(
-                f"{self.mnemo_url}/get/{memory_id}",
-                headers=self.headers, timeout=10
-            )
-            if response.status_code == 200:
-                return response.json().get("content", "")
-            return None
-        except Exception:
-            return None
-
-    def _mnemo_list(self) -> List[Dict]:
-        """List all memories"""
-        try:
-            response = requests.get(
-                f"{self.mnemo_url}/list",
-                headers=self.headers, timeout=10
-            )
-            if response.status_code == 200:
-                return response.json().get("memories", [])
-            return []
-        except Exception:
-            return []
-
-    # =========================================================================
-    # LOOP OPERATIONS
-    # =========================================================================
-
     def load_from_mnemo(self, use_smart_extraction: bool = False):
-        """Load memories from Mnemo and convert to metadata tokens."""
-        memories = self._mnemo_list()
+        """Load memories from Mnemo via MnemoClient and convert to metadata tokens."""
+        memories = self.mnemo.list_memories()
         for mem in memories:
             content = mem.get("content", "")
             mem_id = mem.get("id", "")
@@ -351,7 +295,6 @@ class LoopManager:
         return token
 
     def update_relevance(self, query: str):
-        """Update relevance scores for all tokens based on query."""
         raw_words = set(re.sub(r'[^\w\s]', '', query.lower()).split())
         query_words = raw_words - _STOPWORDS
         if not query_words:
@@ -359,35 +302,28 @@ class LoopManager:
 
         for loop in self.loops.values():
             for token in loop.tokens:
-                # Source 1: Keywords + category + summary
                 token_words = set(kw.lower() for kw in token.keywords)
                 token_words.add(token.category.lower())
                 summary_words = set(re.sub(r'[^\w\s]', '', token.summary.lower()).split())
                 token_words.update(summary_words)
 
-                # Source 2: Full content (if cached)
                 full_content_words = set()
                 if token.full_content_ref and token.full_content_ref in self.content_cache:
                     full_text = self.content_cache[token.full_content_ref].lower()
                     full_content_words = set(re.sub(r'[^\w\s]', '', full_text).split()) - _STOPWORDS
 
                 all_matchable = token_words | full_content_words
-
-                # Count matches (including partial/substring)
                 matches = 0
                 for qw in query_words:
-                    if len(qw) < 3:
-                        continue
+                    if len(qw) < 3: continue
                     for tw in all_matchable:
-                        if len(tw) < 3:
-                            continue
+                        if len(tw) < 3: continue
                         if qw == tw or (len(qw) >= 4 and qw in tw) or (len(tw) >= 4 and tw in qw):
                             matches += 1
                             break
 
                 base_relevance = min(1.0, matches / max(len(query_words), 1)) if query_words else 0.0
 
-                # Boost: character/proper noun in full content
                 if full_content_words:
                     for qw in query_words:
                         if len(qw) >= 4 and qw in full_content_words:
@@ -396,25 +332,11 @@ class LoopManager:
 
                 token.relevance = base_relevance
 
-    # =========================================================================
-    # CONTEXT BUILDING
-    # =========================================================================
-
     def build_context(self, query: str) -> Tuple[str, Dict]:
-        """
-        Build context for LLM injection using metadata loops.
-
-        High relevance (>0.45): Inject FULL content
-        Medium relevance (0.20-0.45): Inject metadata only
-        Low relevance (<0.20): Skip
-        """
         self.update_relevance(query)
 
         context_parts = []
-        metadata = {
-            "full_content_injected": 0, "metadata_injected": 0,
-            "tokens_estimated": 0, "loops_accessed": []
-        }
+        metadata = {"full_content_injected": 0, "metadata_injected": 0, "tokens_estimated": 0, "loops_accessed": []}
         full_content_tokens = 0
         metadata_tokens = 0
         high_relevance = []
@@ -422,23 +344,20 @@ class LoopManager:
 
         for loop in self.loops.values():
             for token in loop.tokens:
-                if token.relevance >= LoopConfig.RELEVANCE_THRESHOLD_FULL:
-                    high_relevance.append(token)
-                elif token.relevance >= LoopConfig.RELEVANCE_THRESHOLD_META:
-                    medium_relevance.append(token)
+                if token.relevance >= LoopConfig.RELEVANCE_THRESHOLD_FULL: high_relevance.append(token)
+                elif token.relevance >= LoopConfig.RELEVANCE_THRESHOLD_META: medium_relevance.append(token)
 
         high_relevance.sort(key=lambda t: t.relevance, reverse=True)
         medium_relevance.sort(key=lambda t: t.relevance, reverse=True)
 
-        # Inject full content for highest relevance (budget limited)
         if high_relevance:
             context_parts.append("[RELEVANT MEMORIES]")
             for token in high_relevance:
-                if full_content_tokens >= LoopConfig.FULL_CONTENT_TOKEN_BUDGET:
-                    break
+                if full_content_tokens >= LoopConfig.FULL_CONTENT_TOKEN_BUDGET: break
                 full_content = self.content_cache.get(token.full_content_ref, "")
                 if not full_content and token.full_content_ref:
-                    full_content = self._mnemo_get(token.full_content_ref) or ""
+                    # Fetches securely through the central MnemoClient
+                    full_content = self.mnemo.get_content(token.full_content_ref) or ""
                     if full_content:
                         self.content_cache[token.full_content_ref] = full_content
                 if full_content:
@@ -447,31 +366,21 @@ class LoopManager:
                     metadata["full_content_injected"] += 1
                     token.access_count += 1
 
-        # Inject metadata for medium relevance (budget limited)
         if medium_relevance:
             context_parts.append("\n[RELATED CONTEXT]")
             for token in medium_relevance:
-                if metadata_tokens >= LoopConfig.METADATA_TOKEN_BUDGET:
-                    break
+                if metadata_tokens >= LoopConfig.METADATA_TOKEN_BUDGET: break
                 meta_str = token.to_context_string()
                 context_parts.append(f"- {meta_str}")
                 metadata_tokens += token.estimate_tokens()
                 metadata["metadata_injected"] += 1
 
-        accessed_loops = set()
-        for token in high_relevance + medium_relevance:
-            accessed_loops.add(token.category)
-        metadata["loops_accessed"] = list(accessed_loops)
+        metadata["loops_accessed"] = list(set([t.category for t in high_relevance + medium_relevance]))
         metadata["tokens_estimated"] = full_content_tokens + metadata_tokens
 
         return "\n".join(context_parts) if context_parts else "", metadata
 
-    # =========================================================================
-    # STATISTICS
-    # =========================================================================
-
     def get_stats(self) -> Dict:
-        """Get loop system statistics"""
         total_tokens = 0
         total_items = 0
         loop_stats = {}
@@ -479,21 +388,17 @@ class LoopManager:
             loop_stats[loop_id] = {
                 "items": len(loop.tokens), "capacity": loop.capacity,
                 "usage": f"{len(loop.tokens)/loop.capacity*100:.1f}%",
-                "estimated_tokens": loop.estimate_tokens(),
-                "total_cycles": loop.total_cycles
+                "estimated_tokens": loop.estimate_tokens(), "total_cycles": loop.total_cycles
             }
             total_tokens += loop.estimate_tokens()
             total_items += len(loop.tokens)
 
         return {
             "total_loops": len(self.loops), "total_items": total_items,
-            "total_metadata_tokens": total_tokens,
-            "cached_full_content": len(self.content_cache),
+            "total_metadata_tokens": total_tokens, "cached_full_content": len(self.content_cache),
             "config": {
-                "metadata_budget": LoopConfig.METADATA_TOKEN_BUDGET,
-                "full_content_budget": LoopConfig.FULL_CONTENT_TOKEN_BUDGET,
-                "relevance_threshold_full": LoopConfig.RELEVANCE_THRESHOLD_FULL,
-                "relevance_threshold_meta": LoopConfig.RELEVANCE_THRESHOLD_META
+                "metadata_budget": LoopConfig.METADATA_TOKEN_BUDGET, "full_content_budget": LoopConfig.FULL_CONTENT_TOKEN_BUDGET,
+                "relevance_threshold_full": LoopConfig.RELEVANCE_THRESHOLD_FULL, "relevance_threshold_meta": LoopConfig.RELEVANCE_THRESHOLD_META
             },
             "loops": loop_stats
         }
