@@ -2,19 +2,16 @@
 Context Engine - Deep Context Generation and Memory Consolidation
 
 Two key features:
-1. RICH CONTEXT: Retrieve and format memories for LLM injection
+1. RICH CONTEXT: Retrieve and format memories for LLM injection via MnemoClient
 2. CONSOLIDATION: GPT-4o "sleep" pass that generates deep context entries
    (CONTEXT, RELATIONSHIP, CLARIFICATION, TIMELINE) from raw facts
-
-Previously included client-side decay/pruning/style extraction — all removed
-since Mnemo v4 handles decay/pruning server-side, and style extraction is
-handled by the file upload pipeline in app.py.
 """
 
 import json
 import requests
 from datetime import datetime
 from typing import List, Dict, Tuple
+from mnemo_client import MnemoClient
 
 
 # =============================================================================
@@ -30,15 +27,9 @@ class ContextEngine:
     - consolidate_memories(): GPT-4o generates deep context from raw facts
     """
 
-    def __init__(self, hf_key: str, openrouter_key: str = None,
-                 mnemo_url: str = "https://athelaperk-mnemo-mcp.hf.space"):
-        self.hf_key = hf_key
+    def __init__(self, mnemo_client: MnemoClient, openrouter_key: str = None):
+        self.mnemo = mnemo_client
         self.openrouter_key = openrouter_key
-        self.mnemo_url = mnemo_url.rstrip("/")
-        self.headers = {
-            "Authorization": f"Bearer {hf_key}",
-            "Content-Type": "application/json"
-        }
 
     # -----------------------------------------------------------------
     # RICH CONTEXT (for prompt injection)
@@ -47,9 +38,6 @@ class ContextEngine:
     def build_rich_context(self, query: str, loop_manager=None) -> Tuple[str, Dict]:
         """
         Retrieve relevant memories from Mnemo and format for LLM injection.
-
-        Uses Mnemo's search (which includes spreading activation over neural
-        links) instead of the old manual cluster-building approach.
         """
         metadata = {
             "facts_included": 0,
@@ -59,28 +47,21 @@ class ContextEngine:
         }
         context_parts = []
 
-        # Primary search — Mnemo handles relevance ranking + link activation
+        # Primary search — Mnemo handles relevance ranking + link activation via MnemoClient
         try:
-            response = requests.post(
-                f"{self.mnemo_url}/search",
-                headers=self.headers,
-                json={"query": query, "limit": 8},
-                timeout=10
-            )
-            if response.status_code == 200:
-                results = response.json().get("results", [])
-                for r in results:
-                    content = r.get("content", "")
-                    if not content:
-                        continue
+            results = self.mnemo.search(query, limit=8)
+            for r in results:
+                content = r.get("content", "")
+                if not content:
+                    continue
 
-                    if any(content.startswith(f"[{tag}]") for tag in
-                           ("CONTEXT", "RELATIONSHIP", "CLARIFICATION", "TIMELINE")):
-                        context_parts.append(content)
-                        metadata["context_included"] += 1
-                    else:
-                        context_parts.append(content)
-                        metadata["facts_included"] += 1
+                if any(content.startswith(f"[{tag}]") for tag in
+                       ("CONTEXT", "RELATIONSHIP", "CLARIFICATION", "TIMELINE")):
+                    context_parts.append(content)
+                    metadata["context_included"] += 1
+                else:
+                    context_parts.append(content)
+                    metadata["facts_included"] += 1
         except Exception:
             pass
 
@@ -88,19 +69,13 @@ class ContextEngine:
         writing_keywords = ["write", "scene", "chapter", "story", "prose", "dialogue", "style"]
         if any(kw in query.lower() for kw in writing_keywords):
             try:
-                response = requests.post(
-                    f"{self.mnemo_url}/search",
-                    headers=self.headers,
-                    json={"query": "PROSE_SAMPLE VOICE DIALOGUE_SAMPLE", "limit": 5},
-                    timeout=10
-                )
-                if response.status_code == 200:
-                    for s in response.json().get("results", [])[:2]:
-                        content = s.get("content", "")
-                        if any(tag in content for tag in
-                               ("PROSE_SAMPLE", "VOICE", "DIALOGUE_SAMPLE", "VOCABULARY")):
-                            context_parts.append(content)
-                            metadata["style_included"] += 1
+                style_results = self.mnemo.search("PROSE_SAMPLE VOICE DIALOGUE_SAMPLE", limit=5)
+                for s in style_results[:2]:
+                    content = s.get("content", "")
+                    if any(tag in content for tag in
+                           ("PROSE_SAMPLE", "VOICE", "DIALOGUE_SAMPLE", "VOCABULARY")):
+                        context_parts.append(content)
+                        metadata["style_included"] += 1
             except Exception:
                 pass
 
@@ -116,8 +91,8 @@ class ContextEngine:
         Memory consolidation — like human sleep consolidation.
 
         Reads all raw facts from Mnemo, sends them to GPT-4o to generate
-        deep context entries (CONTEXT, RELATIONSHIP, CLARIFICATION, TIMELINE),
-        deduplicates against existing context, and stores new entries back.
+        deep context entries, deduplicates against existing context, and
+        stores new entries back.
         """
         api_key = openrouter_key or self.openrouter_key
         if not api_key:
@@ -131,21 +106,13 @@ class ContextEngine:
             "cost": 0.0
         }
 
-        # Fetch all memories
+        # Fetch all memories via MnemoClient
         try:
-            response = requests.get(
-                f"{self.mnemo_url}/list",
-                headers=self.headers,
-                timeout=30
-            )
-            if response.status_code != 200:
-                return {"error": "Failed to fetch memories", "created": 0}
-
-            all_memories = response.json().get("memories", [])
-            results["memories_analyzed"] = len(all_memories)
-
+            all_memories = self.mnemo.list_memories()
             if not all_memories:
-                return {"error": "No memories to consolidate", "created": 0}
+                return {"error": "No memories to consolidate or API unreachable", "created": 0}
+
+            results["memories_analyzed"] = len(all_memories)
 
         except Exception as e:
             return {"error": f"Fetch error: {e}", "created": 0}
@@ -274,20 +241,14 @@ RULES:
                 continue
 
             try:
-                response = requests.post(
-                    f"{self.mnemo_url}/add",
-                    headers=self.headers,
-                    json={
-                        "content": f"[{category}] {entry_content}",
-                        "metadata": {
-                            "category": category,
-                            "source": "consolidation",
-                            "created": datetime.now().isoformat()
-                        }
-                    },
-                    timeout=10
-                )
-                if response.status_code == 200:
+                meta = {
+                    "category": category,
+                    "source": "consolidation",
+                    "created": datetime.now().isoformat()
+                }
+                # Use MnemoClient to add new deep context memory
+                mem_id = self.mnemo.add(f"[{category}] {entry_content}", metadata=meta)
+                if mem_id:
                     stored += 1
                     results["new_entries"].append({
                         "category": category,
