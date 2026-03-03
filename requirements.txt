@@ -6,3 +6,4 @@ pypdf
 tiktoken
 numpy
 python-docx
+huggingface_hub>=0.20.0
