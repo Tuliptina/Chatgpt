@@ -24,7 +24,7 @@ from datetime import datetime
 from memory import MnemoMemoryManager
 from metadata_loops import LoopManager, LoopConfig
 from smart_memory import SmartMemory, ContextWindowManager
-from persistent_storage import PersistentStorage
+from session_store import SessionStore
 from context_engine import ContextEngine
 
 # ============================================================================
@@ -87,7 +87,7 @@ def get_persistent_storage(hf_key=None):
     key = hf_key or DEFAULT_HF_KEY
     if "persistent_storage" not in st.session_state or st.session_state.get("_ps_key") != key:
         if key:
-            st.session_state.persistent_storage = PersistentStorage(
+            st.session_state.persistent_storage = SessionStore(
                 hf_key=key,
                 mnemo_url=MNEMO_URL
             )
@@ -672,7 +672,7 @@ def main():
         with col_refresh:
             if st.button("🔄", key="refresh_sessions", help="Refresh from cloud"):
                 try:
-                    storage = PersistentStorage(hf_key=hf_key, mnemo_url=MNEMO_URL)
+                    storage = SessionStore(hf_key=hf_key, mnemo_url=MNEMO_URL)
                     sessions = storage.load_sessions(limit=MAX_SESSIONS_STORED)
                     st.session_state.session_history = sessions
                     st.rerun()
