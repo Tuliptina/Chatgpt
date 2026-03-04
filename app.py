@@ -1,7 +1,11 @@
 """
-4o with Memory - Enhanced Edition (v5.1 patch)
+4o with Memory - Enhanced Edition (v5.3 patch)
 
-Changes from previous version:
+Changes from v5.1:
+- FIX: handle_message() now uses SmartMemory.two_tier_gate() for proper
+  two-tier injection gating. Tier 2 (Mnemo /should_inject) is consulted
+  for moderate-confidence Tier 1 decisions (FACTUAL, named entities,
+  GENERAL queries). High-confidence skips and uses bypass Tier 2.
 - FIX: Cross-session toggle now correctly gates loop injection AND auto-extract
 - FIX: Unified context retrieval (no more triple-redundant Mnemo searches)
 - REFACTOR: main() broken into render_sidebar(), render_chat(), handle_message()
@@ -14,7 +18,7 @@ Changes from previous version:
 
 Features:
 - GPT-4o via OpenRouter with warm, conversational style
-- Mnemo v5.1 Cloud Memory (persistent across sessions)
+- Mnemo v5.3 Cloud Memory (persistent across sessions)
 - Centralized MnemoClient (clean architecture)
 - Metadata Loop System (80% token savings)
 - Auto-Memory Extraction & File Uploads
@@ -601,18 +605,29 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
 
 
 # ============================================================================
-# MESSAGE HANDLER (v5.1: extracted from main())
+# MESSAGE HANDLER (v5.3: two-tier injection gate)
 # ============================================================================
 
 def handle_message(prompt, openrouter_key, mnemo_client):
     """
     Process a user message: build context, call LLM, extract memories.
+
+    v5.3: Uses SmartMemory.two_tier_gate() instead of bare should_use_memory().
+    Tier 2 (Mnemo /should_inject) is now actually consulted for moderate-
+    confidence Tier 1 decisions, saving full retrieval round-trips when the
+    query has no semantic overlap with stored memories.
     """
     conversation_length = len(st.session_state.messages)
-    needs_memory, memory_reason = st.session_state.smart_memory.should_use_memory(prompt, conversation_length)
-
     cross_session_enabled = st.session_state.get("cross_session_enabled", True)
     use_loops = st.session_state.get("use_loops", True)
+
+    # v5.3: Two-tier gate replaces bare should_use_memory()
+    gate = st.session_state.smart_memory.two_tier_gate(
+        query=prompt,
+        mnemo_client=mnemo_client if cross_session_enabled else None,
+        conversation_length=conversation_length,
+    )
+    needs_memory = gate.should_retrieve
 
     past_conversation_context = ""
     skip_loops_for_this_query = False
@@ -651,9 +666,10 @@ def handle_message(prompt, openrouter_key, mnemo_client):
     context_meta = {
         "cross_session_memories_used": context_stats.get("memory_items_full", 0) + context_stats.get("memory_items_meta", 0),
         "context_tokens": context_stats.get("total_tokens", 0),
-        "mode": "smart" if needs_memory else "skip",
-        "memory_reason": memory_reason,
+        "mode": gate.mode,
+        "memory_reason": gate.reason,
         "sessions_found": sessions_found,
+        "gate_tier": gate.tier_used,
     }
 
     # Call LLM
@@ -703,6 +719,7 @@ def handle_message(prompt, openrouter_key, mnemo_client):
         "extracted": extracted,
         "cost": msg_cost,
         "sessions_found": sessions_found,
+        "gate_tier": context_meta.get("gate_tier", 1),
     }
 
     return response, None, result_meta
@@ -1055,7 +1072,7 @@ def render_consolidation_panel(openrouter_key):
 
 
 # ============================================================================
-# CHAT RENDERER (v5.1: extracted from main())
+# CHAT RENDERER (v5.3: gate_tier in metadata display)
 # ============================================================================
 
 def render_chat(openrouter_key, mnemo_client):
@@ -1073,9 +1090,12 @@ def render_chat(openrouter_key, mnemo_client):
                         memory_info = []
                         if meta.get("cross_session_memories_used", 0) > 0:
                             memory_info.append(f"📚 {meta['cross_session_memories_used']} memories")
-                        if meta.get("mode") == "smart":
+                        mode = meta.get("mode", "")
+                        if mode == "t1_direct":
                             memory_info.append(f"🔄 {meta.get('context_tokens', 0)} tokens")
-                        elif meta.get("mode") == "skip":
+                        elif mode == "t2_confirmed":
+                            memory_info.append(f"🔄 t2 | {meta.get('context_tokens', 0)} tokens")
+                        elif mode == "skip":
                             memory_info.append("⚡ fast")
                         if meta.get("extracted", 0) > 0:
                             memory_info.append(f"🧠 {meta['extracted']} extracted")
@@ -1110,9 +1130,12 @@ def render_chat(openrouter_key, mnemo_client):
                     meta_parts.append(f"📜 {result_meta['sessions_found']} past chats")
                 if result_meta.get("cross_session_memories_used", 0) > 0:
                     meta_parts.append(f"📚 {result_meta['cross_session_memories_used']} memories")
-                if result_meta.get("mode") == "smart":
+                mode = result_meta.get("mode", "")
+                if mode == "t1_direct":
                     meta_parts.append(f"🔄 {result_meta.get('context_tokens', 0)} tokens")
-                elif result_meta.get("mode") == "skip":
+                elif mode == "t2_confirmed":
+                    meta_parts.append(f"🔄 t2 | {result_meta.get('context_tokens', 0)} tokens")
+                elif mode == "skip":
                     meta_parts.append("⚡ fast")
                 if result_meta.get("extracted", 0) > 0:
                     meta_parts.append(f"🧠 {result_meta['extracted']} extracted")
@@ -1129,7 +1152,7 @@ def render_chat(openrouter_key, mnemo_client):
 
 
 # ============================================================================
-# MAIN APP (v5.1: clean orchestrator)
+# MAIN APP (v5.3: clean orchestrator)
 # ============================================================================
 
 def main():
@@ -1201,7 +1224,7 @@ def main():
     render_chat(openrouter_key, mnemo_client)
 
     st.divider()
-    st.caption("🧠 4o with Memory | GPT-4o + Mnemo v5.1 + Metadata Loops")
+    st.caption("🧠 4o with Memory | GPT-4o + Mnemo v5.3 + Metadata Loops")
 
 if __name__ == "__main__":
     main()
