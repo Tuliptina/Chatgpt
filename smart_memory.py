@@ -1,32 +1,40 @@
 """
-Smart Memory System
+Smart Memory System (v5.3)
 
 Reduces latency by detecting which queries need memory lookup.
 
-PROBLEM: Searching memory for EVERY query adds 500ms-2s latency
-SOLUTION: Only search memory when the query actually needs it
+PROBLEM: Searching memory for EVERY query adds 500ms-2s latency.
+SOLUTION: Two-tier injection gate that progressively filters queries.
 
-Two-tier injection gate (v5.1):
-  Tier 1 — SmartMemory (this module): Fast local regex/pattern analysis.
-      Zero latency. Catches greetings, simple responses, continuations.
-      If this says SKIP → skip entirely (no API call to Mnemo either).
+Two-tier injection gate:
+  Tier 1 — SmartMemory.analyze(): Fast local regex/pattern analysis.
+      Zero latency. Produces a QueryAnalysis with confidence score.
+      - High-confidence SKIP (greetings, acks, continuations): done.
+      - High-confidence USE (explicit references, creative writing): done.
+      - Moderate-confidence USE (factual, named entities, general): → Tier 2.
 
   Tier 2 — Mnemo server's /should_inject endpoint: Semantic analysis
       using the server's own knowledge of what's stored. ~200ms.
-      Only called when Tier 1 says USE MEMORY. Can still veto injection
-      if the query has no semantic overlap with stored memories.
+      Only called for moderate-confidence Tier 1 decisions. Can veto
+      injection if the query has no semantic overlap with stored memories.
 
-  The two tiers are wired together in app.py's handle_message():
-      if not smart_memory.should_use_memory(query):  → skip everything
-      elif not mnemo_client.should_inject(query):     → skip injection
-      else:                                           → full retrieval
+  Orchestrated by SmartMemory.two_tier_gate():
+      analysis = analyze(query)
+      if analysis.needs_memory == False:         → skip everything
+      elif analysis.confidence >= 0.90:          → retrieve (skip Tier 2)
+      elif mnemo_client.should_inject(query):    → retrieve
+      else:                                      → skip (Tier 2 vetoed)
+
+  app.py's handle_message() calls two_tier_gate() as the single entry point.
 
 Query Types:
 - SKIP MEMORY: "hi", "thanks", "ok", "continue", etc.
 - SKIP MEMORY: Follow-up questions in same context
-- USE MEMORY: Questions about stored information
+- SKIP MEMORY: Tier 2 veto (no semantic overlap with stored memories)
+- USE MEMORY: Explicit references ("my novel", "the character")
 - USE MEMORY: Creative writing requests
-- USE MEMORY: Questions with named entities
+- USE MEMORY: Questions with named entities (if Tier 2 confirms)
+- USE MEMORY: General queries (if Tier 2 confirms)
 """
 
 import re
@@ -58,21 +66,65 @@ class QueryAnalysis:
     reason: str
 
 
+@dataclass
+class GateDecision:
+    """Result of the full two-tier injection gate.
+
+    Returned by SmartMemory.two_tier_gate(). Contains everything
+    the caller needs to decide whether to retrieve memory context.
+    """
+    should_retrieve: bool
+    tier_used: int          # 1 = local only, 2 = Mnemo consulted
+    reason: str
+    confidence: float
+    query_type: QueryType
+    keywords: List[str]
+    mnemo_confidence: float = 0.0  # Tier 2 confidence (0.0 if not consulted)
+
+    @property
+    def mode(self) -> str:
+        """Return a short label for metadata display."""
+        if not self.should_retrieve:
+            return "skip"
+        if self.tier_used == 1:
+            return "t1_direct"   # Tier 1 high-confidence → straight to retrieval
+        return "t2_confirmed"    # Tier 2 confirmed retrieval
+
+
+# Tier 2 is only consulted when Tier 1 confidence falls below this threshold.
+# Above this: Tier 1 is confident enough to decide alone (saves ~200ms).
+# Below this: Tier 2's semantic check adds real signal.
+#
+# Current confidence map:
+#   REFERENCE=0.95, CREATIVE=0.90  → skip Tier 2 (explicit memory need)
+#   FACTUAL=0.85, NAMES=0.85       → consult Tier 2
+#   GENERAL=0.60                   → consult Tier 2
+TIER_2_THRESHOLD = 0.90
+
+
 class SmartMemory:
     """
-    Tier 1 injection gate — fast local query analyzer.
+    Two-tier memory injection gate.
 
-    Determines whether a query needs memory search using regex patterns
-    and heuristics. Zero network calls, ~0ms latency.
+    Primary entry point: two_tier_gate(query, mnemo_client, conversation_length)
 
-    When this returns needs_memory=False, the caller should skip BOTH
-    memory retrieval AND the Mnemo /should_inject call (Tier 2).
+    Tier 1 (local, ~0ms):
+      Regex/pattern analysis. High-confidence decisions (greetings,
+      explicit references, creative requests) are returned immediately
+      without a network call. Saves ~200ms on obvious cases.
 
-    When this returns needs_memory=True, the caller may optionally
-    consult Mnemo's /should_inject endpoint as a semantic second check
-    before committing to full retrieval.
+    Tier 2 (remote, ~200ms):
+      Only called for moderate-confidence Tier 1 results (FACTUAL,
+      named entities, GENERAL queries). Asks Mnemo's /should_inject
+      endpoint whether the query has semantic overlap with stored
+      memories. Can veto retrieval for queries like "what is
+      photosynthesis" that have no stored context.
 
-    Saves 500ms-2s on every greeting, acknowledgement, and continuation.
+    Fallback: If mnemo_client is None or unavailable, Tier 1 decision
+    is used directly (same behavior as v5.1).
+
+    Backward compat: should_use_memory() still works as a Tier-1-only
+    gate for callers that don't have a MnemoClient reference.
     """
 
     # Patterns that DON'T need memory
@@ -210,14 +262,110 @@ class SmartMemory:
         return [w for w in words if w not in stopwords and len(w) > 2][:10]
 
     def should_use_memory(self, query: str, conversation_length: int = 0) -> Tuple[bool, str]:
-        """Tier 1 gate — returns (needs_memory, reason).
+        """Tier 1 only gate — backward compatibility.
 
-        If False: caller should skip memory retrieval entirely.
-        If True: caller should proceed to Tier 2 (Mnemo /should_inject)
-        or directly to retrieval if Tier 2 is unavailable.
+        Returns (needs_memory, reason). Use two_tier_gate() for full
+        two-tier analysis when a MnemoClient is available.
         """
         analysis = self.analyze(query, conversation_length)
         return analysis.needs_memory, analysis.reason
+
+    def two_tier_gate(self, query: str, mnemo_client=None,
+                      conversation_length: int = 0) -> GateDecision:
+        """Full two-tier injection gate.
+
+        This is the primary entry point for app.py's handle_message().
+
+        Flow:
+          1. Run Tier 1 (local regex analysis)
+          2. If Tier 1 says SKIP → return skip immediately
+          3. If Tier 1 says USE with high confidence (≥ 0.90) → retrieve
+             (explicit references and creative writing always need context)
+          4. If Tier 1 says USE with moderate confidence (< 0.90) →
+             consult Tier 2 (Mnemo /should_inject) for semantic validation
+          5. If Tier 2 vetoes → return skip
+          6. If Tier 2 confirms → return retrieve
+
+        If mnemo_client is None or unavailable, falls back to Tier 1
+        decision for moderate-confidence cases (same as v5.1 behavior).
+
+        Args:
+            query: The user's message.
+            mnemo_client: Optional MnemoClient instance for Tier 2.
+            conversation_length: Number of messages in current conversation.
+
+        Returns:
+            GateDecision with should_retrieve, tier_used, reason, etc.
+        """
+        analysis = self.analyze(query, conversation_length)
+
+        # --- Tier 1 SKIP: greetings, acks, continuations, short follow-ups ---
+        if not analysis.needs_memory:
+            return GateDecision(
+                should_retrieve=False,
+                tier_used=1,
+                reason=f"t1_skip: {analysis.reason}",
+                confidence=analysis.confidence,
+                query_type=analysis.query_type,
+                keywords=analysis.keywords,
+            )
+
+        # --- Tier 1 high-confidence USE: explicit references, creative -------
+        if analysis.confidence >= TIER_2_THRESHOLD:
+            return GateDecision(
+                should_retrieve=True,
+                tier_used=1,
+                reason=f"t1_direct: {analysis.reason}",
+                confidence=analysis.confidence,
+                query_type=analysis.query_type,
+                keywords=analysis.keywords,
+            )
+
+        # --- Moderate confidence: consult Tier 2 if available ----------------
+        if mnemo_client is None:
+            # No client → fall back to Tier 1 decision
+            return GateDecision(
+                should_retrieve=True,
+                tier_used=1,
+                reason=f"t1_fallback (no client): {analysis.reason}",
+                confidence=analysis.confidence,
+                query_type=analysis.query_type,
+                keywords=analysis.keywords,
+            )
+
+        try:
+            should_inject, inject_reason, inject_confidence = mnemo_client.should_inject(query)
+        except Exception:
+            # Tier 2 failed → fall back to Tier 1
+            return GateDecision(
+                should_retrieve=True,
+                tier_used=1,
+                reason=f"t1_fallback (t2 error): {analysis.reason}",
+                confidence=analysis.confidence,
+                query_type=analysis.query_type,
+                keywords=analysis.keywords,
+            )
+
+        if should_inject:
+            return GateDecision(
+                should_retrieve=True,
+                tier_used=2,
+                reason=f"t2_confirmed: {inject_reason}",
+                confidence=analysis.confidence,
+                query_type=analysis.query_type,
+                keywords=analysis.keywords,
+                mnemo_confidence=inject_confidence,
+            )
+        else:
+            return GateDecision(
+                should_retrieve=False,
+                tier_used=2,
+                reason=f"t2_vetoed: {inject_reason}",
+                confidence=analysis.confidence,
+                query_type=analysis.query_type,
+                keywords=analysis.keywords,
+                mnemo_confidence=inject_confidence,
+            )
 
 
 # =============================================================================
