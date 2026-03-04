@@ -4,7 +4,7 @@ import time
 import sys
 
 # ⚠️ REPLACE THIS WITH YOUR ACTUAL STREAMLIT APP URL
-url = "https://your-app-name.streamlit.app"
+url = "https://chatgpt-8vixu8hcdurdusqszdcbz6.streamlit.app/"
 
 def wake_up_app():
     print(f"Attempting to wake up: {url}")
