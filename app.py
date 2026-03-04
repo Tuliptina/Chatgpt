@@ -1,9 +1,20 @@
 """
-4o with Memory - Enhanced Edition
+4o with Memory - Enhanced Edition (v5.1 patch)
+
+Changes from previous version:
+- FIX: Cross-session toggle now correctly gates loop injection AND auto-extract
+- FIX: Unified context retrieval (no more triple-redundant Mnemo searches)
+- REFACTOR: main() broken into render_sidebar(), render_chat(), handle_message()
+- FIX: Error boundaries around Mnemo calls in the chat hot path
+- CLEANUP: estimate_tokens() consolidated into utils.py
+- FIX (UX): Session renames now accurately save to cloud dataset
+- FIX (UX): Sidebar API key changes instantly apply to MnemoClient
+- FIX (UX): Network timeouts no longer strand user messages in the UI
+- FIX (UX): Folders are now fully persistent across reloads
 
 Features:
 - GPT-4o via OpenRouter with warm, conversational style
-- Mnemo v4.5 Cloud Memory (persistent across sessions)
+- Mnemo v5.1 Cloud Memory (persistent across sessions)
 - Centralized MnemoClient (clean architecture)
 - Metadata Loop System (80% token savings)
 - Auto-Memory Extraction & File Uploads
@@ -20,8 +31,7 @@ import os
 import uuid
 from datetime import datetime
 
-# Import the new centralized client
-from mnemo_client import MnemoClient 
+from mnemo_client import MnemoClient
 from metadata_loops import LoopManager, LoopConfig
 from smart_memory import SmartMemory, ContextWindowManager
 from session_store import SessionStore
@@ -48,6 +58,9 @@ TEMPERATURE = 0.75
 
 MAX_CONVERSATION_MESSAGES = 8
 MAX_SESSIONS_STORED = 20
+
+# v5.1: Timeout for Mnemo calls in the chat hot path
+MNEMO_HOT_PATH_TIMEOUT = 4.0
 
 SYSTEM_PROMPT = """You are a warm, intelligent AI companion with persistent memory. You remember past conversations and uploaded context.
 
@@ -208,14 +221,24 @@ def rename_session_dialog(session_id, current_title):
     with col1:
         if st.button("💾 Save", use_container_width=True):
             if new_name and new_name.strip():
+                new_title = new_name.strip()
                 if "custom_titles" not in st.session_state:
                     st.session_state.custom_titles = {}
-                st.session_state.custom_titles[session_id] = new_name.strip()
+                st.session_state.custom_titles[session_id] = new_title
+                
                 for s in st.session_state.session_history:
                     if s.get("id") == session_id:
-                        s["title"] = new_name.strip()
+                        s["title"] = new_title
                         break
-                save_current_session()
+                
+                # FIX: Actually write the renamed session to the cloud dataset
+                storage = get_persistent_storage()
+                if storage:
+                    messages = storage.load_session_messages(session_id)
+                    storage.save_session(session_id, new_title, messages)
+                    
+                if session_id == st.session_state.get("current_session_id"):
+                    save_current_session()
             st.rerun()
     with col2:
         if st.button("❌ Cancel", use_container_width=True):
@@ -232,6 +255,11 @@ def move_session_dialog(session_id):
                 if session_id in st.session_state.session_folders[f]:
                     st.session_state.session_folders[f].remove(session_id)
             st.session_state.session_folders[target_folder].append(session_id)
+            
+            # FIX: Persist folder change to HF Dataset
+            storage = get_persistent_storage()
+            if storage and hasattr(storage, 'save_folder_state'):
+                storage.save_folder_state(st.session_state.session_folders)
             st.rerun()
     with col2:
         if st.button("❌ Cancel", use_container_width=True):
@@ -482,376 +510,558 @@ class CostTracker:
 
 
 # ============================================================================
-# MAIN APP
+# CONTEXT BUILDER (v5.1: unified retrieval path)
 # ============================================================================
 
-def main():
-    st.set_page_config(page_title="4o with Memory", page_icon="🧠", layout="wide")
-    st.title("🧠 4o with Memory")
-    st.caption("GPT-4o with warm, conversational style and persistent memory")
-    
-    if not DEFAULT_OPENROUTER_KEY or not DEFAULT_HF_KEY:
-        st.error("⚠️ **API Keys Not Configured!**")
-        st.markdown("""
-        **For Streamlit Cloud:**
-        1. Go to your app's Settings → Secrets
-        2. Add your keys in TOML format:
-        ```toml
-        OPENROUTER_KEY = "sk-or-v1-your-key"
-        HF_KEY = "hf_your-token"
-        ```
-        """)
-        st.stop()
-    
-    # Initialize Core Centralized Client
-    mnemo_client = init_client(DEFAULT_HF_KEY)
-    
-    if "session_history_loaded" not in st.session_state:
-        st.session_state.session_history_loaded = True
-        st.session_state.session_history = []
+def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops, loop_manager, context_engine):
+    """
+    v5.1: Single unified context retrieval path.
+
+    Returns: (context_string, metadata_dict, skip_loops_flag)
+    """
+    context_parts = []
+    metadata = {
+        "sessions_found": 0,
+        "skip_loops": False,
+    }
+
+    if not cross_session_enabled:
+        return "", metadata, False
+
+    storage = get_persistent_storage()
+    if not storage:
+        return "", metadata, False
+
+    prompt_lower = prompt.lower()
+    asking_about_past = any(phrase in prompt_lower for phrase in [
+        "last chat", "previous chat", "last conversation",
+        "previous conversation", "earlier chat", "before this",
+        "what did we talk", "what were we", "did we discuss",
+        "remember when", "last time", "our last", "previous session",
+        "talked about", "chatting about", "we discussed", "we were talking"
+    ])
+
+    current_session_id = st.session_state.get("current_session_id", "")
+
+    if asking_about_past:
+        # Past-chat questions: search sessions, skip all memory injection
+        metadata["skip_loops"] = True
+        try:
+            session_results = storage.search_sessions(prompt, current_session_id=current_session_id, limit=2)
+            if session_results:
+                metadata["sessions_found"] = len(session_results)
+                context_parts.append(
+                    "\n\n[PREVIOUS CHAT SESSIONS - The user is asking about past conversations. "
+                    "Use ONLY this information to answer. Do NOT use other memories:]\n"
+                    + "\n---\n".join(session_results)
+                )
+            else:
+                recent = storage.get_previous_sessions_content(current_session_id=current_session_id, limit=2)
+                if recent:
+                    metadata["sessions_found"] = len(recent)
+                    summaries = [f"Session '{s['title']}':\n{s['summary']}" for s in recent]
+                    context_parts.append(
+                        "\n\n[RECENT CHAT SESSIONS - The user is asking about past conversations. "
+                        "Use ONLY this information to answer:]\n"
+                        + "\n---\n".join(summaries)
+                    )
+        except Exception:
+            pass
+
+    else:
+        # Normal queries
+        try:
+            past_convos = storage.search_conversations(prompt, limit=3)
+            if past_convos:
+                context_parts.append(
+                    "\n\n[PAST CONVERSATIONS]\n"
+                    + "\n".join(f"• {conv[:200]}" for conv in past_convos)
+                )
+        except Exception:
+            pass
+
+        if not use_loops:
+            try:
+                memories = mnemo_client.search(prompt, limit=8)
+
+                # Style injection for writing queries
+                writing_keywords = ["write", "scene", "chapter", "story", "prose", "dialogue", "style"]
+                if any(kw in prompt.lower() for kw in writing_keywords):
+                    style_results = mnemo_client.search("PROSE_SAMPLE VOICE DIALOGUE_SAMPLE", limit=5)
+                    memories.extend(style_results)
+
+                enriched, enrich_meta = context_engine.build_rich_context(prompt, memories)
+                if enriched:
+                    context_parts.append(f"\n\n[DEEP CONTEXT]\n{enriched}")
+            except Exception:
+                pass
+
+    context_string = "".join(context_parts)
+    return context_string, metadata, metadata["skip_loops"]
+
+
+# ============================================================================
+# MESSAGE HANDLER (v5.1: extracted from main())
+# ============================================================================
+
+def handle_message(prompt, openrouter_key, mnemo_client):
+    """
+    Process a user message: build context, call LLM, extract memories.
+    """
+    conversation_length = len(st.session_state.messages)
+    needs_memory, memory_reason = st.session_state.smart_memory.should_use_memory(prompt, conversation_length)
+
+    cross_session_enabled = st.session_state.get("cross_session_enabled", True)
+    use_loops = st.session_state.get("use_loops", True)
+
+    past_conversation_context = ""
+    skip_loops_for_this_query = False
+    sessions_found = 0
+
+    if needs_memory and cross_session_enabled:
+        try:
+            past_conversation_context, ctx_meta, skip_loops_for_this_query = build_memory_context(
+                prompt, mnemo_client,
+                cross_session_enabled=cross_session_enabled,
+                use_loops=use_loops,
+                loop_manager=st.session_state.get("loop_manager"),
+                context_engine=st.session_state.get("context_engine"),
+            )
+            sessions_found = ctx_meta.get("sessions_found", 0)
+        except Exception:
+            past_conversation_context = ""
+
+    full_system_prompt = SYSTEM_PROMPT + past_conversation_context
+
+    should_use_loops = (
+        needs_memory
+        and use_loops
+        and cross_session_enabled
+        and not skip_loops_for_this_query
+    )
+
+    messages, context_stats = st.session_state.context_manager.build_optimized_context(
+        system_prompt=full_system_prompt,
+        query=prompt,
+        conversation_history=st.session_state.messages,
+        max_messages=MAX_CONVERSATION_MESSAGES,
+        use_loops=should_use_loops,
+    )
+
+    context_meta = {
+        "cross_session_memories_used": context_stats.get("memory_items_full", 0) + context_stats.get("memory_items_meta", 0),
+        "context_tokens": context_stats.get("total_tokens", 0),
+        "mode": "smart" if needs_memory else "skip",
+        "memory_reason": memory_reason,
+        "sessions_found": sessions_found,
+    }
+
+    # Call LLM
+    response, input_tokens, output_tokens, error = call_openrouter(messages, openrouter_key)
+
+    if error:
+        return None, error, {}
+
+    cost_tracker = CostTracker()
+    msg_cost = cost_tracker.add_usage(input_tokens, output_tokens)
+
+    # Save conversation turn
+    if not skip_loops_for_this_query:
         try:
             storage = get_persistent_storage(DEFAULT_HF_KEY, mnemo_client)
             if storage:
-                sessions = storage.load_sessions(limit=MAX_SESSIONS_STORED)
-                if sessions:
-                    st.session_state.session_history = sessions
+                storage.save_conversation_turn(prompt, response, st.session_state.get("current_session_id"))
         except Exception:
             pass
-    
-    if "current_session_id" not in st.session_state:
-        st.session_state.current_session_id = generate_session_id()
-    if "custom_titles" not in st.session_state:
-        st.session_state.custom_titles = {}
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    
-    # Core Engines Initialization (passing the client)
-    if "loop_manager" not in st.session_state:
-        st.session_state.loop_manager = LoopManager(mnemo_client=mnemo_client, openrouter_key=DEFAULT_OPENROUTER_KEY)
-        st.session_state.loop_manager.load_from_mnemo(use_smart_extraction=False)
-    if "smart_memory" not in st.session_state:
-        st.session_state.smart_memory = SmartMemory()
-    if "context_engine" not in st.session_state:
-        st.session_state.context_engine = ContextEngine(mnemo_client=mnemo_client, openrouter_key=DEFAULT_OPENROUTER_KEY)
-    if "context_manager" not in st.session_state:
-        st.session_state.context_manager = ContextWindowManager(loop_manager=st.session_state.loop_manager)
-    else:
-        st.session_state.context_manager.set_loop_manager(st.session_state.loop_manager)
-    
+
+    # Auto-extract
+    extracted = 0
+    if (st.session_state.get("auto_extract", True)
+            and cross_session_enabled 
+            and not skip_loops_for_this_query):
+        conversation = f"User: {prompt}\n\nAssistant: {response}"
+        memories, extract_cost = extract_memories_with_gpt(conversation, openrouter_key)
+        if memories:
+            current_session = st.session_state.get("current_session_id")
+            msg_cost += extract_cost
+            for mem in memories:
+                cat = mem.get("category", "FACT").upper()
+                txt = mem.get("content", "")
+                if txt:
+                    meta = {"category": cat, "session_id": current_session}
+                    try:
+                        if mnemo_client.add(f"[{cat}] {txt}", metadata=meta, priority=0.5):
+                            extracted += 1
+                            st.session_state.loop_manager.add_to_loop(content=txt, category=cat.lower())
+                    except Exception:
+                        pass
+
+    result_meta = {
+        "cross_session_memories_used": context_meta.get("cross_session_memories_used", 0),
+        "context_tokens": context_meta.get("context_tokens", 0),
+        "mode": context_meta.get("mode", "full"),
+        "extracted": extracted,
+        "cost": msg_cost,
+        "sessions_found": sessions_found,
+    }
+
+    return response, None, result_meta
+
+
+# ============================================================================
+# SIDEBAR RENDERER (v5.1: extracted from main())
+# ============================================================================
+
+def render_sidebar(mnemo_client, openrouter_key, hf_key):
+    """Render the full sidebar: settings, sessions, memory management."""
+
     with st.sidebar:
         st.header("⚙️ Settings")
-        
+
         with st.expander("🔑 API Keys", expanded=False):
-            openrouter_key = st.text_input("OpenRouter API Key", value=DEFAULT_OPENROUTER_KEY, type="password")
-            hf_key = st.text_input("HuggingFace Token", value=DEFAULT_HF_KEY, type="password")
-        
-        openrouter_key = openrouter_key or DEFAULT_OPENROUTER_KEY
-        hf_key = hf_key or DEFAULT_HF_KEY
-        
+            or_key = st.text_input("OpenRouter API Key", value=DEFAULT_OPENROUTER_KEY, type="password")
+            hf = st.text_input("HuggingFace Token", value=DEFAULT_HF_KEY, type="password")
+
+        openrouter_key = or_key or DEFAULT_OPENROUTER_KEY
+        hf_key = hf or DEFAULT_HF_KEY
+
         st.divider()
         st.subheader("💬 Chat")
-        
+
         if st.button("➕ New Chat", use_container_width=True, type="primary"):
             start_new_chat()
             st.rerun()
-        
+
         st.divider()
-        
-        col_title, col_refresh = st.columns([3, 1])
-        with col_title:
-            st.subheader("📚 Sessions")
-        with col_refresh:
-            if st.button("🔄", key="refresh_sessions", help="Refresh from cloud"):
-                try:
-                    storage = get_persistent_storage(hf_key, mnemo_client)
-                    sessions = storage.load_sessions(limit=MAX_SESSIONS_STORED)
-                    st.session_state.session_history = sessions
-                    st.rerun()
-                except Exception:
-                    pass
-        
-        if "session_folders" not in st.session_state:
-            st.session_state.session_folders = {"📁 Default": []}
-        
-        with st.expander("📂 Manage Folders", expanded=False):
-            with st.popover("➕ Create Folder"):
-                new_folder = st.text_input("New folder name", placeholder="e.g., Story Ideas")
-                if st.button("Create", use_container_width=True):
-                    if new_folder and new_folder.strip():
-                        folder_name = f"📁 {new_folder.strip()}"
-                        if folder_name not in st.session_state.session_folders:
-                            st.session_state.session_folders[folder_name] = []
-                            st.success(f"Created {folder_name}")
-                            st.rerun()
-            
-            folders = list(st.session_state.session_folders.keys())
-            if len(folders) > 1:
-                with st.popover("🗑️ Delete Folder"):
-                    folder_to_delete = st.selectbox("Delete folder", [""] + [f for f in folders if f != "📁 Default"])
-                    if folder_to_delete and st.button("Delete", type="primary", use_container_width=True):
-                        st.session_state.session_folders["📁 Default"].extend(
-                            st.session_state.session_folders.get(folder_to_delete, [])
-                        )
-                        del st.session_state.session_folders[folder_to_delete]
-                        st.rerun()
-        
-        sessions = st.session_state.get("session_history", [])
-        
-        with st.container():
-            if sessions:
-                session_to_folder = {}
-                for folder, session_ids in st.session_state.session_folders.items():
-                    for sid in session_ids:
-                        session_to_folder[sid] = folder
-                
-                folders_with_sessions = {"📁 Default": []}
-                for folder in st.session_state.session_folders:
-                    if folder not in folders_with_sessions:
-                        folders_with_sessions[folder] = []
-                
-                for session in sessions:
-                    sid = session.get("id", "")
-                    folder = session_to_folder.get(sid, "📁 Default")
-                    if folder not in folders_with_sessions:
-                        folder = "📁 Default"
-                    folders_with_sessions[folder].append(session)
-                
-                for folder, folder_sessions in folders_with_sessions.items():
-                    if folder_sessions:
-                        st.caption(folder)
-                        for session in folder_sessions[:10]:
-                            session_id = session.get("id", "")
-                            title = session.get("title", "Untitled")[:30]
-                            
-                            col1, col2, col3, col4 = st.columns([6, 1, 1, 1])
-                            with col1:
-                                if st.button(f"💬 {title}", key=f"load_{session_id}", use_container_width=True):
-                                    load_session(session_id)
-                                    st.rerun()
-                            with col2:
-                                if st.button("✏️", key=f"rename_{session_id}", help="Rename"):
-                                    rename_session_dialog(session_id, title)
-                            with col3:
-                                if st.button("📂", key=f"move_{session_id}", help="Move to folder"):
-                                    move_session_dialog(session_id)
-                            with col4:
-                                if st.button("🗑️", key=f"del_{session_id}"):
-                                    delete_session(session_id)
-                                    st.rerun()
-                        st.caption("")
-            else:
-                st.caption("No previous sessions")
-        
+
+        # --- Sessions ---
+        render_sessions_panel(mnemo_client, hf_key)
+
         st.divider()
-        
+
+        # --- Settings expander ---
         with st.expander("⚙️ Settings", expanded=False):
-            st.markdown("**📎 Upload File → Memory**")
-            st.caption("Upload a file — extracts facts, deep context, style, and saves everything to memory loops in one pass")
-            
-            uploaded_file = st.file_uploader("Upload file", type=["txt", "md", "csv", "json", "pdf", "docx"], label_visibility="collapsed")
-            
-            if uploaded_file is not None:
-                if st.button("🧠 Extract Deep Context + Memories", use_container_width=True):
-                    with st.spinner("Reading file..."):
-                        content = extract_text_from_file(uploaded_file)
-                    
-                    if content and not content.startswith("["):
-                        n_chunks = max(1, (len(content) - 1) // 12000 + 1)
-                        if n_chunks > 1:
-                            st.info(f"📄 {len(content):,} chars → splitting into {min(n_chunks, 5)} chunks for thorough extraction")
-                        
-                        with st.spinner(f"Extracting deep context & memories ({min(n_chunks, 5)} API call{'s' if n_chunks > 1 else ''})..."):
-                            memories, cost = extract_memories_from_file(content, uploaded_file.name, openrouter_key)
-                        
-                        if memories:
-                            with st.spinner("Storing to memory loops..."):
-                                current_session = st.session_state.get("current_session_id")
-                                stored = 0
-                                for mem in memories:
-                                    cat = mem.get("category", "FACT").upper()
-                                    txt = mem.get("content", "")
-                                    if txt:
-                                        meta = {"category": cat, "session_id": current_session, "source": "file_upload"}
-                                        if mnemo_client.add(f"[{cat}] {txt}", metadata=meta):
-                                            stored += 1
-                            
-                            facts = [m for m in memories if m.get("category") in ("CHARACTER", "PLOT", "SETTING", "THEME", "FACT")]
-                            context = [m for m in memories if m.get("category") in ("CONTEXT", "CLARIFICATION", "RELATIONSHIP", "INSTRUCTION")]
-                            style = [m for m in memories if m.get("category") in ("PROSE_SAMPLE", "DIALOGUE_SAMPLE", "VOICE", "VOCABULARY")]
-                            
-                            st.success(f"✅ Stored {stored} memories")
-                            st.caption(f"📊 {len(facts)} facts · {len(context)} deep context · {len(style)} style | Cost: ${cost:.4f}")
-                            
-                            with st.expander("View extracted memories", expanded=False):
-                                for mem in memories:
-                                    cat = mem.get("category", "FACT")
-                                    txt = mem.get("content", "")[:150]
-                                    st.caption(f"**[{cat}]** {txt}")
-                            
-                            st.session_state.loop_manager.load_from_mnemo()
-                        else:
-                            st.warning("No memories extracted. Try a different file.")
-                    else:
-                        st.error("Could not read file content")
-        
+            render_file_upload(mnemo_client, openrouter_key)
+
         st.divider()
         st.subheader("🧠 Memory Settings")
-        
+
         cross_session_enabled = st.toggle("Cross-Session Memory", value=True, help="Remember across chat sessions")
         auto_extract = st.toggle("Auto-Extract Memories", value=True, help="Automatically extract facts from conversations")
         st.session_state.auto_extract = auto_extract
         st.session_state.cross_session_enabled = cross_session_enabled
-        
+
         use_loops = st.toggle("🔄 Metadata Loops (Save 80% tokens)", value=True, help="Use token-efficient context injection")
         st.session_state.use_loops = use_loops
-        
+
         if "loop_manager" in st.session_state and use_loops:
             loop_stats = st.session_state.loop_manager.get_stats()
             st.caption(f"📊 {loop_stats['total_items']} memories | {loop_stats['total_metadata_tokens']} tokens")
-        
+
         st.divider()
         st.subheader("📝 Add Memory")
-        
-        with st.expander("Add manually", expanded=False):
-            memory_category = st.selectbox("Category", ["CHARACTER", "PLOT", "SETTING", "THEME", "STYLE", "FACT"])
-            memory_content = st.text_area("Content", placeholder="e.g., Detective Mercer has a fear of water since childhood", height=80)
-            if st.button("💾 Save", use_container_width=True):
-                if memory_content.strip():
-                    current_session = st.session_state.get("current_session_id")
-                    meta = {"category": memory_category, "session_id": current_session}
-                    if mnemo_client.add(f"[{memory_category}] {memory_content}", metadata=meta):
-                        st.success(f"✅ Saved [{memory_category}]")
-                        st.session_state.loop_manager.add_to_loop(memory_content, memory_category.lower())
-                    else:
-                        st.error("Failed to save")
-        
-        with st.expander("View memories", expanded=False):
-            col1, col2 = st.columns([1, 1])
-            with col1:
-                if st.button("🔄 Refresh", use_container_width=True, key="refresh_mem"):
-                    st.rerun()
-            with col2:
-                if st.button("📖 View All", use_container_width=True, key="view_all_mem"):
-                    st.session_state.show_all_memories = True
-                    st.rerun()
-            
-            stats = mnemo_client.get_stats()
-            st.caption(f"Total: {stats.get('total_memories', 0)} | Links: {stats.get('total_links', 0)}")
-            
-            memories = mnemo_client.list_memories()[:15]
-            
-            st.markdown("""
-            <style>
-            .memory-scroll { max-height: 300px; overflow-y: auto; padding: 5px; border: 1px solid #333; border-radius: 5px; }
-            </style>
-            """, unsafe_allow_html=True)
-            
-            for mem in memories:
-                col1, col2 = st.columns([5, 1])
-                with col1:
-                    content = mem.get("content", "")[:60]
-                    st.caption(f"{content}...")
-                with col2:
-                    if st.button("🗑️", key=f"del_mem_{mem.get('id', '')}"):
-                        if mnemo_client.delete(mem.get("id")):
-                            st.rerun()
-            
-            if len(mnemo_client.list_memories()) >= 15:
-                st.caption("... showing first 15. Click 'View All' for complete list")
-            
-            st.markdown("---")
-            if st.button("🧹 Clear ALL Memories", use_container_width=True):
-                st.session_state.confirm_clear = True
-            
-            if st.session_state.get("confirm_clear"):
-                st.warning("⚠️ Delete ALL memories?")
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("Yes, delete all"):
-                        mnemo_client.clear()
-                        st.session_state.confirm_clear = False
-                        st.rerun()
-                with col2:
-                    if st.button("Cancel"):
-                        st.session_state.confirm_clear = False
-                        st.rerun()
-        
-        if st.session_state.get("show_all_memories"):
-            st.markdown("---")
-            st.subheader("📖 All Memories")
-            
-            col1, col2, col3 = st.columns([1, 1, 1])
-            with col1:
-                if st.button("❌ Close", use_container_width=True, key="close_all_mem"):
-                    st.session_state.show_all_memories = False
-                    st.rerun()
-            with col2:
-                search_query = st.text_input("🔍 Search", key="mem_search", placeholder="Filter memories...")
-            with col3:
-                category_filter = st.selectbox("Category", ["All", "CHARACTER", "PLOT", "SETTING", "THEME", "CONTEXT", "STYLE", "FACT"], key="cat_filter")
-            
-            all_memories = mnemo_client.list_memories()
-            
-            if search_query:
-                all_memories = [m for m in all_memories if search_query.lower() in m.get("content", "").lower()]
-            if category_filter != "All":
-                all_memories = [m for m in all_memories if f"[{category_filter}]" in m.get("content", "")]
-            
-            st.caption(f"Showing {len(all_memories)} memories")
-            
-            st.markdown("""
-            <style>
-            .full-memory-scroll { max-height: 500px; overflow-y: auto; padding: 10px; border: 1px solid #444; border-radius: 8px; background: #1a1a1a; }
-            </style>
-            """, unsafe_allow_html=True)
-            
-            for mem in all_memories:
-                content = mem.get("content", "")
-                mem_id = mem.get("id", "")
-                
-                category = "OTHER"
-                if content.startswith("["):
-                    category = content.split("]")[0][1:]
-                
-                col1, col2, col3 = st.columns([1, 8, 1])
-                with col1:
-                    st.caption(f"[{category}]")
-                with col2:
-                    st.text(content[len(f"[{category}]"):].strip()[:200])
-                with col3:
-                    if st.button("🗑️", key=f"del_full_{mem_id}"):
-                        if mnemo_client.delete(mem_id):
-                            st.rerun()
-        
+
+        render_memory_management(mnemo_client)
+
         st.divider()
-        
-        with st.expander("🧠 Memory Consolidation", expanded=False):
-            st.caption("Analyze memories & generate deep context entries")
-            last_consol = st.session_state.get("last_consolidation")
-            if last_consol:
-                st.caption(f"Last run: {last_consol[:16]}")
-            
-            if st.button("🧠 Consolidate Now", use_container_width=True):
-                with st.spinner("Analyzing memories... (this may take 30-60 seconds)"):
-                    result = st.session_state.context_engine.consolidate_memories(openrouter_key)
-                    if result.get("error"):
-                        st.error(f"Error: {result['error']}")
-                    else:
-                        st.session_state.last_consolidation = result["timestamp"]
-                        st.success(f"✅ Created {result['created']} new context entries!")
-                        st.caption(f"Analyzed: {result['memories_analyzed']} memories | Cost: ${result['cost']:.4f}")
-                        if result.get("new_entries"):
-                            with st.expander("New entries created"):
-                                for entry in result["new_entries"]:
-                                    st.caption(f"[{entry['category']}] {entry['content']}")
-                        st.session_state.loop_manager.load_from_mnemo(use_smart_extraction=False)
-        
+
+        render_consolidation_panel(openrouter_key)
+
         st.divider()
         st.subheader("💰 Costs")
         st.caption(f"Messages: {st.session_state.get('message_count', 0)}")
         st.caption(f"Total: ${st.session_state.get('total_cost', 0):.4f}")
-    
-    # Render chat interface
+
+    return openrouter_key, hf_key
+
+
+def render_sessions_panel(mnemo_client, hf_key):
+    """Render the sessions list and folder management."""
+    col_title, col_refresh = st.columns([3, 1])
+    with col_title:
+        st.subheader("📚 Sessions")
+    with col_refresh:
+        if st.button("🔄", key="refresh_sessions", help="Refresh from cloud"):
+            try:
+                storage = get_persistent_storage(hf_key, mnemo_client)
+                sessions = storage.load_sessions(limit=MAX_SESSIONS_STORED)
+                st.session_state.session_history = sessions
+                st.rerun()
+            except Exception:
+                pass
+
+    if "session_folders" not in st.session_state:
+        st.session_state.session_folders = {"📁 Default": []}
+
+    with st.expander("📂 Manage Folders", expanded=False):
+        with st.popover("➕ Create Folder"):
+            new_folder = st.text_input("New folder name", placeholder="e.g., Story Ideas")
+            if st.button("Create", use_container_width=True):
+                if new_folder and new_folder.strip():
+                    folder_name = f"📁 {new_folder.strip()}"
+                    if folder_name not in st.session_state.session_folders:
+                        st.session_state.session_folders[folder_name] = []
+                        st.success(f"Created {folder_name}")
+                        st.rerun()
+
+        folders = list(st.session_state.session_folders.keys())
+        if len(folders) > 1:
+            with st.popover("🗑️ Delete Folder"):
+                folder_to_delete = st.selectbox("Delete folder", [""] + [f for f in folders if f != "📁 Default"])
+                if folder_to_delete and st.button("Delete", type="primary", use_container_width=True):
+                    st.session_state.session_folders["📁 Default"].extend(
+                        st.session_state.session_folders.get(folder_to_delete, [])
+                    )
+                    del st.session_state.session_folders[folder_to_delete]
+                    st.rerun()
+
+    sessions = st.session_state.get("session_history", [])
+
+    with st.container():
+        if sessions:
+            session_to_folder = {}
+            for folder, session_ids in st.session_state.session_folders.items():
+                for sid in session_ids:
+                    session_to_folder[sid] = folder
+
+            folders_with_sessions = {"📁 Default": []}
+            for folder in st.session_state.session_folders:
+                if folder not in folders_with_sessions:
+                    folders_with_sessions[folder] = []
+
+            for session in sessions:
+                sid = session.get("id", "")
+                folder = session_to_folder.get(sid, "📁 Default")
+                if folder not in folders_with_sessions:
+                    folder = "📁 Default"
+                folders_with_sessions[folder].append(session)
+
+            for folder, folder_sessions in folders_with_sessions.items():
+                if folder_sessions:
+                    st.caption(folder)
+                    for session in folder_sessions[:10]:
+                        session_id = session.get("id", "")
+                        title = session.get("title", "Untitled")[:30]
+
+                        col1, col2, col3, col4 = st.columns([6, 1, 1, 1])
+                        with col1:
+                            if st.button(f"💬 {title}", key=f"load_{session_id}", use_container_width=True):
+                                load_session(session_id)
+                                st.rerun()
+                        with col2:
+                            if st.button("✏️", key=f"rename_{session_id}", help="Rename"):
+                                rename_session_dialog(session_id, title)
+                        with col3:
+                            if st.button("📂", key=f"move_{session_id}", help="Move to folder"):
+                                move_session_dialog(session_id)
+                        with col4:
+                            if st.button("🗑️", key=f"del_{session_id}"):
+                                delete_session(session_id)
+                                st.rerun()
+                    st.caption("")
+        else:
+            st.caption("No previous sessions")
+
+
+def render_file_upload(mnemo_client, openrouter_key):
+    """Render file upload and extraction UI."""
+    st.markdown("**📎 Upload File → Memory**")
+    st.caption("Upload a file — extracts facts, deep context, style, and saves everything to memory loops in one pass")
+
+    uploaded_file = st.file_uploader("Upload file", type=["txt", "md", "csv", "json", "pdf", "docx"], label_visibility="collapsed")
+
+    if uploaded_file is not None:
+        if st.button("🧠 Extract Deep Context + Memories", use_container_width=True):
+            with st.spinner("Reading file..."):
+                content = extract_text_from_file(uploaded_file)
+
+            if content and not content.startswith("["):
+                n_chunks = max(1, (len(content) - 1) // 12000 + 1)
+                if n_chunks > 1:
+                    st.info(f"📄 {len(content):,} chars → splitting into {min(n_chunks, 5)} chunks for thorough extraction")
+
+                with st.spinner(f"Extracting deep context & memories ({min(n_chunks, 5)} API call{'s' if n_chunks > 1 else ''})..."):
+                    memories, cost = extract_memories_from_file(content, uploaded_file.name, openrouter_key)
+
+                if memories:
+                    with st.spinner("Storing to memory loops..."):
+                        current_session = st.session_state.get("current_session_id")
+                        stored = 0
+                        for mem in memories:
+                            cat = mem.get("category", "FACT").upper()
+                            txt = mem.get("content", "")
+                            if txt:
+                                meta = {"category": cat, "session_id": current_session, "source": "file_upload"}
+                                if mnemo_client.add(f"[{cat}] {txt}", metadata=meta, priority=1.5):
+                                    stored += 1
+
+                    facts = [m for m in memories if m.get("category") in ("CHARACTER", "PLOT", "SETTING", "THEME", "FACT")]
+                    context = [m for m in memories if m.get("category") in ("CONTEXT", "CLARIFICATION", "RELATIONSHIP", "INSTRUCTION")]
+                    style = [m for m in memories if m.get("category") in ("PROSE_SAMPLE", "DIALOGUE_SAMPLE", "VOICE", "VOCABULARY")]
+
+                    st.success(f"✅ Stored {stored} memories")
+                    st.caption(f"📊 {len(facts)} facts · {len(context)} deep context · {len(style)} style | Cost: ${cost:.4f}")
+
+                    with st.expander("View extracted memories", expanded=False):
+                        for mem in memories:
+                            cat = mem.get("category", "FACT")
+                            txt = mem.get("content", "")[:150]
+                            st.caption(f"**[{cat}]** {txt}")
+
+                    st.session_state.loop_manager.load_from_mnemo()
+                else:
+                    st.warning("No memories extracted. Try a different file.")
+            else:
+                st.error("Could not read file content")
+
+
+def render_memory_management(mnemo_client):
+    """Render add/view/delete memory UI."""
+    with st.expander("Add manually", expanded=False):
+        memory_category = st.selectbox("Category", ["CHARACTER", "PLOT", "SETTING", "THEME", "STYLE", "FACT"])
+        memory_content = st.text_area("Content", placeholder="e.g., Detective Mercer has a fear of water since childhood", height=80)
+        if st.button("💾 Save", use_container_width=True):
+            if memory_content.strip():
+                current_session = st.session_state.get("current_session_id")
+                meta = {"category": memory_category, "session_id": current_session}
+                if mnemo_client.add(f"[{memory_category}] {memory_content}", metadata=meta):
+                    st.success(f"✅ Saved [{memory_category}]")
+                    st.session_state.loop_manager.add_to_loop(memory_content, memory_category.lower())
+                else:
+                    st.error("Failed to save")
+
+    with st.expander("View memories", expanded=False):
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            if st.button("🔄 Refresh", use_container_width=True, key="refresh_mem"):
+                st.rerun()
+        with col2:
+            if st.button("📖 View All", use_container_width=True, key="view_all_mem"):
+                st.session_state.show_all_memories = True
+                st.rerun()
+
+        stats = mnemo_client.get_stats()
+        st.caption(f"Total: {stats.get('total_memories', 0)} | Links: {stats.get('total_links', 0)}")
+
+        memories = mnemo_client.list_memories()[:15]
+
+        st.markdown("""
+        <style>
+        .memory-scroll { max-height: 300px; overflow-y: auto; padding: 5px; border: 1px solid #333; border-radius: 5px; }
+        </style>
+        """, unsafe_allow_html=True)
+
+        for mem in memories:
+            col1, col2 = st.columns([5, 1])
+            with col1:
+                content = mem.get("content", "")[:60]
+                st.caption(f"{content}...")
+            with col2:
+                if st.button("🗑️", key=f"del_mem_{mem.get('id', '')}"):
+                    if mnemo_client.delete(mem.get("id")):
+                        st.rerun()
+
+        if len(mnemo_client.list_memories()) >= 15:
+            st.caption("... showing first 15. Click 'View All' for complete list")
+
+        st.markdown("---")
+        if st.button("🧹 Clear ALL Memories", use_container_width=True):
+            st.session_state.confirm_clear = True
+
+        if st.session_state.get("confirm_clear"):
+            st.warning("⚠️ Delete ALL memories?")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Yes, delete all"):
+                    mnemo_client.clear()
+                    st.session_state.confirm_clear = False
+                    st.rerun()
+            with col2:
+                if st.button("Cancel"):
+                    st.session_state.confirm_clear = False
+                    st.rerun()
+
+    # Full memory viewer
+    if st.session_state.get("show_all_memories"):
+        st.markdown("---")
+        st.subheader("📖 All Memories")
+
+        col1, col2, col3 = st.columns([1, 1, 1])
+        with col1:
+            if st.button("❌ Close", use_container_width=True, key="close_all_mem"):
+                st.session_state.show_all_memories = False
+                st.rerun()
+        with col2:
+            search_query = st.text_input("🔍 Search", key="mem_search", placeholder="Filter memories...")
+        with col3:
+            category_filter = st.selectbox("Category", ["All", "CHARACTER", "PLOT", "SETTING", "THEME", "CONTEXT", "STYLE", "FACT"], key="cat_filter")
+
+        all_memories = mnemo_client.list_memories()
+
+        if search_query:
+            all_memories = [m for m in all_memories if search_query.lower() in m.get("content", "").lower()]
+        if category_filter != "All":
+            all_memories = [m for m in all_memories if f"[{category_filter}]" in m.get("content", "")]
+
+        st.caption(f"Showing {len(all_memories)} memories")
+
+        st.markdown("""
+        <style>
+        .full-memory-scroll { max-height: 500px; overflow-y: auto; padding: 10px; border: 1px solid #444; border-radius: 8px; background: #1a1a1a; }
+        </style>
+        """, unsafe_allow_html=True)
+
+        for mem in all_memories:
+            content = mem.get("content", "")
+            mem_id = mem.get("id", "")
+
+            category = "OTHER"
+            if content.startswith("["):
+                category = content.split("]")[0][1:]
+
+            col1, col2, col3 = st.columns([1, 8, 1])
+            with col1:
+                st.caption(f"[{category}]")
+            with col2:
+                st.text(content[len(f"[{category}]"):].strip()[:200])
+            with col3:
+                if st.button("🗑️", key=f"del_full_{mem_id}"):
+                    if mnemo_client.delete(mem_id):
+                        st.rerun()
+
+
+def render_consolidation_panel(openrouter_key):
+    """Render the memory consolidation UI."""
+    with st.expander("🧠 Memory Consolidation", expanded=False):
+        st.caption("Analyze memories & generate deep context entries")
+        last_consol = st.session_state.get("last_consolidation")
+        if last_consol:
+            st.caption(f"Last run: {last_consol[:16]}")
+
+        if st.button("🧠 Consolidate Now", use_container_width=True):
+            with st.spinner("Analyzing memories... (this may take 30-60 seconds)"):
+                result = st.session_state.context_engine.consolidate_memories(openrouter_key)
+                if result.get("error"):
+                    st.error(f"Error: {result['error']}")
+                else:
+                    st.session_state.last_consolidation = result["timestamp"]
+                    st.success(f"✅ Created {result['created']} new context entries!")
+                    st.caption(f"Analyzed: {result['memories_analyzed']} memories | Cost: ${result['cost']:.4f}")
+                    if result.get("new_entries"):
+                        with st.expander("New entries created"):
+                            for entry in result["new_entries"]:
+                                st.caption(f"[{entry['category']}] {entry['content']}")
+                    st.session_state.loop_manager.load_from_mnemo(use_smart_extraction=False)
+
+
+# ============================================================================
+# CHAT RENDERER (v5.1: extracted from main())
+# ============================================================================
+
+def render_chat(openrouter_key, mnemo_client):
+    """Render chat history and handle new messages."""
+
+    # Display existing messages
     for idx, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
@@ -876,140 +1086,122 @@ def main():
                 with col2:
                     if st.button("📋", key=f"copy_{idx}", help="Copy response"):
                         copy_response_dialog(message["content"])
-    
+
+    # Handle new input
     if prompt := st.chat_input("What's on your mind?"):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
-        
+
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                conversation_length = len(st.session_state.messages)
-                needs_memory, memory_reason = st.session_state.smart_memory.should_use_memory(prompt, conversation_length)
+                response, error, result_meta = handle_message(prompt, openrouter_key, mnemo_client)
+
+            if error:
+                st.error(error)
+                # FIX: Remove the stranded user message so the chat history doesn't break
+                st.session_state.messages.pop()
+            else:
+                st.markdown(response)
+
+                # Display metadata
+                meta_parts = []
+                if result_meta.get("sessions_found", 0) > 0:
+                    meta_parts.append(f"📜 {result_meta['sessions_found']} past chats")
+                if result_meta.get("cross_session_memories_used", 0) > 0:
+                    meta_parts.append(f"📚 {result_meta['cross_session_memories_used']} memories")
+                if result_meta.get("mode") == "smart":
+                    meta_parts.append(f"🔄 {result_meta.get('context_tokens', 0)} tokens")
+                elif result_meta.get("mode") == "skip":
+                    meta_parts.append("⚡ fast")
+                if result_meta.get("extracted", 0) > 0:
+                    meta_parts.append(f"🧠 {result_meta['extracted']} extracted")
+                meta_parts.append(f"💰 ${result_meta.get('cost', 0):.4f}")
+                st.caption(" | ".join(meta_parts))
+
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": response,
+                    "metadata": result_meta,
+                })
+
+                save_current_session()
+
+
+# ============================================================================
+# MAIN APP (v5.1: clean orchestrator)
+# ============================================================================
+
+def main():
+    st.set_page_config(page_title="4o with Memory", page_icon="🧠", layout="wide")
+    st.title("🧠 4o with Memory")
+    st.caption("GPT-4o with warm, conversational style and persistent memory")
+
+    if not DEFAULT_OPENROUTER_KEY or not DEFAULT_HF_KEY:
+        st.error("⚠️ **API Keys Not Configured!**")
+        st.markdown("""
+        **For Streamlit Cloud:**
+        1. Go to your app's Settings → Secrets
+        2. Add your keys in TOML format:
+        ```toml
+        OPENROUTER_KEY = "sk-or-v1-your-key"
+        HF_KEY = "hf_your-token"
+        ```
+        """)
+        st.stop()
+
+    # Initialize core client
+    mnemo_client = init_client(DEFAULT_HF_KEY)
+
+    # Load session history on first run
+    if "session_history_loaded" not in st.session_state:
+        st.session_state.session_history_loaded = True
+        st.session_state.session_history = []
+        try:
+            storage = get_persistent_storage(DEFAULT_HF_KEY, mnemo_client)
+            if storage:
+                sessions = storage.load_sessions(limit=MAX_SESSIONS_STORED)
+                if sessions:
+                    st.session_state.session_history = sessions
                 
-                past_conversation_context = ""
-                sessions_found = 0
-                current_session_id = st.session_state.get("current_session_id", "")
-                skip_loops_for_this_query = False
-                
-                if needs_memory and st.session_state.get("cross_session_enabled", True):
-                    storage = get_persistent_storage(DEFAULT_HF_KEY, mnemo_client)
-                    if storage:
-                        prompt_lower = prompt.lower()
-                        asking_about_past = any(phrase in prompt_lower for phrase in [
-                            "last chat", "previous chat", "last conversation", 
-                            "previous conversation", "earlier chat", "before this",
-                            "what did we talk", "what were we", "did we discuss",
-                            "remember when", "last time", "our last", "previous session",
-                            "talked about", "chatting about", "we discussed", "we were talking"
-                        ])
-                        
-                        if asking_about_past:
-                            skip_loops_for_this_query = True
-                            session_results = storage.search_sessions(prompt, current_session_id=current_session_id, limit=2)
-                            if session_results:
-                                sessions_found = len(session_results)
-                                past_conversation_context = "\n\n[PREVIOUS CHAT SESSIONS - The user is asking about past conversations. Use ONLY this information to answer. Do NOT use other memories:]\n" + "\n---\n".join(session_results)
-                            else:
-                                recent = storage.get_previous_sessions_content(current_session_id=current_session_id, limit=2)
-                                if recent:
-                                    sessions_found = len(recent)
-                                    summaries = [f"Session '{s['title']}':\n{s['summary']}" for s in recent]
-                                    past_conversation_context = "\n\n[RECENT CHAT SESSIONS - The user is asking about past conversations. Use ONLY this information to answer:]\n" + "\n---\n".join(summaries)
-                        else:
-                            past_convos = storage.search_conversations(prompt, limit=3)
-                            if past_convos:
-                                past_conversation_context = "\n\n[PAST CONVERSATIONS]\n" + "\n".join(f"• {conv[:200]}" for conv in past_convos)
-                            
-                            # Add standard memories via Deep Context Engine
-                            if st.session_state.get("use_loops", True):
-                                enriched, enrich_meta = st.session_state.context_engine.build_rich_context(prompt, st.session_state.loop_manager)
-                                if enriched:
-                                    past_conversation_context += f"\n\n[DEEP CONTEXT]\n{enriched}"
-                
-                full_system_prompt = SYSTEM_PROMPT + past_conversation_context
-                
-                messages, context_stats = st.session_state.context_manager.build_optimized_context(
-                    system_prompt=full_system_prompt,
-                    query=prompt,
-                    conversation_history=st.session_state.messages,
-                    max_messages=MAX_CONVERSATION_MESSAGES,
-                    use_loops=(needs_memory and st.session_state.get("use_loops", True) and not skip_loops_for_this_query)
-                )
-                
-                context_meta = {
-                    "cross_session_memories_used": context_stats.get("memory_items_full", 0) + context_stats.get("memory_items_meta", 0),
-                    "context_tokens": context_stats.get("total_tokens", 0),
-                    "mode": "smart" if needs_memory else "skip",
-                    "memory_reason": memory_reason,
-                    "sessions_found": sessions_found
-                }
-                
-                response, input_tokens, output_tokens, error = call_openrouter(messages, openrouter_key)
-                
-                if error:
-                    st.error(error)
-                else:
-                    cost_tracker = CostTracker()
-                    msg_cost = cost_tracker.add_usage(input_tokens, output_tokens)
-                    
-                    if not skip_loops_for_this_query:
-                        try:
-                            storage = get_persistent_storage(DEFAULT_HF_KEY, mnemo_client)
-                            if storage:
-                                storage.save_conversation_turn(prompt, response, st.session_state.get("current_session_id"))
-                        except Exception:
-                            pass
-                    
-                    extracted = 0
-                    if st.session_state.get("auto_extract", True) and not skip_loops_for_this_query:
-                        conversation = f"User: {prompt}\n\nAssistant: {response}"
-                        memories, extract_cost = extract_memories_with_gpt(conversation, openrouter_key)
-                        if memories:
-                            current_session = st.session_state.get("current_session_id")
-                            msg_cost += extract_cost
-                            
-                            for mem in memories:
-                                cat = mem.get("category", "FACT").upper()
-                                txt = mem.get("content", "")
-                                if txt:
-                                    meta = {"category": cat, "session_id": current_session}
-                                    if mnemo_client.add(f"[{cat}] {txt}", metadata=meta):
-                                        extracted += 1
-                                        st.session_state.loop_manager.add_to_loop(content=txt, category=cat.lower())
-                    
-                    st.markdown(response)
-                    
-                    meta_parts = []
-                    if context_meta.get("sessions_found", 0) > 0:
-                        meta_parts.append(f"📜 {context_meta['sessions_found']} past chats")
-                    if context_meta.get("cross_session_memories_used", 0) > 0:
-                        meta_parts.append(f"📚 {context_meta['cross_session_memories_used']} memories")
-                    if context_meta.get("mode") == "smart":
-                        meta_parts.append(f"🔄 {context_meta.get('context_tokens', 0)} tokens")
-                    elif context_meta.get("mode") == "skip":
-                        meta_parts.append("⚡ fast")
-                    if extracted > 0:
-                        meta_parts.append(f"🧠 {extracted} extracted")
-                    meta_parts.append(f"💰 ${msg_cost:.4f}")
-                    st.caption(" | ".join(meta_parts))
-                    
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": response,
-                        "metadata": {
-                            "cross_session_memories_used": context_meta.get("cross_session_memories_used", 0),
-                            "context_tokens": context_meta.get("context_tokens", 0),
-                            "mode": context_meta.get("mode", "full"),
-                            "extracted": extracted,
-                            "cost": msg_cost
-                        }
-                    })
-                    
-                    save_current_session()
-    
+                # FIX: Load persistent folders
+                if hasattr(storage, 'load_folder_state'):
+                    st.session_state.session_folders = storage.load_folder_state()
+        except Exception:
+            pass
+
+    if "current_session_id" not in st.session_state:
+        st.session_state.current_session_id = generate_session_id()
+    if "custom_titles" not in st.session_state:
+        st.session_state.custom_titles = {}
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    # Core engines
+    if "loop_manager" not in st.session_state:
+        st.session_state.loop_manager = LoopManager(mnemo_client=mnemo_client, openrouter_key=DEFAULT_OPENROUTER_KEY)
+        st.session_state.loop_manager.load_from_mnemo(use_smart_extraction=False)
+    if "smart_memory" not in st.session_state:
+        st.session_state.smart_memory = SmartMemory()
+    if "context_engine" not in st.session_state:
+        st.session_state.context_engine = ContextEngine(mnemo_client=mnemo_client, openrouter_key=DEFAULT_OPENROUTER_KEY)
+    if "context_manager" not in st.session_state:
+        st.session_state.context_manager = ContextWindowManager(loop_manager=st.session_state.loop_manager)
+    else:
+        st.session_state.context_manager.set_loop_manager(st.session_state.loop_manager)
+
+    # Render UI
+    openrouter_key, hf_key = render_sidebar(mnemo_client, DEFAULT_OPENROUTER_KEY, DEFAULT_HF_KEY)
+
+    # FIX: Ensure the client updates its headers if the user typed a new key
+    if mnemo_client.token != hf_key:
+        mnemo_client.token = hf_key
+        mnemo_client.session.headers.update({"Authorization": f"Bearer {hf_key}"})
+
+    render_chat(openrouter_key, mnemo_client)
+
     st.divider()
-    st.caption("🧠 4o with Memory | GPT-4o + Mnemo v4.5 + Metadata Loops")
+    st.caption("🧠 4o with Memory | GPT-4o + Mnemo v5.1 + Metadata Loops")
 
 if __name__ == "__main__":
     main()
