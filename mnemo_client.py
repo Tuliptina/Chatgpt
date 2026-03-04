@@ -1,7 +1,7 @@
 """
-Mnemo v5.1 REST Client
+Mnemo v5.3 REST Client
 
-Standalone client for the Mnemo v5.1 memory server.
+Standalone client for the Mnemo v5.3 memory server.
 Uses requests.Session for connection pooling (TCP reuse across calls).
 
 Hosted at: https://athelaperk-mnemo-mcp.hf.space
@@ -9,6 +9,10 @@ Hosted at: https://athelaperk-mnemo-mcp.hf.space
 Extracted from memory.py so that context_engine.py, metadata_loops.py,
 and session_store.py can all import a single client instead of each
 building their own inline requests calls.
+
+v5.3 changes:
+- should_inject() now returns 3-tuple: (bool, str, float) to expose
+  the server's confidence score for two-tier gate decisions.
 
 v5.1 changes:
 - add() now accepts priority (0.0–2.0) for decay resistance
@@ -25,7 +29,7 @@ DEFAULT_MNEMO_URL = "https://athelaperk-mnemo-mcp.hf.space"
 
 class MnemoClient:
     """
-    Client for Mnemo v5.1 Server -- three-tiered memory hierarchy,
+    Client for Mnemo v5.3 Server -- three-tiered memory hierarchy,
     neural link pathways, memory utility predictor, self-tuning params.
 
     Uses requests.Session for connection pooling so that repeated
@@ -168,10 +172,18 @@ class MnemoClient:
         except Exception:
             return ""
 
-    def should_inject(self, query: str) -> Tuple[bool, str]:
-        """Ask Mnemo whether memory should be injected for this query."""
+    def should_inject(self, query: str) -> Tuple[bool, str, float]:
+        """Ask Mnemo whether memory should be injected for this query.
+
+        v5.3: Now returns a 3-tuple (should_inject, reason, confidence)
+        to expose the server's semantic confidence score. Used by
+        SmartMemory.two_tier_gate() for Tier 2 decisions.
+
+        Returns:
+            (should_inject: bool, reason: str, confidence: float)
+        """
         if not self.available:
-            return False, "mnemo_unavailable"
+            return False, "mnemo_unavailable", 0.0
         try:
             response = self.session.post(
                 f"{self.base_url}/should_inject",
@@ -180,10 +192,14 @@ class MnemoClient:
             )
             if response.status_code == 200:
                 data = response.json()
-                return data.get("should_inject", False), data.get("reason", "unknown")
-            return False, "api_error"
+                return (
+                    data.get("should_inject", False),
+                    data.get("reason", "unknown"),
+                    data.get("confidence", 0.0),
+                )
+            return False, "api_error", 0.0
         except Exception:
-            return False, "exception"
+            return False, "exception", 0.0
 
     def list_memories(self, namespace: str = "default") -> List[Dict]:
         """List all memories in a namespace."""
