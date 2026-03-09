@@ -3,7 +3,7 @@ Context Engine - Deep Context Generation and Memory Consolidation
 
 Two key features:
 1. RICH CONTEXT: Format pre-fetched memories for LLM injection (pure formatter)
-2. CONSOLIDATION: K2.5 "sleep" pass that generates deep context entries
+2. CONSOLIDATION: K2 "sleep" pass that generates deep context entries
    (CONTEXT, RELATIONSHIP, CLARIFICATION, TIMELINE, TONE) from raw facts
 
 v6.0 changes:
@@ -186,7 +186,15 @@ TIMELINE: Sequence of events with causation.
 TONE: How specific characters or scenes should FEEL.
   Example: "Isabella's scenes: obsessive tenderness. She genuinely believes she's caring for Sebastian. The horror comes from her sincerity, not cruelty."
 
-Generate 5-15 NEW entries. Be bold — find connections between facts that aren't obvious.
+Generate 5-15 NEW entries. STRICT RULE: ONLY use information that is explicitly stated or directly implied by the facts above. Do NOT invent new details, scenes, or events. If a fact says "Alistair fears dementia," you can infer tone guidance — but do NOT fabricate HOW he discovered this fear.
+
+CRITICAL RULES:
+- ONLY derive insights from the facts above. Do NOT fabricate events, dialogue, or details not present in the facts.
+- CONTEXT entries should explain what existing facts MEAN, not invent new backstory.
+- RELATIONSHIP entries should describe dynamics stated or clearly implied by the facts.
+- CLARIFICATION entries should prevent misreading of what the facts actually say.
+- TONE entries should describe how to WRITE scenes based on the character/plot facts given.
+- If you're unsure whether something is in the facts, leave it out.
 
 Return ONLY a JSON object:
 {{
@@ -208,10 +216,10 @@ Return ONLY a JSON object:
                 json={
                     "model": MEMORY_MODEL_ID,
                     "messages": [
-                        {"role": "system", "content": "You are a story analyst. Generate NEW deep context entries from existing facts. Return ONLY valid JSON with an 'entries' array. No markdown, no explanation — pure JSON only."},
+                        {"role": "system", "content": "You are a story analyst. Your job is to derive CONTEXT, RELATIONSHIP, CLARIFICATION, and TONE entries strictly from the facts provided. Never invent new events or details — only explain, connect, and interpret what is already there. Return ONLY valid JSON with an 'entries' array. No markdown, no explanation — pure JSON only."},
                         {"role": "user", "content": consolidation_prompt}
                     ],
-                    "temperature": 0.4,
+                    "temperature": 0.2,
                     "max_tokens": 3000,
                 },
                 timeout=90
