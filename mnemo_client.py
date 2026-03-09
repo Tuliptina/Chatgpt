@@ -252,14 +252,14 @@ class MnemoClient:
                   connects_to: str = "", reason: str = "",
                   weight: float = 0.5, category: str = "fact",
                   session_id: str = "", source: str = "auto_extract",
-                  thread_id: str = "", position: int = -1, 
+                  thread_id: str = "", position: int = -1,
                   namespace: str = "default") -> Optional[str]:
         """Add a ConnectionPoint. Returns CP ID or None."""
         result = self._call(
             "add_point_api",
             entity, point_type, value, connects_to, reason,
             str(weight), category, session_id, source,
-            thread_id, str(position), namespace
+            thread_id, str(position), namespace,
         )
         if result and isinstance(result, dict):
             return result.get("id")
@@ -272,12 +272,9 @@ class MnemoClient:
             return result.get("created", [])
         return []
 
-    def graph_search(self, query: str, top_k: int = 15, active_sessions: List[str] = None) -> List[Dict]:
+    def graph_search(self, query: str, top_k: int = 15) -> List[Dict]:
         """Graph search for ConnectionPoints. Returns list of CP dicts."""
-        sessions_str = json.dumps(active_sessions) if active_sessions else "[]"
-        
-        # Pass the 3rd argument to the API
-        result = self._call("graph_search_api", query, str(top_k), sessions_str)
+        result = self._call("graph_search_api", query, str(top_k))
         if result and isinstance(result, list):
             return result
         return []
