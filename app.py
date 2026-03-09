@@ -57,7 +57,7 @@ MNEMO_URL = "https://athelaperk-mnemo.hf.space"
 
 # v6.0: Two models — writing (4o) and memory ops (K2)
 WRITING_MODEL_ID = "openai/gpt-4o-2024-11-20"
-MEMORY_MODEL_ID = "moonshotai/kimi-k2"
+MEMORY_MODEL_ID = "moonshotai/kimi-k2-0905"
 
 # v6.0: Per-model sampling parameters
 WRITING_PARAMS = {
@@ -524,9 +524,12 @@ def extract_memories_from_file(content, filename, openrouter_key):
 
     all_memories, total_cost = [], 0
     for memories, cost in results:
-        if memories:
-            all_memories.extend(memories)
+        if memories and isinstance(memories, list):
+            # FIX: Only keep elements that are actually dictionaries
+            valid_mems = [m for m in memories if isinstance(m, dict)]
+            all_memories.extend(valid_mems)
         total_cost += cost
+        
     seen = set()
     unique = []
     for mem in all_memories:
@@ -604,7 +607,14 @@ Return ONLY a JSON object:
             if clean.endswith("```"):
                 clean = clean[:-3]
         parsed = json.loads(clean.strip())
-        return parsed.get("memories", []), cost
+        
+        # FIX: Ensure we only return a list of dictionaries
+        raw_memories = parsed.get("memories", [])
+        if isinstance(raw_memories, list):
+            valid_memories = [m for m in raw_memories if isinstance(m, dict)]
+            return valid_memories, cost
+            
+        return [], cost
     except Exception:
         return [], 0
 
@@ -667,7 +677,14 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
     storage = get_persistent_storage()
     if not storage:
         return "", metadata, False
-
+    if not use_loops:
+            try:
+                # Check isolation toggle
+                isolate = st.session_state.get("isolate_sessions", False)
+                active_sessions = [current_session_id] if isolate and current_session_id else None
+                
+                # v6.1: Pass active_sessions to the client
+                cp_results = mnemo_client.graph_search(prompt, top_k=12, active_sessions=active_sessions)
     prompt_lower = prompt.lower()
     asking_about_past = any(phrase in prompt_lower for phrase in [
         "last chat", "previous chat", "last conversation",
