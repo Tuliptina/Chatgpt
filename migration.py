@@ -14,8 +14,8 @@ Can be run as:
   - From Streamlit: import and call run_migration(mnemo_client, openrouter_key)
   - Incremental: safe to re-run; skips already-migrated blobs
 
-Estimated cost: ~$0.05-$0.10 (K2 processing ~400 blobs in ~20 API calls)
-Estimated time: 2-5 minutes on K2
+Estimated cost: ~$0.05-$0.10 (K2.5 processing ~400 blobs in ~20 API calls)
+Estimated time: 2-5 minutes on K2.5
 """
 
 import json
