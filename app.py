@@ -330,7 +330,7 @@ def extract_text_from_file(uploaded_file):
     return content
 
 async def process_chunk_async(http_client, chunk, filename, i, total_chunks, openrouter_key):
-    """v6.0: Routes to MEMORY_MODEL_ID. Produces consolidated, context-rich memories."""
+    """v6.0: Routes to MEMORY_MODEL_ID. All 4 layers with mandatory deep context."""
     chunk_label = f" (part {i+1}/{total_chunks})" if total_chunks > 1 else ""
     prompt = f"""Analyze this document and extract everything worth remembering.
 
@@ -343,27 +343,41 @@ RULES:
 - CONSOLIDATE related facts into single rich entries. One entry per character, per plot arc, per theme.
 - Each memory should be 1-3 sentences with CONTEXT — not bare facts.
 - Include WHY things matter narratively, not just WHAT they are.
-- For characters: combine traits, fears, relationships, motivations into one entry.
-- For plot: include cause, effect, and what it sets up.
-- For tone: describe HOW scenes should feel, what to avoid.
+- You MUST include CONTEXT, RELATIONSHIP, and CLARIFICATION entries — not just CHARACTER/PLOT facts.
+- At least 30% of entries should be LAYER 2 (CONTEXT, RELATIONSHIP, CLARIFICATION, INSTRUCTION).
 
-Categories (use the most specific one):
-LAYER 1 - FACTS: CHARACTER, PLOT, SETTING, THEME, FACT
-LAYER 2 - DEEP CONTEXT: CONTEXT, CLARIFICATION, RELATIONSHIP, INSTRUCTION
-LAYER 3 - STYLE: PROSE_SAMPLE, DIALOGUE_SAMPLE, VOICE, VOCABULARY
-LAYER 4 - TONE: TONE (scene registers, humor types, emotional shifts, atmosphere, do-nots)
+LAYER 1 — FACTS:
+- CHARACTER: Who they are, traits, fears, motivations — one entry per character
+- PLOT: What happened, why it matters, what it sets up
+- SETTING: Where/when, atmosphere
+- THEME: Recurring ideas, symbols
+- FACT: Other important details
 
-BAD (fragmented):
-  {{"category": "CHARACTER", "content": "Alistair is a professor"}}
-  {{"category": "CHARACTER", "content": "Alistair fears dementia"}}
+LAYER 2 — DEEP CONTEXT (MANDATORY — include at least 2-3 of these):
+- CONTEXT: Why something matters, what could be misunderstood, deeper meaning
+- RELATIONSHIP: How two characters relate — dynamics, power balance, emotional undercurrent
+- CLARIFICATION: "When X happens, it means Y, NOT Z" — prevents misinterpretation
+- INSTRUCTION: Explicit rules about how to write/handle something
 
-GOOD (consolidated):
-  {{"category": "CHARACTER", "content": "Alistair Fitzroy: late 30s pharmacology professor, Red Rose manipulator. Driven by fear of being forgotten — secretly funds an orphanage as legacy insurance. Terrified of developing dementia like his father. His scenes should feel clinical and precise, power expressed through control not violence."}}
+LAYER 3 — STYLE:
+- PROSE_SAMPLE / DIALOGUE_SAMPLE / VOICE / VOCABULARY
+
+LAYER 4 — TONE:
+- TONE: How scenes should feel, humor types, emotional registers, do-nots
+
+EXAMPLES (notice the mix of layers):
+  {{"category": "CHARACTER", "content": "Alistair Fitzroy: late 30s pharmacology professor, Red Rose manipulator. Driven by fear of being forgotten. Terrified of developing dementia like his father."}}
+  {{"category": "RELATIONSHIP", "content": "Alistair → Sebastian: former friend turned captor. Alistair frames captivity as medical care. Their dynamic is intellectual chess — Alistair respects Sebastian's mind while destroying his autonomy."}}
+  {{"category": "RELATIONSHIP", "content": "Alistair → Elijah: estranged brothers. Alistair envies Elijah's peace and spiritual conviction. Their father disowned Elijah — Alistair secretly resents that Elijah escaped while he inherited the burden."}}
+  {{"category": "CONTEXT", "content": "The Red Rose Society is NOT a simple villain organization. It's a decentralized medical order practicing social Darwinism — members believe they're advancing humanity through controlled suffering. Writing them as mustache-twirling villains undermines the story's philosophical spine."}}
+  {{"category": "CLARIFICATION", "content": "When Sebastian goes quiet in a scene, it signals dissociation — a trauma response. Never write his silence as peaceful acceptance or stoic strength. It's shutdown, not calm."}}
+  {{"category": "CONTEXT", "content": "The legal-ethical gap is the series' central philosophical spine: what is ethical is not always legal, and vice versa. Every faction represents a different position on this spectrum."}}
+  {{"category": "TONE", "content": "Alistair's scenes: clinical precision, cold menace. Power through control, never raised voices. His humor is dry and cutting — it should make the reader uneasy, not laugh."}}
 
 Return ONLY a JSON object:
 {{
   "memories": [
-    {{"category": "CATEGORY", "content": "consolidated fact with context and narrative significance"}}
+    {{"category": "CATEGORY", "content": "consolidated entry"}}
   ]
 }}"""
 
@@ -457,6 +471,7 @@ RULES:
 - Aim for 3-10 memories, each 1-3 sentences long.
 - If a fact is trivial or obvious from context, skip it.
 - ALWAYS extract at least one CONTEXT or RELATIONSHIP entry if characters interact.
+- At least 30% of entries should be LAYER 2 (CONTEXT, RELATIONSHIP, CLARIFICATION).
 
 Extract in ALL 4 layers:
 
