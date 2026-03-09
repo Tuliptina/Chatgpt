@@ -26,8 +26,8 @@ from mnemo_client import MnemoClient
 
 # v6.0: Memory model for consolidation (matches app.py config)
 MEMORY_MODEL_ID = "moonshotai/kimi-k2"
-MEMORY_COST_INPUT = 0.60 / 1_000_000
-MEMORY_COST_OUTPUT = 3.00 / 1_000_000
+MEMORY_COST_INPUT = 0.47 / 1_000_000
+MEMORY_COST_OUTPUT = 2.00 / 1_000_000
 
 
 # =============================================================================
@@ -116,12 +116,9 @@ class ContextEngine:
         """
         Memory consolidation — like human sleep consolidation.
 
-        v6.0: Routes to K2.5 (MEMORY_MODEL_ID) instead of GPT-4o.
-        Cost: ~$0.007 per run (was ~$0.03). Now also generates TONE entries.
-
-        Reads all raw facts from Mnemo, sends them to K2.5 to generate
-        deep context entries, deduplicates against existing context, and
-        stores new entries back.
+        v6.0: Routes to K2 (MEMORY_MODEL_ID) instead of GPT-4o.
+        Reads raw facts, generates NEW deep context entries, stores them.
+        Never deletes existing memories — purely additive.
         """
         api_key = openrouter_key or self.openrouter_key
         if not api_key:
@@ -132,7 +129,9 @@ class ContextEngine:
             "memories_analyzed": 0,
             "new_entries": [],
             "created": 0,
-            "cost": 0.0
+            "cost": 0.0,
+            "k2_returned": 0,
+            "dedup_rejected": 0,
         }
 
         # Fetch all memories via MnemoClient
@@ -149,73 +148,56 @@ class ContextEngine:
         # Separate facts from existing context
         facts = []
         existing_context = []
-        existing_clarifications = []
 
         for mem in all_memories:
             content = mem.get("content", "")
-            if content.startswith("[CONTEXT]") or content.startswith("[RELATIONSHIP]"):
+            if any(content.startswith(f"[{tag}]") for tag in
+                   ("CONTEXT", "RELATIONSHIP", "CLARIFICATION", "TIMELINE", "TONE")):
                 existing_context.append(content)
-            elif content.startswith("[CLARIFICATION]"):
-                existing_clarifications.append(content)
             elif content.startswith("[SESSION]") or content.startswith("[CONVERSATION]"):
                 continue
             else:
                 facts.append(content)
 
+        if not facts:
+            return {"error": "No facts to analyze (only context entries exist)", "created": 0}
+
         facts_text = "\n".join(facts[:100])
-        existing_context_text = "\n".join(existing_context[:20])
 
-        consolidation_prompt = f"""Analyze these story memories and generate DEEP CONTEXT entries.
+        consolidation_prompt = f"""You are analyzing story memories to generate NEW deep context entries.
 
-EXISTING FACTS:
+EXISTING FACTS TO ANALYZE:
 {facts_text}
 
-EXISTING CONTEXT (avoid duplicating):
-{existing_context_text if existing_context_text else "None yet"}
+YOUR TASK — generate entries in these categories:
 
-YOUR TASK:
-1. Identify facts that could be MISINTERPRETED without context
-2. Find IMPLICIT RELATIONSHIPS between characters/events
-3. Note any TIMELINE or sequence information
-4. Create entries that explain WHAT THINGS MEAN, not just what they are
-5. Extract TONE directives — how scenes should FEEL, not just what happens
+CONTEXT: Explain what a fact MEANS. What could be misunderstood? What's the subtext?
+  Example: "When Sebastian stops speaking mid-scene, it's dissociation from trauma — never write it as stoic calm or peaceful acceptance."
 
-Generate ONLY a JSON object containing an array called "entries" with NEW entries only (don't duplicate existing). Example format:
+RELATIONSHIP: How two characters relate. Power dynamics, emotional undercurrent, history.
+  Example: "Alistair → Elijah: estranged brothers. Alistair envies Elijah's peace. Their father disowned Elijah for becoming a Quaker — Alistair secretly resents inheriting the family burden."
+
+CLARIFICATION: Prevent specific misinterpretations.
+  Example: "The Red Rose Society is NOT a shadowy cabal of villains. It's a decentralized medical order where members genuinely believe controlled suffering advances humanity. Writing them as evil undermines the story's moral complexity."
+
+TIMELINE: Sequence of events with causation.
+  Example: "Captivity arc sequence: Alistair offers 'treatment' → Sebastian arrives at Blackwood Estate → drug protocols begin → Isabella takes over → tattoo scene (branding) → Evelyn launches rescue."
+
+TONE: How specific characters or scenes should FEEL.
+  Example: "Isabella's scenes: obsessive tenderness. She genuinely believes she's caring for Sebastian. The horror comes from her sincerity, not cruelty."
+
+Generate 5-15 NEW entries. Be bold — find connections between facts that aren't obvious.
+
+Return ONLY a JSON object:
 {{
   "entries": [
-    {{
-      "category": "CONTEXT",
-      "content": "Explanation of deeper meaning behind a fact"
-    }},
-    {{
-      "category": "RELATIONSHIP",
-      "content": "Character A -> Character B: nature of relationship, dynamics"
-    }},
-    {{
-      "category": "CLARIFICATION",
-      "content": "When X is mentioned, it means Y, NOT Z. Common misinterpretation to avoid."
-    }},
-    {{
-      "category": "TIMELINE",
-      "content": "Sequence: Event A -> Event B -> Event C (with context)"
-    }},
-    {{
-      "category": "TONE",
-      "content": "Character X's scenes should feel [register]. Their humor is [type] — it should make the reader [effect], not [wrong effect]. DO NOT [common mistake]."
-    }}
+    {{"category": "CONTEXT", "content": "your insight"}},
+    {{"category": "RELATIONSHIP", "content": "your insight"}},
+    {{"category": "CLARIFICATION", "content": "your insight"}},
+    {{"category": "TONE", "content": "your insight"}}
   ]
-}}
+}}"""
 
-RULES:
-- Focus on things that could be misunderstood
-- Make relationships explicit
-- Create 5-15 high-value entries
-- TONE entries are critical — extract HOW scenes should feel for each character
-- Identify humor types (dark, dry, bitter, nervous) and their narrative function
-- Note emotional DO NOTs (e.g., "never let Sebastian cry — he dissociates, not emotes")
-- Skip entries if existing context already covers them"""
-
-        # v6.0: Call K2.5 (MEMORY_MODEL_ID) for consolidation — ~77% cheaper than GPT-4o
         try:
             response = requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
@@ -226,53 +208,76 @@ RULES:
                 json={
                     "model": MEMORY_MODEL_ID,
                     "messages": [
-                        {"role": "system", "content": "You are a story analyst creating deep context and tone entries. Return JSON only."},
+                        {"role": "system", "content": "You are a story analyst. Generate NEW deep context entries from existing facts. Return ONLY valid JSON with an 'entries' array. No markdown, no explanation — pure JSON only."},
                         {"role": "user", "content": consolidation_prompt}
                     ],
-                    "temperature": 0.2,
-                    "max_tokens": 2000,
-                    "response_format": {"type": "json_object"}
+                    "temperature": 0.4,
+                    "max_tokens": 3000,
                 },
-                timeout=60
+                timeout=90
             )
 
             if response.status_code != 200:
-                return {"error": f"API error: {response.status_code}", "created": 0}
+                return {"error": f"API error: {response.status_code} — {response.text[:200]}", "created": 0}
 
             data = response.json()
 
             usage = data.get("usage", {})
             input_tokens = usage.get("prompt_tokens", 0)
             output_tokens = usage.get("completion_tokens", 0)
-            # v6.0: K2.5 pricing ($0.60/$3.00 per M tokens)
             results["cost"] = (input_tokens * MEMORY_COST_INPUT + output_tokens * MEMORY_COST_OUTPUT)
 
             content = data["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
+            # Strip markdown fences if K2 wraps JSON in ```json ... ```
+            clean = content.strip()
+            if clean.startswith("```"):
+                clean = clean.split("\n", 1)[-1] if "\n" in clean else clean[3:]
+                if clean.endswith("```"):
+                    clean = clean[:-3]
+                clean = clean.strip()
+            parsed = json.loads(clean)
             new_entries = parsed.get("entries", [])
+            results["k2_returned"] = len(new_entries)
 
         except json.JSONDecodeError as e:
-            return {"error": f"JSON parse error: {e}", "created": 0}
+            # Include raw content in error for debugging
+            raw_preview = content[:200] if 'content' in dir() else 'no content'
+            return {"error": f"JSON parse error: {e} — raw: {raw_preview}", "created": 0}
         except Exception as e:
             return {"error": f"API error: {e}", "created": 0}
 
-        # Store new entries, deduplicating against existing context
+        # Handle models returning different key names
+        if not new_entries:
+            for key in ("results", "memories", "items", "data"):
+                new_entries = parsed.get(key, [])
+                if new_entries:
+                    results["k2_returned"] = len(new_entries)
+                    break
+
+        if not new_entries:
+            return {**results, "error": f"K2 returned JSON but no entries found. Keys: {list(parsed.keys())}", "created": 0}
+
+        # Store new entries — dedup only against near-exact matches
         stored = 0
         for entry in new_entries:
             category = entry.get("category", "CONTEXT").upper()
             entry_content = entry.get("content", "")
 
-            if not entry_content:
+            if not entry_content or len(entry_content) < 20:
                 continue
 
-            # Check for duplicates via word overlap
+            # Only reject near-exact duplicates (0.85 threshold)
+            # Old threshold of 0.7 was too aggressive for same-universe content
             is_duplicate = False
-            for existing in existing_context + existing_clarifications:
+            for existing in existing_context:
                 content_words = set(entry_content.lower().split())
                 existing_words = set(existing.lower().split())
-                overlap = len(content_words & existing_words) / max(len(content_words), 1)
-                if overlap > 0.7:
+                if not content_words:
+                    break
+                overlap = len(content_words & existing_words) / len(content_words)
+                if overlap > 0.85:
                     is_duplicate = True
+                    results["dedup_rejected"] += 1
                     break
 
             if is_duplicate:
@@ -284,10 +289,6 @@ RULES:
                     "source": "consolidation",
                     "created": datetime.now().isoformat()
                 }
-                # v6.0: Consolidation entries get elevated priority (1.2)
-                # — these are K2.5-synthesized insights, more valuable than
-                # raw auto-extracted facts (0.5) but below deliberate
-                # file uploads (1.5)
                 mem_id = self.mnemo.add(f"[{category}] {entry_content}", metadata=meta, priority=1.2)
                 if mem_id:
                     stored += 1
@@ -295,6 +296,8 @@ RULES:
                         "category": category,
                         "content": entry_content[:100] + "..." if len(entry_content) > 100 else entry_content
                     })
+                    # Also add to existing_context to prevent self-duplication within this batch
+                    existing_context.append(f"[{category}] {entry_content}")
             except Exception:
                 continue
 
