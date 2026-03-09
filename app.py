@@ -48,7 +48,7 @@ DEFAULT_HF_KEY = get_secret("HF_KEY", "")
 MNEMO_URL = "https://athelaperk-mnemo.hf.space"
 
 WRITING_MODEL_ID = "openai/gpt-4o-2024-11-20"
-MEMORY_MODEL_ID = "moonshotai/kimi-k2"
+MEMORY_MODEL_ID = "moonshotai/kimi-k2-090"
 
 WRITING_PARAMS = {
     "temperature": 1.0,
