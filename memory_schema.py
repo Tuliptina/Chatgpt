@@ -585,3 +585,12 @@ def signals_to_points(signals: dict, session_id: str = "") -> List[dict]:
             })
 
     return points
+
+
+def get_signal_instruction() -> str:
+    """Return the instruction block that tells 4o to emit signals.
+
+    Append this to the system prompt ONLY for creative writing queries.
+    For recall/conversation queries, omit it.
+    """
+    return SIGNAL_INSTRUCTION
