@@ -516,34 +516,39 @@ class SessionStore:
         return ""
 
     def _delete_session_memories(self, session_id: str):
-        """v6.0 FIX: Remove ALL Mnemo memories tied to a session.
+        """v6.0.1 FIX: Remove only AUTO-EXTRACTED Mnemo memories tied to a session.
 
-        Old behavior (_delete_mnemo_conversations): Only deleted memories
-        where metadata.type == "conversation". Left behind all CHARACTER,
-        PLOT, THEME, CONTEXT, STYLE, TONE memories extracted during that
-        session — roughly 90% of session data was leaked on delete.
+        Previous bug: deleted ALL memories with matching session_id, including
+        file uploads, manual corrections, and consolidation entries. This wiped
+        the entire knowledge base when deleting a single chat session.
 
-        New behavior: 
-        1. Calls server-side /delete_session endpoint which atomically
-           removes all ConnectionPoints, Threads, and Knots for the session.
-        2. Falls back to client-side cleanup for blob memories: deletes
-           ALL memories where metadata.session_id matches, regardless of type.
+        New behavior:
+        1. Server-side: delete CPs, threads, knots for the session.
+        2. Client-side: delete only blob memories where source is auto_extract
+           or conversation. PROTECT file_upload, manual_correction, consolidation.
         """
-        # Step 1: Server-side atomic cleanup (CPs, threads, knots + blobs)
+        # Step 1: Server-side cleanup (CPs, threads, knots)
         try:
             if hasattr(self.mnemo, 'delete_session'):
                 self.mnemo.delete_session(session_id)
-                return  # Server handled everything
         except Exception:
-            pass  # Fall through to client-side cleanup
+            pass
 
-        # Step 2: Client-side fallback — delete ALL memories for this session
+        # Step 2: Client-side cleanup — ONLY auto-extracted blobs
+        # Protected sources that should NEVER be deleted with a session:
+        PROTECTED_SOURCES = {"file_upload", "manual_correction", "consolidation", "manual"}
         try:
             memories = self.mnemo.list_memories()
+            deleted = 0
             for mem in memories:
                 meta = mem.get("metadata", {})
-                # v6.0: Delete ALL memory types, not just "conversation"
-                if meta.get("session_id") == session_id:
-                    self.mnemo.delete(mem.get("id"))
+                if meta.get("session_id") != session_id:
+                    continue
+                # Only delete auto-extracted or conversation memories
+                source = meta.get("source", "")
+                if source in PROTECTED_SOURCES:
+                    continue  # PROTECT permanent knowledge
+                self.mnemo.delete(mem.get("id"))
+                deleted += 1
         except Exception:
             pass
