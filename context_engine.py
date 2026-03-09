@@ -25,7 +25,7 @@ from typing import List, Dict, Tuple
 from mnemo_client import MnemoClient
 
 # v6.0: Memory model for consolidation (matches app.py config)
-MEMORY_MODEL_ID = "moonshotai/kimi-k2"
+MEMORY_MODEL_ID = "moonshotai/kimi-k2-0905"
 MEMORY_COST_INPUT = 0.47 / 1_000_000
 MEMORY_COST_OUTPUT = 2.00 / 1_000_000
 
