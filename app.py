@@ -56,7 +56,7 @@ MNEMO_URL = "https://athelaperk-mnemo.hf.space"
 
 # v6.0: Two models — writing (4o) and memory ops (K2)
 WRITING_MODEL_ID = "openai/gpt-4o-2024-11-20"
-MEMORY_MODEL_ID = "moonshotai/kimi-k2-0905"
+MEMORY_MODEL_ID = "moonshotai/kimi-k2"
 
 # v6.0: Per-model sampling parameters
 WRITING_PARAMS = {
@@ -683,9 +683,8 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
                                      + "\n".join(f"\u2022 {conv[:200]}" for conv in past_convos))
         except Exception:
             pass
-        # v6.1: Always search ConnectionPoints — loops only affect token optimization, not retrieval
+        # v6.1: Always search ConnectionPoints (loops only affect token format, not retrieval)
         try:
-            # Check isolation toggle and pass to client
             isolate = st.session_state.get("isolate_sessions", False)
             active_sessions = [current_session_id] if isolate and current_session_id else None
             
@@ -716,8 +715,9 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
             enriched, enrich_meta = context_engine.build_rich_context(prompt, memories)
             if enriched:
                 context_parts.append(f"\n\n[DEEP CONTEXT]\n{enriched}")
-        except Exception:
-            pass
+                metadata["cp_results"] = len(cp_results)
+        except Exception as e:
+            metadata["cp_error"] = str(e)[:100]
 
     return "".join(context_parts), metadata, metadata["skip_loops"]
 
@@ -744,6 +744,9 @@ def handle_message(prompt, openrouter_key, mnemo_client):
     skip_loops_for_this_query = False
     sessions_found = 0
 
+    cp_results_count = 0
+    cp_error = ""
+
     if needs_memory and cross_session_enabled:
         try:
             past_conversation_context, ctx_meta, skip_loops_for_this_query = build_memory_context(
@@ -754,8 +757,11 @@ def handle_message(prompt, openrouter_key, mnemo_client):
                 context_engine=st.session_state.get("context_engine"),
             )
             sessions_found = ctx_meta.get("sessions_found", 0)
-        except Exception:
+            cp_results_count = ctx_meta.get("cp_results", 0)
+            cp_error = ctx_meta.get("cp_error", "")
+        except Exception as e:
             past_conversation_context = ""
+            cp_error = f"build_context_failed: {str(e)[:80]}"
 
     full_system_prompt = SYSTEM_PROMPT + past_conversation_context
 
@@ -787,6 +793,7 @@ def handle_message(prompt, openrouter_key, mnemo_client):
         "context_tokens": context_stats.get("total_tokens", 0),
         "mode": gate.mode, "memory_reason": gate.reason,
         "sessions_found": sessions_found, "gate_tier": gate.tier_used,
+        "cp_results": cp_results_count, "cp_error": cp_error,
     }
 
     response, input_tokens, output_tokens, error = call_openrouter(messages, openrouter_key, mode="writing")
@@ -867,6 +874,8 @@ def handle_message(prompt, openrouter_key, mnemo_client):
         "extracted": extracted, "cost": msg_cost,
         "sessions_found": sessions_found,
         "gate_tier": context_meta.get("gate_tier", 1),
+        "cp_results": context_meta.get("cp_results", 0),
+        "cp_error": context_meta.get("cp_error", ""),
     }
     return response, None, result_meta
 
@@ -1294,6 +1303,10 @@ def render_chat(openrouter_key, mnemo_client):
                     meta_parts.append("\u26a1 fast")
                 if result_meta.get("extracted", 0) > 0:
                     meta_parts.append(f"\U0001f9e0 {result_meta['extracted']} extracted")
+                if result_meta.get("cp_results", 0) > 0:
+                    meta_parts.append(f"\U0001f50d {result_meta['cp_results']} CPs")
+                if result_meta.get("cp_error"):
+                    meta_parts.append(f"\u274c {result_meta['cp_error'][:40]}")
                 meta_parts.append(f"\U0001f4b0 ${result_meta.get('cost', 0):.4f}")
                 st.caption(" | ".join(meta_parts))
                 st.session_state.messages.append({
