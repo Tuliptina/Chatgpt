@@ -675,23 +675,21 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
     if not cross_session_enabled:
         return "", metadata, False
     storage = get_persistent_storage()
-    if not storage:
-        return "", metadata, False
     if not use_loops:
             try:
-          # Check isolation toggle
-          isolate = st.session_state.get("isolate_sessions", False)
-          active_sessions = [current_session_id] if isolate and current_session_id else None
+                # Check isolation toggle
+                isolate = st.session_state.get("isolate_sessions", False)
+                active_sessions = [current_session_id] if isolate and current_session_id else None
                 
-         # v6.1: Pass active_sessions to the client
-         cp_results = mnemo_client.graph_search(prompt, top_k=12, active_sessions=active_sessions)
-         prompt_lower = prompt.lower()
-         asking_about_past = any(phrase in prompt_lower for phrase in [
-        "last chat", "previous chat", "last conversation",
-        "previous conversation", "earlier chat", "before this",
-        "what did we talk", "what were we", "did we discuss",
-        "remember when", "last time", "our last", "previous session",
-        "talked about", "chatting about", "we discussed", "we were talking"
+                # v6.1: Pass active_sessions to the client
+                cp_results = mnemo_client.graph_search(prompt, top_k=12, active_sessions=active_sessions)
+                prompt_lower = prompt.lower()
+                asking_about_past = any(phrase in prompt_lower for phrase in [
+                "last chat", "previous chat", "last conversation",
+                "previous conversation", "earlier chat", "before this",
+                "what did we talk", "what were we", "did we discuss",
+                "remember when", "last time", "our last", "previous session",
+                "talked about", "chatting about", "we discussed", "we were talking"
     ])
     current_session_id = st.session_state.get("current_session_id", "")
 
