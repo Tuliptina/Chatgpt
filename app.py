@@ -51,7 +51,7 @@ def get_secret(key, default=""):
 
 DEFAULT_OPENROUTER_KEY = get_secret("OPENROUTER_KEY", "")
 DEFAULT_HF_KEY = get_secret("HF_KEY", "")
-MNEMO_URL = "https://athelaperk-mnemo-mcp.hf.space"
+MNEMO_URL = "https://athelaperk-mnemo.hf.space"
 
 # v6.0: Two models — writing (4o) and memory ops (K2.5)
 WRITING_MODEL_ID = "openai/gpt-4o-2024-11-20"
