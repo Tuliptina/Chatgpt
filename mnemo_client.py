@@ -252,7 +252,7 @@ class MnemoClient:
                   connects_to: str = "", reason: str = "",
                   weight: float = 0.5, category: str = "fact",
                   session_id: str = "", source: str = "auto_extract",
-                  thread_id: str = "", position: int = -1), 
+                  thread_id: str = "", position: int = -1, 
                   namespace: str = "default") -> Optional[str]:
         """Add a ConnectionPoint. Returns CP ID or None."""
         result = self._call(
