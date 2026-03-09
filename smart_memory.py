@@ -154,8 +154,8 @@ class SmartMemory:
         r'\b(scene|chapter|dialogue|conversation|story|poem|script)\b',
     ]
 
-    # Named entity indicators (forces at least TWO capitalized words)
-    NAME_PATTERN = r'\b[A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b'
+    # Named entity indicators (single or multi-word capitalized names)
+    NAME_PATTERN = r'\b[A-Z][a-z]{2,}\b'
 
     def __init__(self):
         self.greeting_re = [re.compile(p, re.IGNORECASE) for p in self.GREETING_PATTERNS]
@@ -216,7 +216,13 @@ class SmartMemory:
             'I', 'The', 'A', 'An', 'This', 'That', 'What', 'Who', 'Where',
             'When', 'How', 'Why', 'Can', 'Could', 'Would', 'Should', 'Do',
             'Does', 'Is', 'Are', 'Was', 'Were', 'Have', 'Has', 'Had',
-            'Will', 'Would', 'May', 'Might', 'Must', 'Shall'
+            'Will', 'Would', 'May', 'Might', 'Must', 'Shall',
+            'Write', 'Create', 'Tell', 'Show', 'Give', 'Find', 'Help',
+            'Make', 'Describe', 'Explain', 'Please', 'Sure', 'Thanks',
+            'Also', 'Just', 'Some', 'Many', 'Each', 'Every', 'Both',
+            'Not', 'But', 'And', 'For', 'About', 'Like', 'Here',
+            'There', 'Then', 'Now', 'Very', 'Really', 'Actually',
+            'Maybe', 'Well', 'Still', 'Even', 'Never', 'Always',
         }
         real_names = [n for n in names if n not in common_words]
         if real_names:
