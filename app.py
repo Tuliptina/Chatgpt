@@ -80,6 +80,89 @@ MAX_CONVERSATION_MESSAGES = 8
 MAX_SESSIONS_STORED = 20
 MNEMO_HOT_PATH_TIMEOUT = 4.0
 
+# v6.1: Category → ConnectionPoint mapping (blobs eliminated)
+CATEGORY_TO_CP = {
+    "CHARACTER": ("character", "character_profile"),
+    "PLOT": ("plot", "plot_event"),
+    "SETTING": ("setting", "setting_detail"),
+    "THEME": ("fact", "theme"),
+    "STYLE": ("style", "voice_note"),
+    "TONE": ("tone", "tone_directive"),
+    "FACT": ("fact", "general"),
+    "CONTEXT": ("fact", "context_note"),
+    "CLARIFICATION": ("fact", "clarification"),
+    "RELATIONSHIP": ("relationship", "relationship"),
+    "INSTRUCTION": ("fact", "instruction"),
+    "PROSE_SAMPLE": ("style", "prose_sample"),
+    "DIALOGUE_SAMPLE": ("style", "dialogue_sample"),
+    "VOICE": ("style", "voice_note"),
+    "VOCABULARY": ("style", "vocabulary"),
+    "TIMELINE": ("plot", "timeline"),
+}
+
+def store_as_cp(mnemo_client, entity, category, content, session_id="",
+                source="auto_extract", connects_to="", weight=0.5):
+    """v6.1: Store a memory as a ConnectionPoint instead of blob."""
+    cat_key = category.upper()
+    cp_category, point_type = CATEGORY_TO_CP.get(cat_key, ("fact", "general"))
+    return mnemo_client.add_point(
+        entity=entity, point_type=point_type, value=content,
+        connects_to=connects_to, reason="", weight=float(weight),
+        category=cp_category, session_id=session_id, source=source,
+    )
+
+def auto_convert_blobs(mnemo_client):
+    """v6.1: Auto-convert existing blob memories → ConnectionPoints on startup.
+    Free (no K2), fast, runs once. Parses [TAG] prefix and first proper noun as entity."""
+    import re
+    try:
+        blobs = mnemo_client.list_memories()
+        if not blobs:
+            return 0
+        # Check if already converted
+        stats = mnemo_client.get_stats()
+        if stats.get("total_connection_points", 0) > 0:
+            return 0  # Already have CPs, skip
+        
+        converted = 0
+        for mem in blobs:
+            content = mem.get("content", "")
+            meta = mem.get("metadata", {})
+            if not content:
+                continue
+            # Parse [TAG] prefix
+            tag_match = re.match(r'\[([A-Z_]+)\]\s*(.*)', content, re.DOTALL)
+            if tag_match:
+                category = tag_match.group(1)
+                body = tag_match.group(2).strip()
+            else:
+                category = "FACT"
+                body = content
+            # Extract entity: first capitalized name, or "Story"
+            entity_match = re.match(r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', body)
+            entity = entity_match.group(1) if entity_match else "Story"
+            # Parse connects_to for RELATIONSHIP entries (look for →)
+            connects_to = ""
+            if "→" in body or "->" in body:
+                arrow_match = re.match(r'(\w+)\s*(?:→|->)\s*(\w+)', body)
+                if arrow_match:
+                    entity = arrow_match.group(1)
+                    connects_to = arrow_match.group(2)
+            # Store as CP
+            source = meta.get("source", "migrated")
+            session_id = meta.get("session_id", "")
+            cp_id = store_as_cp(
+                mnemo_client, entity=entity, category=category,
+                content=body, session_id=session_id,
+                source=source, connects_to=connects_to,
+                weight=0.7 if category in ("CLARIFICATION", "CONTEXT", "RELATIONSHIP") else 0.5,
+            )
+            if cp_id:
+                converted += 1
+        return converted
+    except Exception:
+        return 0
+
 # v6.0: System prompt — split personality. Warm for conversation, invisible for creative.
 SYSTEM_PROMPT = """You are a sharp, well-read creative collaborator with genuine enthusiasm for storytelling craft. You have three modes — detect which one the user needs and switch seamlessly.
 
@@ -378,19 +461,19 @@ LAYER 3 — STYLE:
 LAYER 4 — TONE:
 - TONE: How scenes should feel, humor types, emotional registers, do-nots
 
-EXAMPLES (notice the mix of layers):
-  {{"category": "CHARACTER", "content": "Alistair Fitzroy: late 30s pharmacology professor, Red Rose manipulator. Driven by fear of being forgotten. Terrified of developing dementia like his father."}}
-  {{"category": "RELATIONSHIP", "content": "Alistair → Sebastian: former friend turned captor. Alistair frames captivity as medical care. Their dynamic is intellectual chess — Alistair respects Sebastian's mind while destroying his autonomy."}}
-  {{"category": "RELATIONSHIP", "content": "Alistair → Elijah: estranged brothers. Alistair envies Elijah's peace and spiritual conviction. Their father disowned Elijah — Alistair secretly resents that Elijah escaped while he inherited the burden."}}
-  {{"category": "CONTEXT", "content": "The Red Rose Society is NOT a simple villain organization. It's a decentralized medical order practicing social Darwinism — members believe they're advancing humanity through controlled suffering. Writing them as mustache-twirling villains undermines the story's philosophical spine."}}
-  {{"category": "CLARIFICATION", "content": "When Sebastian goes quiet in a scene, it signals dissociation — a trauma response. Never write his silence as peaceful acceptance or stoic strength. It's shutdown, not calm."}}
-  {{"category": "CONTEXT", "content": "The legal-ethical gap is the series' central philosophical spine: what is ethical is not always legal, and vice versa. Every faction represents a different position on this spectrum."}}
-  {{"category": "TONE", "content": "Alistair's scenes: clinical precision, cold menace. Power through control, never raised voices. His humor is dry and cutting — it should make the reader uneasy, not laugh."}}
+EXAMPLES (notice the mix of layers — each has an entity):
+  {{"entity": "Alistair", "category": "CHARACTER", "content": "Late 30s pharmacology professor, Red Rose manipulator. Driven by fear of being forgotten. Terrified of developing dementia like his father."}}
+  {{"entity": "Alistair", "connects_to": "Sebastian", "category": "RELATIONSHIP", "content": "Former friend turned captor. Alistair frames captivity as medical care. Their dynamic is intellectual chess — Alistair respects Sebastian's mind while destroying his autonomy."}}
+  {{"entity": "Alistair", "connects_to": "Elijah", "category": "RELATIONSHIP", "content": "Estranged brothers. Alistair envies Elijah's peace and spiritual conviction. Their father disowned Elijah — Alistair secretly resents that Elijah escaped while he inherited the burden."}}
+  {{"entity": "Red Rose Society", "category": "CONTEXT", "content": "NOT a simple villain organization. It's a decentralized medical order practicing social Darwinism — members believe they're advancing humanity through controlled suffering. Writing them as mustache-twirling villains undermines the story's philosophical spine."}}
+  {{"entity": "Sebastian", "category": "CLARIFICATION", "content": "When Sebastian goes quiet in a scene, it signals dissociation — a trauma response. Never write his silence as peaceful acceptance or stoic strength. It's shutdown, not calm."}}
+  {{"entity": "Story", "category": "CONTEXT", "content": "The legal-ethical gap is the series' central philosophical spine: what is ethical is not always legal, and vice versa. Every faction represents a different position on this spectrum."}}
+  {{"entity": "Alistair", "category": "TONE", "content": "Alistair's scenes: clinical precision, cold menace. Power through control, never raised voices. His humor is dry and cutting — it should make the reader uneasy, not laugh."}}
 
 Return ONLY a JSON object:
 {{
   "memories": [
-    {{"category": "CATEGORY", "content": "consolidated entry"}}
+    {{"entity": "Name or Story", "category": "CATEGORY", "content": "consolidated entry", "connects_to": "optional target entity"}}
   ]
 }}"""
 
@@ -410,7 +493,7 @@ Return ONLY a JSON object:
         data = response.json()
         raw = data["choices"][0]["message"]["content"]
         usage = data.get("usage", {})
-        cost = (usage.get("prompt_tokens", 0) * 0.60 + usage.get("completion_tokens", 0) * 3.00) / 1_000_000
+        cost = (usage.get("prompt_tokens", 0) * 0.47 + usage.get("completion_tokens", 0) * 2.00) / 1_000_000
         parsed = json.loads(raw)
         return parsed.get("memories", []), cost
     except Exception:
@@ -519,14 +602,14 @@ BAD example (too fragmented, no context layer):
   {{"category": "CHARACTER", "content": "Alistair is Sebastian's rival"}}
 
 GOOD example (consolidated with context layer):
-  {{"category": "CHARACTER", "content": "Sebastian Carlisle is a late-20s anatomy lecturer at St Bartholomew's with a working-class background. He uses dry, dark humor as a coping mechanism — it should cut, not charm. He dissociates under stress rather than emoting."}}
-  {{"category": "RELATIONSHIP", "content": "Alistair → Sebastian: former friend turned captor. Alistair frames the captivity as medical care — their dynamic is intellectual chess. Alistair respects Sebastian's mind while systematically destroying his autonomy."}}
-  {{"category": "CONTEXT", "content": "When Sebastian goes quiet in a scene, it signals dissociation, not calm. His silence is a trauma response — never write it as peaceful acceptance."}}
+  {{"entity": "Sebastian", "category": "CHARACTER", "content": "Sebastian Carlisle is a late-20s anatomy lecturer at St Bartholomew's with a working-class background. He uses dry, dark humor as a coping mechanism — it should cut, not charm. He dissociates under stress rather than emoting."}}
+  {{"entity": "Alistair", "connects_to": "Sebastian", "category": "RELATIONSHIP", "content": "Former friend turned captor. Alistair frames the captivity as medical care — their dynamic is intellectual chess. Alistair respects Sebastian's mind while systematically destroying his autonomy."}}
+  {{"entity": "Sebastian", "category": "CONTEXT", "content": "When Sebastian goes quiet in a scene, it signals dissociation, not calm. His silence is a trauma response — never write it as peaceful acceptance."}}
 
 Return ONLY a JSON object:
 {{
   "memories": [
-    {{"category": "CATEGORY", "content": "consolidated fact with context"}}
+    {{"entity": "Name or Story", "category": "CATEGORY", "content": "consolidated fact with context", "connects_to": "optional target entity for relationships"}}
   ]
 }}"""
 
@@ -547,7 +630,7 @@ Return ONLY a JSON object:
         data = response.json()
         raw = data["choices"][0]["message"]["content"]
         usage = data.get("usage", {})
-        cost = (usage.get("prompt_tokens", 0) * 0.60 + usage.get("completion_tokens", 0) * 3.00) / 1_000_000
+        cost = (usage.get("prompt_tokens", 0) * 0.47 + usage.get("completion_tokens", 0) * 2.00) / 1_000_000
         parsed = json.loads(raw)
         return parsed.get("memories", []), cost
     except Exception:
@@ -581,8 +664,8 @@ class CostTracker:
     """v6.0: Dual-model cost tracking."""
     WRITING_INPUT = 2.50 / 1_000_000
     WRITING_OUTPUT = 15.00 / 1_000_000
-    MEMORY_INPUT = 0.60 / 1_000_000
-    MEMORY_OUTPUT = 3.00 / 1_000_000
+    MEMORY_INPUT = 0.47 / 1_000_000
+    MEMORY_OUTPUT = 2.00 / 1_000_000
 
     def __init__(self):
         if "total_cost" not in st.session_state:
@@ -654,11 +737,30 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
             pass
         if not use_loops:
             try:
-                memories = mnemo_client.search(prompt, limit=8)
+                # v6.1: Search ConnectionPoints via graph_search instead of blob search
+                cp_results = mnemo_client.graph_search(prompt, top_k=12)
                 writing_keywords = ["write", "scene", "chapter", "story", "prose", "dialogue", "style"]
                 if any(kw in prompt.lower() for kw in writing_keywords):
-                    style_results = mnemo_client.search("PROSE_SAMPLE VOICE DIALOGUE_SAMPLE", limit=5)
-                    memories.extend(style_results)
+                    style_cps = mnemo_client.graph_search("prose voice dialogue style tone", top_k=5)
+                    # Deduplicate
+                    seen_ids = {r.get("id") for r in cp_results}
+                    for cp in style_cps:
+                        if cp.get("id") not in seen_ids:
+                            cp_results.append(cp)
+                # Adapt CP format → memory format for build_rich_context
+                memories = []
+                for cp in cp_results:
+                    entity = cp.get("entity", "")
+                    value = cp.get("value", "")
+                    cat = cp.get("category", "fact").upper()
+                    conn = cp.get("connects_to", "")
+                    if conn:
+                        content = f"[{cat}] {entity} → {conn}: {value}"
+                    elif entity and entity != "Story":
+                        content = f"[{cat}] {entity}: {value}"
+                    else:
+                        content = f"[{cat}] {value}"
+                    memories.append({"content": content, "score": cp.get("score", 0)})
                 enriched, enrich_meta = context_engine.build_rich_context(prompt, memories)
                 if enriched:
                     context_parts.append(f"\n\n[DEEP CONTEXT]\n{enriched}")
@@ -778,7 +880,7 @@ def handle_message(prompt, openrouter_key, mnemo_client):
         except Exception:
             pass
 
-    # Auto-extract via K2
+    # Auto-extract via K2 → store as ConnectionPoints
     extracted = 0
     if (st.session_state.get("auto_extract", True)
             and cross_session_enabled
@@ -792,23 +894,27 @@ def handle_message(prompt, openrouter_key, mnemo_client):
             for mem in memories:
                 cat = mem.get("category", "FACT").upper()
                 txt = mem.get("content", "")
+                entity = mem.get("entity", "Story")
+                connects_to = mem.get("connects_to", "")
                 if txt:
-                    meta = {"category": cat, "session_id": current_session_id}
-                    store_tasks.append((f"[{cat}] {txt}", meta, cat))
+                    store_tasks.append((entity, cat, txt, connects_to))
             if store_tasks:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                     futures = {
-                        executor.submit(mnemo_client.add, content, "default", meta, 0.5): (content, cat_name)
-                        for content, meta, cat_name in store_tasks
+                        executor.submit(store_as_cp, mnemo_client,
+                                        entity=ent, category=cat, content=txt,
+                                        session_id=current_session_id, source="auto_extract",
+                                        connects_to=conn): (txt, cat)
+                        for ent, cat, txt, conn in store_tasks
                     }
                     for future in concurrent.futures.as_completed(futures):
-                        content, cat_name = futures[future]
+                        txt, cat_name = futures[future]
                         try:
-                            mem_id = future.result()
-                            if mem_id:
+                            cp_id = future.result()
+                            if cp_id:
                                 extracted += 1
                                 st.session_state.loop_manager.add_to_loop(
-                                    content=content, category=cat_name.lower(),
+                                    content=txt, category=cat_name.lower(),
                                     session_id=current_session_id)
                         except Exception:
                             pass
@@ -881,47 +987,6 @@ def render_sidebar(mnemo_client, openrouter_key, hf_key):
         render_memory_management(mnemo_client)
         st.divider()
         render_consolidation_panel(openrouter_key)
-
-        # v6.0.1: Inline migration (Streamlit Cloud has no terminal)
-        with st.expander("🔄 Migrate Blobs → Graph", expanded=False):
-            stats = mnemo_client.get_stats()
-            n_mem = stats.get("total_memories", 0)
-            n_cp = stats.get("total_connection_points", 0)
-            n_thr = stats.get("total_threads", 0)
-            n_knot = stats.get("total_knots", 0)
-            st.caption(f"Blobs: {n_mem} · CPs: {n_cp} · Threads: {n_thr} · Knots: {n_knot}")
-            if n_cp > 0:
-                st.success(f"✅ Already migrated — {n_cp} CPs exist.")
-            if n_mem > 0 and st.button("🚀 Run Migration", key="run_mig", type="primary", use_container_width=True):
-                from migration import run_migration
-                log_lines = []
-                log_box = st.empty()
-                def _mig_log(msg):
-                    log_lines.append(msg)
-                    log_box.code("\n".join(log_lines[-15:]), language=None)
-                with st.spinner("Migrating..."):
-                    results = run_migration(mnemo_client, openrouter_key,
-                                            phases=["decompose", "threads", "cleanup"],
-                                            progress_callback=_mig_log)
-                p1 = results.get("phase_results", {}).get("decompose", {})
-                p2 = results.get("phase_results", {}).get("threads", {})
-                cost = results.get("total_cost", 0)
-                st.success(
-                    f"✅ {p1.get('points_stored', 0)} CPs · "
-                    f"{p2.get('threads_created', 0)} threads · "
-                    f"{p2.get('knots_created', 0)} knots · ${cost:.4f}")
-                errs = []
-                for pd in results.get("phase_results", {}).values():
-                    errs.extend(pd.get("errors", []))
-                if errs:
-                    with st.expander(f"⚠️ {len(errs)} errors"):
-                        for e in errs[:20]:
-                            st.caption(e)
-                # Reload memory systems with new data
-                if "loop_manager" in st.session_state:
-                    st.session_state.loop_manager.load_from_mnemo(use_smart_extraction=False)
-                if "signal_processor" in st.session_state:
-                    st.session_state.signal_processor.update_threads_from_server(mnemo_client)
 
         st.divider()
 
@@ -1039,23 +1104,27 @@ def render_file_upload(mnemo_client, openrouter_key):
                         for mem in memories:
                             cat = mem.get("category", "FACT").upper()
                             txt = mem.get("content", "")
+                            entity = mem.get("entity", "Story")
+                            connects_to = mem.get("connects_to", "")
                             if txt:
-                                meta = {"category": cat, "session_id": current_session, "source": "file_upload"}
-                                store_tasks.append((f"[{cat}] {txt}", meta, cat))
+                                store_tasks.append((entity, cat, txt, connects_to))
                         if store_tasks:
                             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                                 futures = {
-                                    executor.submit(mnemo_client.add, content, "default", meta, 1.5): (content, cat_name)
-                                    for content, meta, cat_name in store_tasks
+                                    executor.submit(store_as_cp, mnemo_client,
+                                                    entity=ent, category=cat, content=txt,
+                                                    session_id=current_session, source="file_upload",
+                                                    connects_to=conn, weight=0.8): (txt, cat)
+                                    for ent, cat, txt, conn in store_tasks
                                 }
                                 for future in concurrent.futures.as_completed(futures):
-                                    content, cat_name = futures[future]
+                                    txt, cat_name = futures[future]
                                     try:
-                                        mem_id = future.result()
-                                        if mem_id:
+                                        cp_id = future.result()
+                                        if cp_id:
                                             stored += 1
                                             st.session_state.loop_manager.add_to_loop(
-                                                content=content, category=cat_name.lower(),
+                                                content=txt, category=cat_name.lower(),
                                                 session_id=current_session)
                                     except Exception:
                                         pass
@@ -1078,15 +1147,19 @@ def render_memory_management(mnemo_client):
     with st.expander("Add manually", expanded=False):
         memory_category = st.selectbox("Category",
             ["CHARACTER", "PLOT", "SETTING", "THEME", "STYLE", "TONE", "FACT"])
+        memory_entity = st.text_input("Entity (character name, 'Story', etc.)",
+            placeholder="e.g., Alistair, Story, Red Rose Society", value="Story")
         memory_content = st.text_area("Content",
             placeholder="e.g., Alistair's scenes should feel clinical and cold, never melodramatic",
             height=80)
         if st.button("\U0001f4be Save", use_container_width=True):
             if memory_content.strip():
                 current_session = st.session_state.get("current_session_id", "")
-                meta = {"category": memory_category, "session_id": current_session}
-                if mnemo_client.add(f"[{memory_category}] {memory_content}", metadata=meta):
-                    st.success(f"\u2705 Saved [{memory_category}]")
+                cp_id = store_as_cp(mnemo_client, entity=memory_entity.strip() or "Story",
+                                    category=memory_category, content=memory_content.strip(),
+                                    session_id=current_session, source="manual")
+                if cp_id:
+                    st.success(f"\u2705 Saved [{memory_category}] for {memory_entity}")
                     st.session_state.loop_manager.add_to_loop(
                         memory_content, memory_category.lower(),
                         session_id=current_session)
@@ -1103,18 +1176,25 @@ def render_memory_management(mnemo_client):
                 st.session_state.show_all_memories = True
                 st.rerun()
         stats = mnemo_client.get_stats()
-        st.caption(f"Total: {stats.get('total_memories', 0)} | CPs: {stats.get('total_connection_points', 0)} | Links: {stats.get('total_links', 0)}")
-        memories = mnemo_client.list_memories()[:15]
-        for mem in memories:
+        n_blobs = stats.get('total_memories', 0)
+        n_cps = stats.get('total_connection_points', 0)
+        st.caption(f"ConnectionPoints: {n_cps} | Legacy blobs: {n_blobs} | Links: {stats.get('total_links', 0)}")
+        # Show CPs (primary) then blobs (legacy)
+        points = mnemo_client.list_points(limit=15)
+        for cp in points:
             col1, col2 = st.columns([5, 1])
             with col1:
-                st.caption(f"{mem.get('content', '')[:60]}...")
+                entity = cp.get("entity", "?")
+                value = cp.get("value", "")[:60]
+                cat = cp.get("category", "?")
+                conn = f" → {cp.get('connects_to')}" if cp.get("connects_to") else ""
+                st.caption(f"**{entity}{conn}** [{cat}] {value}...")
             with col2:
-                if st.button("\U0001f5d1\ufe0f", key=f"del_mem_{mem.get('id', '')}"):
-                    if mnemo_client.delete(mem.get("id")):
+                if st.button("\U0001f5d1\ufe0f", key=f"del_cp_{cp.get('id', '')}"):
+                    if mnemo_client.delete_point(cp.get("id")):
                         st.rerun()
-        if len(mnemo_client.list_memories()) >= 15:
-            st.caption("... showing first 15. Click 'View All' for complete list")
+        if n_cps > 15:
+            st.caption(f"... showing first 15 of {n_cps}. Click 'View All' for complete list")
         st.markdown("---")
         if st.button("\U0001f9f9 Clear ALL Memories", use_container_width=True):
             st.session_state.confirm_clear = True
@@ -1133,38 +1213,45 @@ def render_memory_management(mnemo_client):
 
     if st.session_state.get("show_all_memories"):
         st.markdown("---")
-        st.subheader("\U0001f4d6 All Memories")
+        st.subheader("\U0001f4d6 All ConnectionPoints")
         col1, col2, col3 = st.columns([1, 1, 1])
         with col1:
             if st.button("\u274c Close", use_container_width=True, key="close_all_mem"):
                 st.session_state.show_all_memories = False
                 st.rerun()
         with col2:
-            search_query = st.text_input("\U0001f50d Search", key="mem_search", placeholder="Filter memories...")
+            search_query = st.text_input("\U0001f50d Search", key="mem_search", placeholder="Filter by entity or value...")
         with col3:
             category_filter = st.selectbox("Category",
-                ["All", "CHARACTER", "PLOT", "SETTING", "THEME", "CONTEXT", "STYLE", "TONE", "FACT"],
+                ["All", "character", "relationship", "plot", "tone", "setting", "style", "fact"],
                 key="cat_filter")
-        all_memories = mnemo_client.list_memories()
+        all_points = mnemo_client.list_points(limit=500)
         if search_query:
-            all_memories = [m for m in all_memories if search_query.lower() in m.get("content", "").lower()]
+            q = search_query.lower()
+            all_points = [p for p in all_points if q in p.get("entity", "").lower()
+                          or q in p.get("value", "").lower()
+                          or q in p.get("connects_to", "").lower()]
         if category_filter != "All":
-            all_memories = [m for m in all_memories if f"[{category_filter}]" in m.get("content", "")]
-        st.caption(f"Showing {len(all_memories)} memories")
-        for mem in all_memories:
-            content = mem.get("content", "")
-            mem_id = mem.get("id", "")
-            category = "OTHER"
-            if content.startswith("["):
-                category = content.split("]")[0][1:]
-            col1, col2, col3 = st.columns([1, 8, 1])
+            all_points = [p for p in all_points if p.get("category") == category_filter]
+        st.caption(f"Showing {len(all_points)} ConnectionPoints")
+        for cp in all_points:
+            entity = cp.get("entity", "?")
+            value = cp.get("value", "")
+            cat = cp.get("category", "?")
+            conn = cp.get("connects_to", "")
+            cp_id = cp.get("id", "")
+            source = cp.get("source", "")
+            col1, col2, col3, col4 = st.columns([2, 1, 6, 1])
             with col1:
-                st.caption(f"[{category}]")
+                conn_str = f" → {conn}" if conn else ""
+                st.caption(f"**{entity}{conn_str}**")
             with col2:
-                st.text(content[len(f"[{category}]"):].strip()[:200])
+                st.caption(f"[{cat}]")
             with col3:
-                if st.button("\U0001f5d1\ufe0f", key=f"del_full_{mem_id}"):
-                    if mnemo_client.delete(mem_id):
+                st.text(value[:200])
+            with col4:
+                if st.button("\U0001f5d1\ufe0f", key=f"del_full_{cp_id}"):
+                    if mnemo_client.delete_point(cp_id):
                         st.rerun()
 
 
@@ -1179,16 +1266,14 @@ def render_consolidation_panel(openrouter_key):
         try:
             mnemo_client = st.session_state.get("mnemo_client")
             if mnemo_client:
-                all_mems = mnemo_client.list_memories()
-                facts = [m for m in all_mems if not any(
-                    m.get("content", "").startswith(f"[{tag}]")
-                    for tag in ("CONTEXT", "RELATIONSHIP", "CLARIFICATION", "TIMELINE", "CONVERSATION", "SESSION")
-                )]
-                existing_context = [m for m in all_mems if any(
-                    m.get("content", "").startswith(f"[{tag}]")
-                    for tag in ("CONTEXT", "RELATIONSHIP", "CLARIFICATION", "TIMELINE")
-                )]
-                st.caption(f"📊 {len(facts)} facts to analyze · {len(existing_context)} context entries already exist")
+                stats = mnemo_client.get_stats()
+                n_cps = stats.get("total_connection_points", 0)
+                n_blobs = stats.get("total_memories", 0)
+                # Count CPs by type
+                cp_cats = stats.get("cp_by_category", {})
+                fact_cats = sum(v for k, v in cp_cats.items() if k not in ("relationship", "tone"))
+                context_cats = cp_cats.get("relationship", 0)
+                st.caption(f"📊 {n_cps} CPs ({fact_cats} facts · {context_cats} relationships) · {n_blobs} legacy blobs")
         except Exception:
             pass
 
@@ -1499,6 +1584,16 @@ def main():
         st.stop()
 
     mnemo_client = init_client(DEFAULT_HF_KEY)
+
+    # v6.1: Auto-convert legacy blobs → ConnectionPoints (free, runs once)
+    if "blobs_auto_converted" not in st.session_state:
+        st.session_state.blobs_auto_converted = True
+        try:
+            converted = auto_convert_blobs(mnemo_client)
+            if converted > 0:
+                st.toast(f"🔄 Auto-migrated {converted} legacy memories → ConnectionPoints")
+        except Exception:
+            pass
 
     if "session_history_loaded" not in st.session_state:
         st.session_state.session_history_loaded = True
