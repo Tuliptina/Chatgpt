@@ -38,7 +38,6 @@ from prefetch_engine import PrefetchEngine
 from memory_schema import parse_signals_from_response, get_signal_instruction
 
 
-
 # ============================================================================
 # CONFIGURATION (v6.0: Dual-Model Architecture)
 # ============================================================================
@@ -57,7 +56,7 @@ MNEMO_URL = "https://athelaperk-mnemo.hf.space"
 
 # v6.0: Two models — writing (4o) and memory ops (K2)
 WRITING_MODEL_ID = "openai/gpt-4o-2024-11-20"
-MEMORY_MODEL_ID = "moonshotai/kimi-k2-0905"
+MEMORY_MODEL_ID = "moonshotai/kimi-k2"
 
 # v6.0: Per-model sampling parameters
 WRITING_PARAMS = {
@@ -112,17 +111,15 @@ def store_as_cp(mnemo_client, entity, category, content, session_id="",
     )
 
 def auto_convert_blobs(mnemo_client):
-    """v6.1: Auto-convert existing blob memories → ConnectionPoints on startup.
-    Free (no K2), fast, runs once. Parses [TAG] prefix and first proper noun as entity."""
+    """v6.1: Auto-convert existing blob memories → ConnectionPoints on startup."""
     import re
     try:
         blobs = mnemo_client.list_memories()
         if not blobs:
             return 0
-        # Check if already converted
         stats = mnemo_client.get_stats()
         if stats.get("total_connection_points", 0) > 0:
-            return 0  # Already have CPs, skip
+            return 0 
         
         converted = 0
         for mem in blobs:
@@ -130,7 +127,6 @@ def auto_convert_blobs(mnemo_client):
             meta = mem.get("metadata", {})
             if not content:
                 continue
-            # Parse [TAG] prefix
             tag_match = re.match(r'\[([A-Z_]+)\]\s*(.*)', content, re.DOTALL)
             if tag_match:
                 category = tag_match.group(1)
@@ -138,17 +134,14 @@ def auto_convert_blobs(mnemo_client):
             else:
                 category = "FACT"
                 body = content
-            # Extract entity: first capitalized name, or "Story"
             entity_match = re.match(r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', body)
             entity = entity_match.group(1) if entity_match else "Story"
-            # Parse connects_to for RELATIONSHIP entries (look for →)
             connects_to = ""
             if "→" in body or "->" in body:
                 arrow_match = re.match(r'(\w+)\s*(?:→|->)\s*(\w+)', body)
                 if arrow_match:
                     entity = arrow_match.group(1)
                     connects_to = arrow_match.group(2)
-            # Store as CP
             source = meta.get("source", "migrated")
             session_id = meta.get("session_id", "")
             cp_id = store_as_cp(
@@ -163,7 +156,6 @@ def auto_convert_blobs(mnemo_client):
     except Exception:
         return 0
 
-# v6.0: System prompt — split personality. Warm for conversation, invisible for creative.
 SYSTEM_PROMPT = """You are a sharp, well-read creative collaborator with genuine enthusiasm for storytelling craft. You have three modes — detect which one the user needs and switch seamlessly.
 
 MODE 1 — CONVERSATION (chatting about the project, brainstorming, planning):
@@ -304,7 +296,6 @@ def load_session(session_id):
     st.session_state.current_session_id = session_id
 
 def delete_session(session_id):
-    """v6.0 FIX: Delete session + ALL associated memories + loop tokens."""
     st.session_state.session_history = [
         s for s in st.session_state.get("session_history", []) if s["id"] != session_id
     ]
@@ -314,7 +305,6 @@ def delete_session(session_id):
             storage.delete_session(session_id)
     except Exception:
         pass
-    # v6.0: Clean loop tokens for this session
     if "loop_manager" in st.session_state:
         lm = st.session_state.loop_manager
         if hasattr(lm, 'remove_session_tokens'):
@@ -379,7 +369,7 @@ def copy_response_dialog(content):
 
 
 # ============================================================================
-# FILE PROCESSING (Async + pypdf)
+# FILE PROCESSING
 # ============================================================================
 
 def extract_text_from_file(uploaded_file):
@@ -418,7 +408,6 @@ def extract_text_from_file(uploaded_file):
     return content
 
 async def process_chunk_async(http_client, chunk, filename, i, total_chunks, openrouter_key):
-    """v6.1: W-method extraction — asks W questions about every fact in the document."""
     chunk_label = f" (part {i+1}/{total_chunks})" if total_chunks > 1 else ""
     prompt = f"""Extract structured memories from this document by asking the W questions about everything mentioned.
 
@@ -437,22 +426,11 @@ METHOD — For every character, event, faction, place, or rule mentioned, ask:
   HOW should it feel on the page? → TONE entry (register, humor type, do-nots)
   WHOSE interpretation could go wrong? → CLARIFICATION entry (prevent specific misreadings)
 
-Apply every applicable W to every entity. If the text mentions 5 characters, that's potentially 5 WHO + 5 HOW + multiple WHOM entries. Let the content drive the count.
-
 ENTRY FORMAT:
   {{"entity": "Name", "category": "CATEGORY", "content": "1-3 sentence answer"}}
   Add "connects_to": "OtherName" only for RELATIONSHIP entries.
 
 CATEGORIES: CHARACTER, PLOT, SETTING, THEME, FACT, CONTEXT, CLARIFICATION, RELATIONSHIP, INSTRUCTION, STYLE, TONE
-
-EXAMPLE — if text mentions "Isabella orchestrates a ritual pregnancy using Sebastian's blood":
-  WHO: {{"entity": "Isabella", "category": "CHARACTER", "content": "Cult founder who fuses medicine with occultism. Views Sebastian as raw material for transcendence, not a person."}}
-  WHAT: {{"entity": "Isabella", "category": "PLOT", "content": "Orchestrates ritual pregnancy using Sebastian's blood and arcane protocols. The child is a living experiment, not born from love."}}
-  WHOM: {{"entity": "Isabella", "connects_to": "Sebastian", "category": "RELATIONSHIP", "content": "Captor and symbolic spouse. Her devotion is coercion dressed as care — she seduces with tenderness while embedding control."}}
-  WHY: {{"entity": "Story", "category": "CONTEXT", "content": "The ritual pregnancy critiques how women's reproductive power can be weaponized by ideology — Isabella is both perpetrator and product of patriarchal science's rejection."}}
-  HOW: {{"entity": "Isabella", "category": "TONE", "content": "Devotional menace. Breastfeeding as sacrament. The horror comes from her sincerity, not cruelty — she genuinely believes she's saving him."}}
-  WHOSE: {{"entity": "Sebastian", "category": "CLARIFICATION", "content": "Sebastian did NOT consent to fatherhood. The child is conceived through ritual coercion. Never frame this as a love story."}}
-  WHERE: {{"entity": "Blackwood Estate", "category": "SETTING", "content": "Gothic manor blending clinical sterility with occult intimacy. Medical equipment beside ritual altars. White linens stained with ink and blood."}}
 
 Return ONLY a JSON object:
 {{
@@ -524,8 +502,8 @@ def extract_memories_from_file(content, filename, openrouter_key):
 
     all_memories, total_cost = [], 0
     for memories, cost in results:
+        # V6.1 FIX: Defensive check for JSON hallucination
         if memories and isinstance(memories, list):
-            # FIX: Only keep elements that are actually dictionaries
             valid_mems = [m for m in memories if isinstance(m, dict)]
             all_memories.extend(valid_mems)
         total_cost += cost
@@ -541,41 +519,30 @@ def extract_memories_from_file(content, filename, openrouter_key):
 
 
 # ============================================================================
-# MEMORY EXTRACTION (v6.0: routes to K2.5)
+# MEMORY EXTRACTION
 # ============================================================================
 
 def extract_memories_with_gpt(conversation, openrouter_key):
-    """v6.1: W-method extraction — content density drives yield, not thresholds."""
     prompt = f"""Extract structured memories from this conversation by asking the W questions about everything mentioned.
 
 CONVERSATION:
 {conversation}
 
 METHOD — For every character, event, or topic mentioned, ask:
-  WHO is this? → CHARACTER entry (traits, fears, motivations)
-  WHAT happened? → PLOT entry (events, outcomes, consequences)
-  WHOM do they affect/relate to? → RELATIONSHIP entry (dynamics, power, emotion)
-  WHY does it matter? → CONTEXT entry (deeper meaning, what could be misunderstood)
-  WHERE does it happen? → SETTING entry (location, atmosphere)
-  WHEN in the timeline? → PLOT entry (sequence, what comes before/after)
-  HOW should it feel? → TONE entry (emotional register, humor type, do-nots)
-  WHOSE rule or instruction? → CLARIFICATION entry (prevent misinterpretation)
-
-Not every W applies to every fact. Skip what doesn't fit. But if a W applies, create the entry.
+  WHO is this? → CHARACTER entry
+  WHAT happened? → PLOT entry 
+  WHOM do they affect/relate to? → RELATIONSHIP entry 
+  WHY does it matter? → CONTEXT entry 
+  WHERE does it happen? → SETTING entry 
+  WHEN in the timeline? → PLOT entry 
+  HOW should it feel? → TONE entry 
+  WHOSE rule or instruction? → CLARIFICATION entry 
 
 ENTRY FORMAT:
-  {{"entity": "Name", "category": "CATEGORY", "content": "1-3 sentence answer to the W question"}}
+  {{"entity": "Name", "category": "CATEGORY", "content": "1-3 sentence answer"}}
   Add "connects_to": "OtherName" only for RELATIONSHIP entries.
 
 CATEGORIES: CHARACTER, PLOT, SETTING, THEME, FACT, CONTEXT, CLARIFICATION, RELATIONSHIP, INSTRUCTION, STYLE, TONE
-
-EXAMPLE — if the conversation mentions "Alistair drugs Sebastian during captivity":
-  WHO: {{"entity": "Alistair", "category": "CHARACTER", "content": "Pharmacology professor who uses drug protocols as control. Frames coercion as mentorship."}}
-  WHAT: {{"entity": "Sebastian", "category": "PLOT", "content": "Alistair administers escalating drug regimen during Blackwood Estate captivity, creating enforced dependency."}}
-  WHOM: {{"entity": "Alistair", "connects_to": "Sebastian", "category": "RELATIONSHIP", "content": "Captor and former friend. Alistair respects Sebastian's intellect while systematically destroying his autonomy through pharmacological control."}}
-  WHY: {{"entity": "Story", "category": "CONTEXT", "content": "The drug protocols critique how Victorian medical authority can be weaponized — 'treatment' as ownership."}}
-  HOW: {{"entity": "Alistair", "category": "TONE", "content": "Drug scenes should feel clinical and methodical. Alistair's calm is the horror — no raised voices, no visible cruelty."}}
-  WHOSE: {{"entity": "Sebastian", "category": "CLARIFICATION", "content": "Sebastian's trembling under drugs is bodily accusation, not weakness. Never write it as willing submission."}}
 
 Return ONLY a JSON object:
 {{
@@ -608,7 +575,7 @@ Return ONLY a JSON object:
                 clean = clean[:-3]
         parsed = json.loads(clean.strip())
         
-        # FIX: Ensure we only return a list of dictionaries
+        # V6.1 FIX: Defensive check to prevent string AttributeError
         raw_memories = parsed.get("memories", [])
         if isinstance(raw_memories, list):
             valid_memories = [m for m in raw_memories if isinstance(m, dict)]
@@ -618,12 +585,12 @@ Return ONLY a JSON object:
     except Exception:
         return [], 0
 
+
 # ============================================================================
-# API CALLS & COST TRACKING (v6.0: dual-model routing)
+# API CALLS & COST TRACKING 
 # ============================================================================
 
 def call_openrouter(messages, api_key, mode="writing"):
-    """v6.0: Routes to WRITING or MEMORY model based on mode."""
     model = WRITING_MODEL_ID if mode == "writing" else MEMORY_MODEL_ID
     params = WRITING_PARAMS if mode == "writing" else MEMORY_PARAMS
     try:
@@ -643,7 +610,6 @@ def call_openrouter(messages, api_key, mode="writing"):
         return None, 0, 0, str(e)
 
 class CostTracker:
-    """v6.0: Dual-model cost tracking."""
     WRITING_INPUT = 2.50 / 1_000_000
     WRITING_OUTPUT = 15.00 / 1_000_000
     MEMORY_INPUT = 0.47 / 1_000_000
@@ -675,23 +641,18 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
     if not cross_session_enabled:
         return "", metadata, False
     storage = get_persistent_storage()
-    if not use_loops:
-            try:
-                # Check isolation toggle
-                isolate = st.session_state.get("isolate_sessions", False)
-                active_sessions = [current_session_id] if isolate and current_session_id else None
-                
-                # v6.1: Pass active_sessions to the client
-                cp_results = mnemo_client.graph_search(prompt, top_k=12, active_sessions=active_sessions)
-                prompt_lower = prompt.lower()
-                asking_about_past = any(phrase in prompt_lower for phrase in [
-                "last chat", "previous chat", "last conversation",
-                "previous conversation", "earlier chat", "before this",
-                "what did we talk", "what were we", "did we discuss",
-                "remember when", "last time", "our last", "previous session",
-                "talked about", "chatting about", "we discussed", "we were talking"
-])
-current_session_id = st.session_state.get("current_session_id", "")
+    if not storage:
+        return "", metadata, False
+
+    prompt_lower = prompt.lower()
+    asking_about_past = any(phrase in prompt_lower for phrase in [
+        "last chat", "previous chat", "last conversation",
+        "previous conversation", "earlier chat", "before this",
+        "what did we talk", "what were we", "did we discuss",
+        "remember when", "last time", "our last", "previous session",
+        "talked about", "chatting about", "we discussed", "we were talking"
+    ])
+    current_session_id = st.session_state.get("current_session_id", "")
 
     if asking_about_past:
         metadata["skip_loops"] = True
@@ -724,17 +685,20 @@ current_session_id = st.session_state.get("current_session_id", "")
             pass
         if not use_loops:
             try:
-                # v6.1: Search ConnectionPoints via graph_search instead of blob search
-                cp_results = mnemo_client.graph_search(prompt, top_k=12)
+                # v6.1: Check isolation toggle and pass to client
+                isolate = st.session_state.get("isolate_sessions", False)
+                active_sessions = [current_session_id] if isolate and current_session_id else None
+                
+                cp_results = mnemo_client.graph_search(prompt, top_k=12, active_sessions=active_sessions)
+                
                 writing_keywords = ["write", "scene", "chapter", "story", "prose", "dialogue", "style"]
                 if any(kw in prompt.lower() for kw in writing_keywords):
-                    style_cps = mnemo_client.graph_search("prose voice dialogue style tone", top_k=5)
-                    # Deduplicate
+                    style_cps = mnemo_client.graph_search("prose voice dialogue style tone", top_k=5, active_sessions=active_sessions)
                     seen_ids = {r.get("id") for r in cp_results}
                     for cp in style_cps:
                         if cp.get("id") not in seen_ids:
                             cp_results.append(cp)
-                # Adapt CP format → memory format for build_rich_context
+                            
                 memories = []
                 for cp in cp_results:
                     entity = cp.get("entity", "")
@@ -748,6 +712,7 @@ current_session_id = st.session_state.get("current_session_id", "")
                     else:
                         content = f"[{cat}] {value}"
                     memories.append({"content": content, "score": cp.get("score", 0)})
+                    
                 enriched, enrich_meta = context_engine.build_rich_context(prompt, memories)
                 if enriched:
                     context_parts.append(f"\n\n[DEEP CONTEXT]\n{enriched}")
@@ -758,7 +723,7 @@ current_session_id = st.session_state.get("current_session_id", "")
 
 
 # ============================================================================
-# MESSAGE HANDLER (v6.0: dual-model, session_id threading, prefetching)
+# MESSAGE HANDLER
 # ============================================================================
 
 def handle_message(prompt, openrouter_key, mnemo_client):
@@ -794,27 +759,22 @@ def handle_message(prompt, openrouter_key, mnemo_client):
 
     full_system_prompt = SYSTEM_PROMPT + past_conversation_context
 
-    # v6.0: Append the signal instruction to the system prompt if writing creatively
     if gate.query_type.value == "creative":
         full_system_prompt += "\n\n" + get_signal_instruction()
 
-    # v6.0: Check for a pre-fetched creative brief
     cached_brief = None
     if "prefetch_engine" in st.session_state and "signal_processor" in st.session_state:
         current_state = st.session_state.signal_processor.get_state()
         cached_brief = st.session_state.prefetch_engine.check_cache(current_state)
 
     if cached_brief:
-        # 0ms cache hit! Prepend the pre-built brief to the system prompt
         full_system_prompt = cached_brief.brief + "\n\n" + full_system_prompt
 
     should_use_loops = (needs_memory and use_loops and cross_session_enabled
                         and not skip_loops_for_this_query)
 
-    # v6.0: Check session isolation toggle
     active_sessions = [current_session_id] if isolate_sessions and current_session_id else None
 
-    # v6.0: Pass active_sessions to build_optimized_context
     messages, context_stats = st.session_state.context_manager.build_optimized_context(
         system_prompt=full_system_prompt, query=prompt,
         conversation_history=st.session_state.messages,
@@ -829,13 +789,11 @@ def handle_message(prompt, openrouter_key, mnemo_client):
         "sessions_found": sessions_found, "gate_tier": gate.tier_used,
     }
 
-    # v6.0: Call WRITING model (4o) with creative sampling params
     response, input_tokens, output_tokens, error = call_openrouter(messages, openrouter_key, mode="writing")
 
     if error:
         return None, error, {}
 
-    # v6.0: Parse and process signals
     clean_response, signals = parse_signals_from_response(response)
     
     if signals and "signal_processor" in st.session_state:
@@ -845,20 +803,17 @@ def handle_message(prompt, openrouter_key, mnemo_client):
             user_prompt=prompt
         )
         if "prefetch_engine" in st.session_state:
-            # Spin up the background K2.5 thread while the user reads
             st.session_state.prefetch_engine.trigger(
                 st.session_state.signal_processor.get_state(),
                 st.session_state.signal_processor.history,
                 mnemo_client
             )
             
-    # Swap out the raw response for the clean one before saving to history
     response = clean_response
 
     cost_tracker = CostTracker()
     msg_cost = cost_tracker.add_usage(input_tokens, output_tokens, mode="writing")
 
-    # Save conversation turn
     if not skip_loops_for_this_query:
         try:
             storage = get_persistent_storage(DEFAULT_HF_KEY, mnemo_client)
@@ -867,7 +822,6 @@ def handle_message(prompt, openrouter_key, mnemo_client):
         except Exception:
             pass
 
-    # Auto-extract via K2 → store as ConnectionPoints
     extracted = 0
     if (st.session_state.get("auto_extract", True)
             and cross_session_enabled
@@ -918,7 +872,7 @@ def handle_message(prompt, openrouter_key, mnemo_client):
 
 
 # ============================================================================
-# SIDEBAR RENDERER (v6.0: session isolation toggle)
+# SIDEBAR RENDERER 
 # ============================================================================
 
 def render_sidebar(mnemo_client, openrouter_key, hf_key):
@@ -960,7 +914,6 @@ def render_sidebar(mnemo_client, openrouter_key, hf_key):
                               help="Use token-efficient context injection")
         st.session_state.use_loops = use_loops
 
-        # v6.0: Session memory isolation toggle
         isolate_sessions = st.toggle("\U0001f512 Session Memory Isolation", value=False,
                                      help="Only use memories from the current session")
         st.session_state.isolate_sessions = isolate_sessions
@@ -1080,7 +1033,7 @@ def render_file_upload(mnemo_client, openrouter_key):
                 n_chunks = max(1, (len(content) - 1) // 12000 + 1)
                 if n_chunks > 1:
                     st.info(f"\U0001f4c4 {len(content):,} chars \u2192 splitting into {min(n_chunks, 5)} chunks")
-                with st.spinner(f"K2.5 extracting ({min(n_chunks, 5)} call{'s' if n_chunks > 1 else ''})..."):
+                with st.spinner(f"K2 extracting ({min(n_chunks, 5)} call{'s' if n_chunks > 1 else ''})..."):
                     memories, cost = extract_memories_from_file(content, uploaded_file.name, openrouter_key)
                 if memories:
                     with st.spinner("Storing to memory..."):
@@ -1166,7 +1119,6 @@ def render_memory_management(mnemo_client):
         n_blobs = stats.get('total_memories', 0)
         n_cps = stats.get('total_connection_points', 0)
         st.caption(f"ConnectionPoints: {n_cps} | Legacy blobs: {n_blobs} | Links: {stats.get('total_links', 0)}")
-        # Show CPs (primary) then blobs (legacy)
         points = mnemo_client.list_points(limit=15)
         for cp in points:
             col1, col2 = st.columns([5, 1])
@@ -1227,7 +1179,6 @@ def render_memory_management(mnemo_client):
             cat = cp.get("category", "?")
             conn = cp.get("connects_to", "")
             cp_id = cp.get("id", "")
-            source = cp.get("source", "")
             col1, col2, col3, col4 = st.columns([2, 1, 6, 1])
             with col1:
                 conn_str = f" → {conn}" if conn else ""
@@ -1249,14 +1200,12 @@ def render_consolidation_panel(openrouter_key):
         if last_consol:
             st.caption(f"Last run: {last_consol[:16]}")
 
-        # Show what will be analyzed
         try:
             mnemo_client = st.session_state.get("mnemo_client")
             if mnemo_client:
                 stats = mnemo_client.get_stats()
                 n_cps = stats.get("total_connection_points", 0)
                 n_blobs = stats.get("total_memories", 0)
-                # Count CPs by type
                 cp_cats = stats.get("cp_by_category", {})
                 fact_cats = sum(v for k, v in cp_cats.items() if k not in ("relationship", "tone"))
                 context_cats = cp_cats.get("relationship", 0)
@@ -1552,7 +1501,7 @@ def main():
         <div class="brand-icon">🧠</div>
         <div class="brand-text">
             <h1>4o with Memory</h1>
-            <p>GPT-4o writer · K2 memory curator · Mnemo v6.0</p>
+            <p>GPT-4o writer · K2 memory curator · Mnemo v6.1</p>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1561,7 +1510,7 @@ def main():
         st.error("\u26a0\ufe0f **API Keys Not Configured!**")
         st.markdown("""
         **For Streamlit Cloud:**
-        1. Go to your app's Settings \u2192 Secrets
+        1. Go to your app's Settings → Secrets
         2. Add your keys in TOML format:
         ```toml
         OPENROUTER_KEY = "sk-or-v1-your-key"
@@ -1637,7 +1586,7 @@ def main():
 
     st.markdown(f"""
     <div class="status-bar">
-        4o with Memory v6.0 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Threads & Knots &nbsp;·&nbsp; Graph Search
+        4o with Memory v6.1 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Threads & Knots &nbsp;·&nbsp; Graph Search
     </div>
     """, unsafe_allow_html=True)
 
