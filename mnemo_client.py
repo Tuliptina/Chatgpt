@@ -252,13 +252,14 @@ class MnemoClient:
                   connects_to: str = "", reason: str = "",
                   weight: float = 0.5, category: str = "fact",
                   session_id: str = "", source: str = "auto_extract",
-                  thread_id: str = "", position: int = -1) -> Optional[str]:
+                  thread_id: str = "", position: int = -1), 
+                  namespace: str = "default") -> Optional[str]:
         """Add a ConnectionPoint. Returns CP ID or None."""
         result = self._call(
             "add_point_api",
             entity, point_type, value, connects_to, reason,
             str(weight), category, session_id, source,
-            thread_id, str(position),
+            thread_id, str(position), namespace
         )
         if result and isinstance(result, dict):
             return result.get("id")
