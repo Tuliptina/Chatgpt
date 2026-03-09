@@ -1,28 +1,19 @@
 """
-4o with Memory - Enhanced Edition (v5.3 patch)
+4o with Memory v6.0 — Dual-Processor Creative Writing Engine
 
-Changes from v5.1:
-- FIX: handle_message() now uses SmartMemory.two_tier_gate() for proper
-  two-tier injection gating. Tier 2 (Mnemo /should_inject) is consulted
-  for moderate-confidence Tier 1 decisions (FACTUAL, named entities,
-  GENERAL queries). High-confidence skips and uses bypass Tier 2.
-- FIX: Cross-session toggle now correctly gates loop injection AND auto-extract
-- FIX: Unified context retrieval (no more triple-redundant Mnemo searches)
-- REFACTOR: main() broken into render_sidebar(), render_chat(), handle_message()
-- FIX: Error boundaries around Mnemo calls in the chat hot path
-- CLEANUP: estimate_tokens() consolidated into utils.py
-- FIX (UX): Session renames now accurately save to cloud dataset
-- FIX (UX): Sidebar API key changes instantly apply to MnemoClient
-- FIX (UX): Network timeouts no longer strand user messages in the UI
-- FIX (UX): Folders are now fully persistent across reloads
+v6.0 changes:
+- DUAL MODEL: K2.5 for memory ops ($0.60/$3.00/M), GPT-4o for writing ($2.50/$15.00/M)
+- SAMPLING: GPT-4o uses temperature=1.0, repetition_penalty=1.1, frequency/presence penalties
+  for creative diversity. K2.5 uses temperature=0.2 for deterministic JSON extraction.
+- SYSTEM PROMPT: Split into conversation/recall/creative modes. Creative mode is tonally
+  invisible — no "warm" personality bleeding into dark scenes.
+- SESSION CLEANUP: delete_session() now removes ALL memory types + loop tokens
+- SESSION ISOLATION: New toggle — only use memories from current session when ON
+- SESSION_ID THREADING: All add_to_loop() calls now pass session_id
+- COST TRACKING: Dual-model pricing in CostTracker
+- PREFETCH CACHING: Integrated predictive briefs via SignalProcessor & PrefetchEngine
 
-Features:
-- GPT-4o via OpenRouter with warm, conversational style
-- Mnemo v5.3 Cloud Memory (persistent across sessions)
-- Centralized MnemoClient (clean architecture)
-- Metadata Loop System (80% token savings)
-- Auto-Memory Extraction & File Uploads
-- Native Session Management & Streamlit Dialog Modals
+Prior: v5.3 two-tier injection gate, unified context retrieval, error boundaries.
 """
 
 import streamlit as st
@@ -41,8 +32,13 @@ from smart_memory import SmartMemory, ContextWindowManager
 from session_store import SessionStore
 from context_engine import ContextEngine
 
+# NEW IMPORTS for v6.0 Signal & Prefetch architecture
+from signal_protocol import SignalProcessor
+from prefetch_engine import PrefetchEngine
+from memory_schema import parse_signals_from_response, get_signal_instruction
+
 # ============================================================================
-# CONFIGURATION
+# CONFIGURATION (v6.0: Dual-Model Architecture)
 # ============================================================================
 
 def get_secret(key, default=""):
@@ -57,42 +53,60 @@ DEFAULT_OPENROUTER_KEY = get_secret("OPENROUTER_KEY", "")
 DEFAULT_HF_KEY = get_secret("HF_KEY", "")
 MNEMO_URL = "https://athelaperk-mnemo-mcp.hf.space"
 
-MODEL_ID = "openai/gpt-4o-2024-11-20"
-TEMPERATURE = 0.75
+# v6.0: Two models — writing (4o) and memory ops (K2.5)
+WRITING_MODEL_ID = "openai/gpt-4o-2024-11-20"
+MEMORY_MODEL_ID = "moonshotai/kimi-k2.5"
+
+# v6.0: Per-model sampling parameters
+WRITING_PARAMS = {
+    "temperature": 1.0,
+    "repetition_penalty": 1.1,
+    "frequency_penalty": 0.2,
+    "presence_penalty": 0.3,
+    "max_tokens": 4000,
+}
+
+MEMORY_PARAMS = {
+    "temperature": 0.2,
+    "repetition_penalty": 1.0,
+    "frequency_penalty": 0.0,
+    "presence_penalty": 0.0,
+    "max_tokens": 4096,
+    "response_format": {"type": "json_object"},
+}
 
 MAX_CONVERSATION_MESSAGES = 8
 MAX_SESSIONS_STORED = 20
-
-# v5.1: Timeout for Mnemo calls in the chat hot path
 MNEMO_HOT_PATH_TIMEOUT = 4.0
 
-SYSTEM_PROMPT = """You are a warm, intelligent AI companion with persistent memory. You remember past conversations and uploaded context.
+# v6.0: System prompt — split personality. Warm for conversation, invisible for creative.
+SYSTEM_PROMPT = """You have two modes. Detect which one the user needs and switch seamlessly.
 
-Your personality:
+MODE 1 — CONVERSATION (chatting about the project, questions, planning):
 - Warm and direct, like a knowledgeable collaborator
-- Excellent memory for details people share
+- Natural, conversational tone
 - Ask thoughtful follow-up questions when needed
-- Natural, conversational tone (not formal or robotic)
 
-IMPORTANT — Match your response style to what the user is asking:
-
-When the user asks you to RECALL, RETRIEVE, LIST, or SUMMARIZE information:
+MODE 2 — RECALL & RETRIEVAL (user asks you to recall, list, summarize):
 - Give clean, factual answers drawn from your memory context
-- Use the exact details stored in memory — do NOT embellish, infer, or fill gaps with imagination
-- If memory doesn't contain something, say so honestly instead of inventing details
-- Structure clearly: bullet points or short paragraphs, no dramatic prose
+- Use EXACT details from memory — do NOT embellish, infer, or fill gaps with imagination
+- If memory doesn't contain something, say so honestly
+- Structure clearly: bullet points or short paragraphs
 
-When the user asks you to WRITE creatively (scenes, chapters, dialogue, prose):
-- Match the genre, tone, and atmosphere of the project (from memory context)
+MODE 3 — CREATIVE WRITING (scenes, chapters, dialogue, prose):
+- Your personality DISAPPEARS. You are not "warm" — you are the story.
+- Match the tonal register from the [TONE DIRECTIVE] in your context. Dark stays dark. Humor cuts. Tension holds.
 - Deep psychological complexity in characters
-- Setting-accurate language (historical, futuristic, contemporary — whatever the project requires)
-- Show don't tell
-- Default to third person past tense unless the user specifies otherwise or memory contains a different VOICE preference
-- Match the user's writing voice if style samples are in memory
-- Stay consistent with all CHARACTER, PLOT, CONTEXT, and INSTRUCTION memories
+- Setting-accurate language for the project's period/genre
+- Show don't tell. Sensory detail. Subtext in dialogue.
+- Default to third person past tense unless user or memory specifies otherwise
+- Match the user's writing voice if VOICE/PROSE_SAMPLE memories exist
+- Stay consistent with ALL CHARACTER, PLOT, CONTEXT, INSTRUCTION, and TONE memories
+- NEVER soften emotional edges. If the brief says "clinical dread," write clinical dread.
+- If a character uses dark humor, the humor should make the reader MORE uncomfortable, not less.
+- DO NOT resolve tension prematurely. DO NOT add reassuring internal monologue unless the brief says to.
 
 When in doubt about which mode: ask the user.
-
 Always acknowledge context from memory naturally."""
 
 
@@ -142,48 +156,34 @@ def get_session_title(messages):
 def save_current_session():
     if "messages" not in st.session_state or not st.session_state.messages:
         return
-    
     session_id = st.session_state.get("current_session_id", generate_session_id())
-    
     custom_titles = st.session_state.get("custom_titles", {})
     title = custom_titles.get(session_id, get_session_title(st.session_state.messages))
-    
     messages_copy = [msg.copy() for msg in st.session_state.messages]
     storage = get_persistent_storage()
-    
     if storage:
         try:
-            storage.save_session(
-                session_id=session_id,
-                title=title,
-                messages=messages_copy,
-                timestamp=datetime.now().isoformat()
-            )
+            storage.save_session(session_id=session_id, title=title,
+                                 messages=messages_copy, timestamp=datetime.now().isoformat())
             msg_count = len([m for m in messages_copy if m.get("role") == "user"])
             if msg_count > 0 and msg_count % 25 == 0:
                 storage.cleanup_stale_sessions()
         except Exception:
             pass
-    
     if "session_history" not in st.session_state:
         st.session_state.session_history = []
-    
     current_session = {
-        "id": session_id,
-        "title": title,
-        "timestamp": datetime.now().isoformat(),
+        "id": session_id, "title": title, "timestamp": datetime.now().isoformat(),
         "message_count": len([m for m in messages_copy if m["role"] == "user"]),
         "preview": messages_copy[0]["content"][:100] if messages_copy else "",
         "messages": messages_copy
     }
-    
-    existing_idx = next((i for i, s in enumerate(st.session_state.session_history) if s["id"] == current_session["id"]), None)
-    
+    existing_idx = next((i for i, s in enumerate(st.session_state.session_history)
+                         if s["id"] == current_session["id"]), None)
     if existing_idx is not None:
         st.session_state.session_history[existing_idx] = current_session
     else:
         st.session_state.session_history.insert(0, current_session)
-    
     st.session_state.session_history = st.session_state.session_history[:MAX_SESSIONS_STORED]
 
 def start_new_chat():
@@ -203,6 +203,7 @@ def load_session(session_id):
     st.session_state.current_session_id = session_id
 
 def delete_session(session_id):
+    """v6.0 FIX: Delete session + ALL associated memories + loop tokens."""
     st.session_state.session_history = [
         s for s in st.session_state.get("session_history", []) if s["id"] != session_id
     ]
@@ -212,6 +213,11 @@ def delete_session(session_id):
             storage.delete_session(session_id)
     except Exception:
         pass
+    # v6.0: Clean loop tokens for this session
+    if "loop_manager" in st.session_state:
+        lm = st.session_state.loop_manager
+        if hasattr(lm, 'remove_session_tokens'):
+            lm.remove_session_tokens(session_id)
 
 
 # ============================================================================
@@ -223,29 +229,25 @@ def rename_session_dialog(session_id, current_title):
     new_name = st.text_input("New name:", value=current_title, key=f"rename_input_{session_id}")
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("💾 Save", use_container_width=True):
+        if st.button("\U0001f4be Save", use_container_width=True):
             if new_name and new_name.strip():
                 new_title = new_name.strip()
                 if "custom_titles" not in st.session_state:
                     st.session_state.custom_titles = {}
                 st.session_state.custom_titles[session_id] = new_title
-                
                 for s in st.session_state.session_history:
                     if s.get("id") == session_id:
                         s["title"] = new_title
                         break
-                
-                # FIX: Actually write the renamed session to the cloud dataset
                 storage = get_persistent_storage()
                 if storage:
                     messages = storage.load_session_messages(session_id)
                     storage.save_session(session_id, new_title, messages)
-                    
                 if session_id == st.session_state.get("current_session_id"):
                     save_current_session()
             st.rerun()
     with col2:
-        if st.button("❌ Cancel", use_container_width=True):
+        if st.button("\u274c Cancel", use_container_width=True):
             st.rerun()
 
 @st.dialog("Move Session")
@@ -254,26 +256,24 @@ def move_session_dialog(session_id):
     target_folder = st.selectbox("Move to:", folders, key=f"move_target_{session_id}")
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("📂 Move", use_container_width=True):
+        if st.button("\U0001f4c2 Move", use_container_width=True):
             for f in st.session_state.session_folders:
                 if session_id in st.session_state.session_folders[f]:
                     st.session_state.session_folders[f].remove(session_id)
             st.session_state.session_folders[target_folder].append(session_id)
-            
-            # FIX: Persist folder change to HF Dataset
             storage = get_persistent_storage()
             if storage and hasattr(storage, 'save_folder_state'):
                 storage.save_folder_state(st.session_state.session_folders)
             st.rerun()
     with col2:
-        if st.button("❌ Cancel", use_container_width=True):
+        if st.button("\u274c Cancel", use_container_width=True):
             st.rerun()
 
 @st.dialog("Copy Response")
 def copy_response_dialog(content):
-    st.markdown("**📋 Copy this text:**")
+    st.markdown("**\U0001f4cb Copy this text:**")
     st.code(content, language=None)
-    if st.button("✅ Done", use_container_width=True):
+    if st.button("\u2705 Done", use_container_width=True):
         st.rerun()
 
 
@@ -282,12 +282,10 @@ def copy_response_dialog(content):
 # ============================================================================
 
 def extract_text_from_file(uploaded_file):
-    """Extract text content from uploaded file"""
     file_type = uploaded_file.type
     content = ""
-    
     try:
-        if file_type == "text/plain" or file_type == "text/csv" or file_type == "text/markdown":
+        if file_type in ("text/plain", "text/csv", "text/markdown"):
             content = uploaded_file.read().decode("utf-8")
         elif file_type == "application/json":
             data = json.load(uploaded_file)
@@ -301,14 +299,14 @@ def extract_text_from_file(uploaded_file):
                     if text:
                         content += text + "\n"
             except ImportError:
-                content = "[PDF support requires pypdf. Please run: pip install pypdf]"
+                content = "[PDF support requires pypdf]"
         elif "word" in file_type or "docx" in file_type:
             try:
                 import docx
                 doc = docx.Document(uploaded_file)
                 content = "\n".join([para.text for para in doc.paragraphs])
             except ImportError:
-                content = "[Word support requires python-docx. Please upload as text file.]"
+                content = "[Word support requires python-docx]"
         else:
             try:
                 content = uploaded_file.read().decode("utf-8")
@@ -316,14 +314,13 @@ def extract_text_from_file(uploaded_file):
                 content = f"[Cannot read file type: {file_type}]"
     except Exception as e:
         content = f"[Error reading file: {str(e)}]"
-    
     return content
 
 async def process_chunk_async(http_client, chunk, filename, i, total_chunks, openrouter_key):
-    """Async worker to process a single chunk with structured JSON outputs"""
+    """v6.0: Routes to MEMORY_MODEL_ID (K2.5) instead of GPT-4o."""
     chunk_label = f" (part {i+1}/{total_chunks})" if total_chunks > 1 else ""
     prompt = f"""Analyze this document and extract ALL information in multiple layers.
-Be EXHAUSTIVE — extract every character, plot point, relationship, rule, and detail. 
+Be EXHAUSTIVE -- extract every character, plot point, relationship, rule, and detail. 
 
 DOCUMENT: {filename}{chunk_label}
 
@@ -334,12 +331,13 @@ Extract in these categories:
 LAYER 1 - FACTS: CHARACTER, PLOT, SETTING, THEME, FACT
 LAYER 2 - DEEP CONTEXT: CONTEXT, CLARIFICATION, RELATIONSHIP, INSTRUCTION
 LAYER 3 - STYLE: PROSE_SAMPLE, DIALOGUE_SAMPLE, VOICE, VOCABULARY
+LAYER 4 - TONE: TONE (scene registers, humor types, emotional shifts, atmosphere, do-nots)
 
 Return ONLY a JSON object containing an array called "memories". Example format:
 {{
   "memories": [
     {{"category": "CHARACTER", "content": "John Mercer, mid-30s detective"}},
-    {{"category": "CONTEXT", "content": "John's obsession is driven by guilt"}}
+    {{"category": "TONE", "content": "John's scenes should feel noir-claustrophobic, not action-thriller"}}
   ]
 }}"""
 
@@ -348,32 +346,27 @@ Return ONLY a JSON object containing an array called "memories". Example format:
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {openrouter_key}", "Content-Type": "application/json"},
             json={
-                "model": MODEL_ID,
+                "model": MEMORY_MODEL_ID,
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.2, "max_tokens": 4096,
-                "response_format": {"type": "json_object"}
+                **MEMORY_PARAMS
             },
             timeout=90.0
         )
         if response.status_code != 200:
             return [], 0
-        
         data = response.json()
         raw = data["choices"][0]["message"]["content"]
         usage = data.get("usage", {})
-        cost = (usage.get("prompt_tokens", 0) * 2.50 + usage.get("completion_tokens", 0) * 15.00) / 1_000_000
-        
+        cost = (usage.get("prompt_tokens", 0) * 0.60 + usage.get("completion_tokens", 0) * 3.00) / 1_000_000
         parsed = json.loads(raw)
         return parsed.get("memories", []), cost
     except Exception:
         return [], 0
 
 def extract_memories_from_file(content, filename, openrouter_key):
-    """Extract memories concurrently using httpx and asyncio."""
     CHUNK_SIZE = 12000
     CHUNK_OVERLAP = 1500
     MAX_CHUNKS = 5
-    
     chunks = []
     if len(content) <= CHUNK_SIZE:
         chunks = [content]
@@ -389,10 +382,11 @@ def extract_memories_from_file(content, filename, openrouter_key):
                     end = boundary + 1
             chunks.append(content[start:end])
             start = end - CHUNK_OVERLAP
-            
+
     async def run_all_chunks():
         async with httpx.AsyncClient() as http_client:
-            tasks = [process_chunk_async(http_client, chunk, filename, i, len(chunks), openrouter_key) for i, chunk in enumerate(chunks)]
+            tasks = [process_chunk_async(http_client, chunk, filename, i, len(chunks), openrouter_key)
+                     for i, chunk in enumerate(chunks)]
             return await asyncio.gather(*tasks)
 
     try:
@@ -402,32 +396,28 @@ def extract_memories_from_file(content, filename, openrouter_key):
         results = loop.run_until_complete(run_all_chunks())
     except RuntimeError:
         results = asyncio.run(run_all_chunks())
-    
-    all_memories = []
-    total_cost = 0
-    
+
+    all_memories, total_cost = [], 0
     for memories, cost in results:
         if memories:
             all_memories.extend(memories)
         total_cost += cost
-    
     seen = set()
-    unique_memories = []
+    unique = []
     for mem in all_memories:
         key = mem.get("content", "")[:80].lower().strip()
         if key not in seen:
             seen.add(key)
-            unique_memories.append(mem)
-    
-    return unique_memories, total_cost
+            unique.append(mem)
+    return unique, total_cost
 
 
 # ============================================================================
-# MEMORY EXTRACTION (from conversations)
+# MEMORY EXTRACTION (v6.0: routes to K2.5)
 # ============================================================================
 
 def extract_memories_with_gpt(conversation, openrouter_key):
-    """Extract memories from conversation using GPT-4o with JSON Mode"""
+    """v6.0: Routes to MEMORY_MODEL_ID (K2.5) for extraction. Adds TONE category."""
     prompt = f"""Analyze this conversation and extract important facts to remember.
 
 CONVERSATION:
@@ -439,6 +429,7 @@ Categories:
 - SETTING: Locations, time periods
 - THEME: Themes, symbols
 - STYLE: Writing preferences
+- TONE: Emotional registers, mood shifts, humor types, do-nots
 - FACT: Other important info
 
 Return ONLY a JSON object containing an array called "memories". Example format:
@@ -453,85 +444,80 @@ Return ONLY a JSON object containing an array called "memories". Example format:
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {openrouter_key}", "Content-Type": "application/json"},
             json={
-                "model": MODEL_ID,
+                "model": MEMORY_MODEL_ID,
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.2, "max_tokens": 500,
-                "response_format": {"type": "json_object"}
+                **MEMORY_PARAMS,
+                "max_tokens": 500,
             },
             timeout=30
         )
         if response.status_code != 200:
             return [], 0
-        
         data = response.json()
         raw = data["choices"][0]["message"]["content"]
         usage = data.get("usage", {})
-        cost = (usage.get("prompt_tokens", 0) * 2.50 + usage.get("completion_tokens", 0) * 15.00) / 1_000_000
-        
+        cost = (usage.get("prompt_tokens", 0) * 0.60 + usage.get("completion_tokens", 0) * 3.00) / 1_000_000
         parsed = json.loads(raw)
         return parsed.get("memories", []), cost
     except Exception:
         return [], 0
 
 # ============================================================================
-# API CALLS & COST TRACKING
+# API CALLS & COST TRACKING (v6.0: dual-model routing)
 # ============================================================================
 
-def call_openrouter(messages, api_key):
+def call_openrouter(messages, api_key, mode="writing"):
+    """v6.0: Routes to WRITING or MEMORY model based on mode."""
+    model = WRITING_MODEL_ID if mode == "writing" else MEMORY_MODEL_ID
+    params = WRITING_PARAMS if mode == "writing" else MEMORY_PARAMS
     try:
+        body = {"model": model, "messages": messages, **params}
         response = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": MODEL_ID, "messages": messages, "temperature": TEMPERATURE, "max_tokens": 4000},
-            timeout=120
+            json=body, timeout=120
         )
         if response.status_code != 200:
             return None, 0, 0, f"API Error: {response.status_code}"
-        
         data = response.json()
         content = data["choices"][0]["message"]["content"]
         usage = data.get("usage", {})
-        
         return content, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0), None
     except Exception as e:
         return None, 0, 0, str(e)
 
 class CostTracker:
-    INPUT_COST = 2.50 / 1_000_000
-    OUTPUT_COST = 15.00 / 1_000_000
-    
+    """v6.0: Dual-model cost tracking."""
+    WRITING_INPUT = 2.50 / 1_000_000
+    WRITING_OUTPUT = 15.00 / 1_000_000
+    MEMORY_INPUT = 0.60 / 1_000_000
+    MEMORY_OUTPUT = 3.00 / 1_000_000
+
     def __init__(self):
         if "total_cost" not in st.session_state:
             st.session_state.total_cost = 0.0
         if "message_count" not in st.session_state:
             st.session_state.message_count = 0
-    
-    def add_usage(self, input_tokens, output_tokens):
-        cost = (input_tokens * self.INPUT_COST) + (output_tokens * self.OUTPUT_COST)
+
+    def add_usage(self, input_tokens, output_tokens, mode="writing"):
+        if mode == "writing":
+            cost = (input_tokens * self.WRITING_INPUT) + (output_tokens * self.WRITING_OUTPUT)
+        else:
+            cost = (input_tokens * self.MEMORY_INPUT) + (output_tokens * self.MEMORY_OUTPUT)
         st.session_state.total_cost += cost
         st.session_state.message_count += 1
         return cost
 
 
 # ============================================================================
-# CONTEXT BUILDER (v5.1: unified retrieval path)
+# CONTEXT BUILDER
 # ============================================================================
 
 def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops, loop_manager, context_engine):
-    """
-    v5.1: Single unified context retrieval path.
-
-    Returns: (context_string, metadata_dict, skip_loops_flag)
-    """
     context_parts = []
-    metadata = {
-        "sessions_found": 0,
-        "skip_loops": False,
-    }
-
+    metadata = {"sessions_found": 0, "skip_loops": False}
     if not cross_session_enabled:
         return "", metadata, False
-
     storage = get_persistent_storage()
     if not storage:
         return "", metadata, False
@@ -544,11 +530,9 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
         "remember when", "last time", "our last", "previous session",
         "talked about", "chatting about", "we discussed", "we were talking"
     ])
-
     current_session_id = st.session_state.get("current_session_id", "")
 
     if asking_about_past:
-        # Past-chat questions: search sessions, skip all memory injection
         metadata["skip_loops"] = True
         try:
             session_results = storage.search_sessions(prompt, current_session_id=current_session_id, limit=2)
@@ -557,8 +541,7 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
                 context_parts.append(
                     "\n\n[PREVIOUS CHAT SESSIONS - The user is asking about past conversations. "
                     "Use ONLY this information to answer. Do NOT use other memories:]\n"
-                    + "\n---\n".join(session_results)
-                )
+                    + "\n---\n".join(session_results))
             else:
                 recent = storage.get_previous_sessions_content(current_session_id=current_session_id, limit=2)
                 if recent:
@@ -567,61 +550,44 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
                     context_parts.append(
                         "\n\n[RECENT CHAT SESSIONS - The user is asking about past conversations. "
                         "Use ONLY this information to answer:]\n"
-                        + "\n---\n".join(summaries)
-                    )
+                        + "\n---\n".join(summaries))
         except Exception:
             pass
-
     else:
-        # Normal queries
         try:
             past_convos = storage.search_conversations(prompt, limit=3)
             if past_convos:
-                context_parts.append(
-                    "\n\n[PAST CONVERSATIONS]\n"
-                    + "\n".join(f"• {conv[:200]}" for conv in past_convos)
-                )
+                context_parts.append("\n\n[PAST CONVERSATIONS]\n"
+                                     + "\n".join(f"\u2022 {conv[:200]}" for conv in past_convos))
         except Exception:
             pass
-
         if not use_loops:
             try:
                 memories = mnemo_client.search(prompt, limit=8)
-
-                # Style injection for writing queries
                 writing_keywords = ["write", "scene", "chapter", "story", "prose", "dialogue", "style"]
                 if any(kw in prompt.lower() for kw in writing_keywords):
                     style_results = mnemo_client.search("PROSE_SAMPLE VOICE DIALOGUE_SAMPLE", limit=5)
                     memories.extend(style_results)
-
                 enriched, enrich_meta = context_engine.build_rich_context(prompt, memories)
                 if enriched:
                     context_parts.append(f"\n\n[DEEP CONTEXT]\n{enriched}")
             except Exception:
                 pass
 
-    context_string = "".join(context_parts)
-    return context_string, metadata, metadata["skip_loops"]
+    return "".join(context_parts), metadata, metadata["skip_loops"]
 
 
 # ============================================================================
-# MESSAGE HANDLER (v5.3: two-tier injection gate)
+# MESSAGE HANDLER (v6.0: dual-model, session_id threading, prefetching)
 # ============================================================================
 
 def handle_message(prompt, openrouter_key, mnemo_client):
-    """
-    Process a user message: build context, call LLM, extract memories.
-
-    v5.3: Uses SmartMemory.two_tier_gate() instead of bare should_use_memory().
-    Tier 2 (Mnemo /should_inject) is now actually consulted for moderate-
-    confidence Tier 1 decisions, saving full retrieval round-trips when the
-    query has no semantic overlap with stored memories.
-    """
     conversation_length = len(st.session_state.messages)
     cross_session_enabled = st.session_state.get("cross_session_enabled", True)
     use_loops = st.session_state.get("use_loops", True)
+    isolate_sessions = st.session_state.get("isolate_sessions", False)
+    current_session_id = st.session_state.get("current_session_id", "")
 
-    # v5.3: Two-tier gate replaces bare should_use_memory()
     gate = st.session_state.smart_memory.two_tier_gate(
         query=prompt,
         mnemo_client=mnemo_client if cross_session_enabled else None,
@@ -648,67 +614,99 @@ def handle_message(prompt, openrouter_key, mnemo_client):
 
     full_system_prompt = SYSTEM_PROMPT + past_conversation_context
 
-    should_use_loops = (
-        needs_memory
-        and use_loops
-        and cross_session_enabled
-        and not skip_loops_for_this_query
-    )
+    # v6.0: Append the signal instruction to the system prompt if writing creatively
+    if gate.query_type.value == "creative":
+        full_system_prompt += "\n\n" + get_signal_instruction()
 
+    # v6.0: Check for a pre-fetched creative brief
+    cached_brief = None
+    if "prefetch_engine" in st.session_state and "signal_processor" in st.session_state:
+        current_state = st.session_state.signal_processor.get_state()
+        cached_brief = st.session_state.prefetch_engine.check_cache(current_state)
+
+    if cached_brief:
+        # 0ms cache hit! Prepend the pre-built brief to the system prompt
+        full_system_prompt = cached_brief.brief + "\n\n" + full_system_prompt
+
+    should_use_loops = (needs_memory and use_loops and cross_session_enabled
+                        and not skip_loops_for_this_query)
+
+    # v6.0: Check session isolation toggle
+    active_sessions = [current_session_id] if isolate_sessions and current_session_id else None
+
+    # v6.0: Pass active_sessions to build_optimized_context
     messages, context_stats = st.session_state.context_manager.build_optimized_context(
-        system_prompt=full_system_prompt,
-        query=prompt,
+        system_prompt=full_system_prompt, query=prompt,
         conversation_history=st.session_state.messages,
-        max_messages=MAX_CONVERSATION_MESSAGES,
-        use_loops=should_use_loops,
+        max_messages=MAX_CONVERSATION_MESSAGES, use_loops=should_use_loops,
+        active_sessions=active_sessions,
     )
 
     context_meta = {
         "cross_session_memories_used": context_stats.get("memory_items_full", 0) + context_stats.get("memory_items_meta", 0),
         "context_tokens": context_stats.get("total_tokens", 0),
-        "mode": gate.mode,
-        "memory_reason": gate.reason,
-        "sessions_found": sessions_found,
-        "gate_tier": gate.tier_used,
+        "mode": gate.mode, "memory_reason": gate.reason,
+        "sessions_found": sessions_found, "gate_tier": gate.tier_used,
     }
 
-    # Call LLM
-    response, input_tokens, output_tokens, error = call_openrouter(messages, openrouter_key)
+    # v6.0: Call WRITING model (4o) with creative sampling params
+    response, input_tokens, output_tokens, error = call_openrouter(messages, openrouter_key, mode="writing")
 
     if error:
         return None, error, {}
 
+    # v6.0: Parse and process signals
+    clean_response, signals = parse_signals_from_response(response)
+    
+    if signals and "signal_processor" in st.session_state:
+        st.session_state.signal_processor.process(
+            signals, mnemo_client, 
+            session_id=current_session_id, 
+            user_prompt=prompt
+        )
+        if "prefetch_engine" in st.session_state:
+            # Spin up the background K2.5 thread while the user reads
+            st.session_state.prefetch_engine.trigger(
+                st.session_state.signal_processor.get_state(),
+                st.session_state.signal_processor.history,
+                mnemo_client
+            )
+            
+    # Swap out the raw response for the clean one before saving to history
+    response = clean_response
+
     cost_tracker = CostTracker()
-    msg_cost = cost_tracker.add_usage(input_tokens, output_tokens)
+    msg_cost = cost_tracker.add_usage(input_tokens, output_tokens, mode="writing")
 
     # Save conversation turn
     if not skip_loops_for_this_query:
         try:
             storage = get_persistent_storage(DEFAULT_HF_KEY, mnemo_client)
             if storage:
-                storage.save_conversation_turn(prompt, response, st.session_state.get("current_session_id"))
+                storage.save_conversation_turn(prompt, response, current_session_id)
         except Exception:
             pass
 
-    # Auto-extract
+    # Auto-extract via K2.5
     extracted = 0
     if (st.session_state.get("auto_extract", True)
-            and cross_session_enabled 
+            and cross_session_enabled
             and not skip_loops_for_this_query):
         conversation = f"User: {prompt}\n\nAssistant: {response}"
         memories, extract_cost = extract_memories_with_gpt(conversation, openrouter_key)
         if memories:
-            current_session = st.session_state.get("current_session_id")
             msg_cost += extract_cost
             for mem in memories:
                 cat = mem.get("category", "FACT").upper()
                 txt = mem.get("content", "")
                 if txt:
-                    meta = {"category": cat, "session_id": current_session}
+                    meta = {"category": cat, "session_id": current_session_id}
                     try:
                         if mnemo_client.add(f"[{cat}] {txt}", metadata=meta, priority=0.5):
                             extracted += 1
-                            st.session_state.loop_manager.add_to_loop(content=txt, category=cat.lower())
+                            st.session_state.loop_manager.add_to_loop(
+                                content=txt, category=cat.lower(),
+                                session_id=current_session_id)
                     except Exception:
                         pass
 
@@ -716,26 +714,22 @@ def handle_message(prompt, openrouter_key, mnemo_client):
         "cross_session_memories_used": context_meta.get("cross_session_memories_used", 0),
         "context_tokens": context_meta.get("context_tokens", 0),
         "mode": context_meta.get("mode", "full"),
-        "extracted": extracted,
-        "cost": msg_cost,
+        "extracted": extracted, "cost": msg_cost,
         "sessions_found": sessions_found,
         "gate_tier": context_meta.get("gate_tier", 1),
     }
-
     return response, None, result_meta
 
 
 # ============================================================================
-# SIDEBAR RENDERER (v5.1: extracted from main())
+# SIDEBAR RENDERER (v6.0: session isolation toggle)
 # ============================================================================
 
 def render_sidebar(mnemo_client, openrouter_key, hf_key):
-    """Render the full sidebar: settings, sessions, memory management."""
-
     with st.sidebar:
-        st.header("⚙️ Settings")
+        st.header("\u2699\ufe0f Settings")
 
-        with st.expander("🔑 API Keys", expanded=False):
+        with st.expander("\U0001f511 API Keys", expanded=False):
             or_key = st.text_input("OpenRouter API Key", value=DEFAULT_OPENROUTER_KEY, type="password")
             hf = st.text_input("HuggingFace Token", value=DEFAULT_HF_KEY, type="password")
 
@@ -743,62 +737,63 @@ def render_sidebar(mnemo_client, openrouter_key, hf_key):
         hf_key = hf or DEFAULT_HF_KEY
 
         st.divider()
-        st.subheader("💬 Chat")
+        st.subheader("\U0001f4ac Chat")
 
-        if st.button("➕ New Chat", use_container_width=True, type="primary"):
+        if st.button("\u2795 New Chat", use_container_width=True, type="primary"):
             start_new_chat()
             st.rerun()
 
         st.divider()
-
-        # --- Sessions ---
         render_sessions_panel(mnemo_client, hf_key)
-
         st.divider()
 
-        # --- Settings expander ---
-        with st.expander("⚙️ Settings", expanded=False):
+        with st.expander("\u2699\ufe0f Settings", expanded=False):
             render_file_upload(mnemo_client, openrouter_key)
 
         st.divider()
-        st.subheader("🧠 Memory Settings")
+        st.subheader("\U0001f9e0 Memory Settings")
 
-        cross_session_enabled = st.toggle("Cross-Session Memory", value=True, help="Remember across chat sessions")
-        auto_extract = st.toggle("Auto-Extract Memories", value=True, help="Automatically extract facts from conversations")
+        cross_session_enabled = st.toggle("Cross-Session Memory", value=True,
+                                          help="Remember across chat sessions")
+        auto_extract = st.toggle("Auto-Extract Memories", value=True,
+                                 help="Automatically extract facts from conversations")
         st.session_state.auto_extract = auto_extract
         st.session_state.cross_session_enabled = cross_session_enabled
 
-        use_loops = st.toggle("🔄 Metadata Loops (Save 80% tokens)", value=True, help="Use token-efficient context injection")
+        use_loops = st.toggle("\U0001f504 Metadata Loops (Save 80% tokens)", value=True,
+                              help="Use token-efficient context injection")
         st.session_state.use_loops = use_loops
+
+        # v6.0: Session memory isolation toggle
+        isolate_sessions = st.toggle("\U0001f512 Session Memory Isolation", value=False,
+                                     help="Only use memories from the current session")
+        st.session_state.isolate_sessions = isolate_sessions
 
         if "loop_manager" in st.session_state and use_loops:
             loop_stats = st.session_state.loop_manager.get_stats()
-            st.caption(f"📊 {loop_stats['total_items']} memories | {loop_stats['total_metadata_tokens']} tokens")
+            st.caption(f"\U0001f4ca {loop_stats['total_items']} memories | {loop_stats['total_metadata_tokens']} tokens")
 
         st.divider()
-        st.subheader("📝 Add Memory")
-
+        st.subheader("\U0001f4dd Add Memory")
         render_memory_management(mnemo_client)
-
         st.divider()
-
         render_consolidation_panel(openrouter_key)
-
         st.divider()
-        st.subheader("💰 Costs")
+
+        st.subheader("\U0001f4b0 Costs")
         st.caption(f"Messages: {st.session_state.get('message_count', 0)}")
         st.caption(f"Total: ${st.session_state.get('total_cost', 0):.4f}")
+        st.caption(f"Writing: {WRITING_MODEL_ID.split('/')[-1]} | Memory: {MEMORY_MODEL_ID.split('/')[-1]}")
 
     return openrouter_key, hf_key
 
 
 def render_sessions_panel(mnemo_client, hf_key):
-    """Render the sessions list and folder management."""
     col_title, col_refresh = st.columns([3, 1])
     with col_title:
-        st.subheader("📚 Sessions")
+        st.subheader("\U0001f4da Sessions")
     with col_refresh:
-        if st.button("🔄", key="refresh_sessions", help="Refresh from cloud"):
+        if st.button("\U0001f504", key="refresh_sessions", help="Refresh from cloud"):
             try:
                 storage = get_persistent_storage(hf_key, mnemo_client)
                 sessions = storage.load_sessions(limit=MAX_SESSIONS_STORED)
@@ -808,71 +803,65 @@ def render_sessions_panel(mnemo_client, hf_key):
                 pass
 
     if "session_folders" not in st.session_state:
-        st.session_state.session_folders = {"📁 Default": []}
+        st.session_state.session_folders = {"\U0001f4c1 Default": []}
 
-    with st.expander("📂 Manage Folders", expanded=False):
-        with st.popover("➕ Create Folder"):
+    with st.expander("\U0001f4c2 Manage Folders", expanded=False):
+        with st.popover("\u2795 Create Folder"):
             new_folder = st.text_input("New folder name", placeholder="e.g., Story Ideas")
             if st.button("Create", use_container_width=True):
                 if new_folder and new_folder.strip():
-                    folder_name = f"📁 {new_folder.strip()}"
+                    folder_name = f"\U0001f4c1 {new_folder.strip()}"
                     if folder_name not in st.session_state.session_folders:
                         st.session_state.session_folders[folder_name] = []
                         st.success(f"Created {folder_name}")
                         st.rerun()
-
         folders = list(st.session_state.session_folders.keys())
         if len(folders) > 1:
-            with st.popover("🗑️ Delete Folder"):
-                folder_to_delete = st.selectbox("Delete folder", [""] + [f for f in folders if f != "📁 Default"])
+            with st.popover("\U0001f5d1\ufe0f Delete Folder"):
+                folder_to_delete = st.selectbox("Delete folder",
+                    [""] + [f for f in folders if f != "\U0001f4c1 Default"])
                 if folder_to_delete and st.button("Delete", type="primary", use_container_width=True):
-                    st.session_state.session_folders["📁 Default"].extend(
-                        st.session_state.session_folders.get(folder_to_delete, [])
-                    )
+                    st.session_state.session_folders["\U0001f4c1 Default"].extend(
+                        st.session_state.session_folders.get(folder_to_delete, []))
                     del st.session_state.session_folders[folder_to_delete]
                     st.rerun()
 
     sessions = st.session_state.get("session_history", [])
-
     with st.container():
         if sessions:
             session_to_folder = {}
             for folder, session_ids in st.session_state.session_folders.items():
                 for sid in session_ids:
                     session_to_folder[sid] = folder
-
-            folders_with_sessions = {"📁 Default": []}
+            folders_with_sessions = {"\U0001f4c1 Default": []}
             for folder in st.session_state.session_folders:
                 if folder not in folders_with_sessions:
                     folders_with_sessions[folder] = []
-
             for session in sessions:
                 sid = session.get("id", "")
-                folder = session_to_folder.get(sid, "📁 Default")
+                folder = session_to_folder.get(sid, "\U0001f4c1 Default")
                 if folder not in folders_with_sessions:
-                    folder = "📁 Default"
+                    folder = "\U0001f4c1 Default"
                 folders_with_sessions[folder].append(session)
-
             for folder, folder_sessions in folders_with_sessions.items():
                 if folder_sessions:
                     st.caption(folder)
                     for session in folder_sessions[:10]:
                         session_id = session.get("id", "")
                         title = session.get("title", "Untitled")[:30]
-
                         col1, col2, col3, col4 = st.columns([6, 1, 1, 1])
                         with col1:
-                            if st.button(f"💬 {title}", key=f"load_{session_id}", use_container_width=True):
+                            if st.button(f"\U0001f4ac {title}", key=f"load_{session_id}", use_container_width=True):
                                 load_session(session_id)
                                 st.rerun()
                         with col2:
-                            if st.button("✏️", key=f"rename_{session_id}", help="Rename"):
+                            if st.button("\u270f\ufe0f", key=f"rename_{session_id}", help="Rename"):
                                 rename_session_dialog(session_id, title)
                         with col3:
-                            if st.button("📂", key=f"move_{session_id}", help="Move to folder"):
+                            if st.button("\U0001f4c2", key=f"move_{session_id}", help="Move to folder"):
                                 move_session_dialog(session_id)
                         with col4:
-                            if st.button("🗑️", key=f"del_{session_id}"):
+                            if st.button("\U0001f5d1\ufe0f", key=f"del_{session_id}"):
                                 delete_session(session_id)
                                 st.rerun()
                     st.caption("")
@@ -881,28 +870,23 @@ def render_sessions_panel(mnemo_client, hf_key):
 
 
 def render_file_upload(mnemo_client, openrouter_key):
-    """Render file upload and extraction UI."""
-    st.markdown("**📎 Upload File → Memory**")
-    st.caption("Upload a file — extracts facts, deep context, style, and saves everything to memory loops in one pass")
-
-    uploaded_file = st.file_uploader("Upload file", type=["txt", "md", "csv", "json", "pdf", "docx"], label_visibility="collapsed")
-
+    st.markdown("**\U0001f4ce Upload File \u2192 Memory**")
+    st.caption("Upload a file \u2014 extracts facts, deep context, style, tone via K2.5")
+    uploaded_file = st.file_uploader("Upload file", type=["txt", "md", "csv", "json", "pdf", "docx"],
+                                     label_visibility="collapsed")
     if uploaded_file is not None:
-        if st.button("🧠 Extract Deep Context + Memories", use_container_width=True):
+        if st.button("\U0001f9e0 Extract Deep Context + Memories", use_container_width=True):
             with st.spinner("Reading file..."):
                 content = extract_text_from_file(uploaded_file)
-
             if content and not content.startswith("["):
                 n_chunks = max(1, (len(content) - 1) // 12000 + 1)
                 if n_chunks > 1:
-                    st.info(f"📄 {len(content):,} chars → splitting into {min(n_chunks, 5)} chunks for thorough extraction")
-
-                with st.spinner(f"Extracting deep context & memories ({min(n_chunks, 5)} API call{'s' if n_chunks > 1 else ''})..."):
+                    st.info(f"\U0001f4c4 {len(content):,} chars \u2192 splitting into {min(n_chunks, 5)} chunks")
+                with st.spinner(f"K2.5 extracting ({min(n_chunks, 5)} call{'s' if n_chunks > 1 else ''})..."):
                     memories, cost = extract_memories_from_file(content, uploaded_file.name, openrouter_key)
-
                 if memories:
-                    with st.spinner("Storing to memory loops..."):
-                        current_session = st.session_state.get("current_session_id")
+                    with st.spinner("Storing to memory..."):
+                        current_session = st.session_state.get("current_session_id", "")
                         stored = 0
                         for mem in memories:
                             cat = mem.get("category", "FACT").upper()
@@ -911,21 +895,18 @@ def render_file_upload(mnemo_client, openrouter_key):
                                 meta = {"category": cat, "session_id": current_session, "source": "file_upload"}
                                 if mnemo_client.add(f"[{cat}] {txt}", metadata=meta, priority=1.5):
                                     stored += 1
-
+                                    st.session_state.loop_manager.add_to_loop(
+                                        content=txt, category=cat.lower(),
+                                        session_id=current_session)
                     facts = [m for m in memories if m.get("category") in ("CHARACTER", "PLOT", "SETTING", "THEME", "FACT")]
                     context = [m for m in memories if m.get("category") in ("CONTEXT", "CLARIFICATION", "RELATIONSHIP", "INSTRUCTION")]
                     style = [m for m in memories if m.get("category") in ("PROSE_SAMPLE", "DIALOGUE_SAMPLE", "VOICE", "VOCABULARY")]
-
-                    st.success(f"✅ Stored {stored} memories")
-                    st.caption(f"📊 {len(facts)} facts · {len(context)} deep context · {len(style)} style | Cost: ${cost:.4f}")
-
+                    tone = [m for m in memories if m.get("category") in ("TONE",)]
+                    st.success(f"\u2705 Stored {stored} memories")
+                    st.caption(f"\U0001f4ca {len(facts)} facts \u00b7 {len(context)} context \u00b7 {len(style)} style \u00b7 {len(tone)} tone | Cost: ${cost:.4f}")
                     with st.expander("View extracted memories", expanded=False):
                         for mem in memories:
-                            cat = mem.get("category", "FACT")
-                            txt = mem.get("content", "")[:150]
-                            st.caption(f"**[{cat}]** {txt}")
-
-                    st.session_state.loop_manager.load_from_mnemo()
+                            st.caption(f"**[{mem.get('category', 'FACT')}]** {mem.get('content', '')[:150]}")
                 else:
                     st.warning("No memories extracted. Try a different file.")
             else:
@@ -933,60 +914,51 @@ def render_file_upload(mnemo_client, openrouter_key):
 
 
 def render_memory_management(mnemo_client):
-    """Render add/view/delete memory UI."""
     with st.expander("Add manually", expanded=False):
-        memory_category = st.selectbox("Category", ["CHARACTER", "PLOT", "SETTING", "THEME", "STYLE", "FACT"])
-        memory_content = st.text_area("Content", placeholder="e.g., Detective Mercer has a fear of water since childhood", height=80)
-        if st.button("💾 Save", use_container_width=True):
+        memory_category = st.selectbox("Category",
+            ["CHARACTER", "PLOT", "SETTING", "THEME", "STYLE", "TONE", "FACT"])
+        memory_content = st.text_area("Content",
+            placeholder="e.g., Alistair's scenes should feel clinical and cold, never melodramatic",
+            height=80)
+        if st.button("\U0001f4be Save", use_container_width=True):
             if memory_content.strip():
-                current_session = st.session_state.get("current_session_id")
+                current_session = st.session_state.get("current_session_id", "")
                 meta = {"category": memory_category, "session_id": current_session}
                 if mnemo_client.add(f"[{memory_category}] {memory_content}", metadata=meta):
-                    st.success(f"✅ Saved [{memory_category}]")
-                    st.session_state.loop_manager.add_to_loop(memory_content, memory_category.lower())
+                    st.success(f"\u2705 Saved [{memory_category}]")
+                    st.session_state.loop_manager.add_to_loop(
+                        memory_content, memory_category.lower(),
+                        session_id=current_session)
                 else:
                     st.error("Failed to save")
 
     with st.expander("View memories", expanded=False):
         col1, col2 = st.columns([1, 1])
         with col1:
-            if st.button("🔄 Refresh", use_container_width=True, key="refresh_mem"):
+            if st.button("\U0001f504 Refresh", use_container_width=True, key="refresh_mem"):
                 st.rerun()
         with col2:
-            if st.button("📖 View All", use_container_width=True, key="view_all_mem"):
+            if st.button("\U0001f4d6 View All", use_container_width=True, key="view_all_mem"):
                 st.session_state.show_all_memories = True
                 st.rerun()
-
         stats = mnemo_client.get_stats()
-        st.caption(f"Total: {stats.get('total_memories', 0)} | Links: {stats.get('total_links', 0)}")
-
+        st.caption(f"Total: {stats.get('total_memories', 0)} | CPs: {stats.get('total_connection_points', 0)} | Links: {stats.get('total_links', 0)}")
         memories = mnemo_client.list_memories()[:15]
-
-        st.markdown("""
-        <style>
-        .memory-scroll { max-height: 300px; overflow-y: auto; padding: 5px; border: 1px solid #333; border-radius: 5px; }
-        </style>
-        """, unsafe_allow_html=True)
-
         for mem in memories:
             col1, col2 = st.columns([5, 1])
             with col1:
-                content = mem.get("content", "")[:60]
-                st.caption(f"{content}...")
+                st.caption(f"{mem.get('content', '')[:60]}...")
             with col2:
-                if st.button("🗑️", key=f"del_mem_{mem.get('id', '')}"):
+                if st.button("\U0001f5d1\ufe0f", key=f"del_mem_{mem.get('id', '')}"):
                     if mnemo_client.delete(mem.get("id")):
                         st.rerun()
-
         if len(mnemo_client.list_memories()) >= 15:
             st.caption("... showing first 15. Click 'View All' for complete list")
-
         st.markdown("---")
-        if st.button("🧹 Clear ALL Memories", use_container_width=True):
+        if st.button("\U0001f9f9 Clear ALL Memories", use_container_width=True):
             st.session_state.confirm_clear = True
-
         if st.session_state.get("confirm_clear"):
-            st.warning("⚠️ Delete ALL memories?")
+            st.warning("\u26a0\ufe0f Delete ALL memories?")
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("Yes, delete all"):
@@ -998,71 +970,57 @@ def render_memory_management(mnemo_client):
                     st.session_state.confirm_clear = False
                     st.rerun()
 
-    # Full memory viewer
     if st.session_state.get("show_all_memories"):
         st.markdown("---")
-        st.subheader("📖 All Memories")
-
+        st.subheader("\U0001f4d6 All Memories")
         col1, col2, col3 = st.columns([1, 1, 1])
         with col1:
-            if st.button("❌ Close", use_container_width=True, key="close_all_mem"):
+            if st.button("\u274c Close", use_container_width=True, key="close_all_mem"):
                 st.session_state.show_all_memories = False
                 st.rerun()
         with col2:
-            search_query = st.text_input("🔍 Search", key="mem_search", placeholder="Filter memories...")
+            search_query = st.text_input("\U0001f50d Search", key="mem_search", placeholder="Filter memories...")
         with col3:
-            category_filter = st.selectbox("Category", ["All", "CHARACTER", "PLOT", "SETTING", "THEME", "CONTEXT", "STYLE", "FACT"], key="cat_filter")
-
+            category_filter = st.selectbox("Category",
+                ["All", "CHARACTER", "PLOT", "SETTING", "THEME", "CONTEXT", "STYLE", "TONE", "FACT"],
+                key="cat_filter")
         all_memories = mnemo_client.list_memories()
-
         if search_query:
             all_memories = [m for m in all_memories if search_query.lower() in m.get("content", "").lower()]
         if category_filter != "All":
             all_memories = [m for m in all_memories if f"[{category_filter}]" in m.get("content", "")]
-
         st.caption(f"Showing {len(all_memories)} memories")
-
-        st.markdown("""
-        <style>
-        .full-memory-scroll { max-height: 500px; overflow-y: auto; padding: 10px; border: 1px solid #444; border-radius: 8px; background: #1a1a1a; }
-        </style>
-        """, unsafe_allow_html=True)
-
         for mem in all_memories:
             content = mem.get("content", "")
             mem_id = mem.get("id", "")
-
             category = "OTHER"
             if content.startswith("["):
                 category = content.split("]")[0][1:]
-
             col1, col2, col3 = st.columns([1, 8, 1])
             with col1:
                 st.caption(f"[{category}]")
             with col2:
                 st.text(content[len(f"[{category}]"):].strip()[:200])
             with col3:
-                if st.button("🗑️", key=f"del_full_{mem_id}"):
+                if st.button("\U0001f5d1\ufe0f", key=f"del_full_{mem_id}"):
                     if mnemo_client.delete(mem_id):
                         st.rerun()
 
 
 def render_consolidation_panel(openrouter_key):
-    """Render the memory consolidation UI."""
-    with st.expander("🧠 Memory Consolidation", expanded=False):
-        st.caption("Analyze memories & generate deep context entries")
+    with st.expander("\U0001f9e0 Memory Consolidation", expanded=False):
+        st.caption("Analyze memories & generate deep context entries (via K2.5)")
         last_consol = st.session_state.get("last_consolidation")
         if last_consol:
             st.caption(f"Last run: {last_consol[:16]}")
-
-        if st.button("🧠 Consolidate Now", use_container_width=True):
-            with st.spinner("Analyzing memories... (this may take 30-60 seconds)"):
+        if st.button("\U0001f9e0 Consolidate Now", use_container_width=True):
+            with st.spinner("K2.5 analyzing memories... (this may take 30-60 seconds)"):
                 result = st.session_state.context_engine.consolidate_memories(openrouter_key)
                 if result.get("error"):
                     st.error(f"Error: {result['error']}")
                 else:
                     st.session_state.last_consolidation = result["timestamp"]
-                    st.success(f"✅ Created {result['created']} new context entries!")
+                    st.success(f"\u2705 Created {result['created']} new context entries!")
                     st.caption(f"Analyzed: {result['memories_analyzed']} memories | Cost: ${result['cost']:.4f}")
                     if result.get("new_entries"):
                         with st.expander("New entries created"):
@@ -1072,13 +1030,10 @@ def render_consolidation_panel(openrouter_key):
 
 
 # ============================================================================
-# CHAT RENDERER (v5.3: gate_tier in metadata display)
+# CHAT RENDERER
 # ============================================================================
 
 def render_chat(openrouter_key, mnemo_client):
-    """Render chat history and handle new messages."""
-
-    # Display existing messages
     for idx, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
@@ -1089,82 +1044,72 @@ def render_chat(openrouter_key, mnemo_client):
                         meta = message["metadata"]
                         memory_info = []
                         if meta.get("cross_session_memories_used", 0) > 0:
-                            memory_info.append(f"📚 {meta['cross_session_memories_used']} memories")
+                            memory_info.append(f"\U0001f4da {meta['cross_session_memories_used']} memories")
                         mode = meta.get("mode", "")
                         if mode == "t1_direct":
-                            memory_info.append(f"🔄 {meta.get('context_tokens', 0)} tokens")
+                            memory_info.append(f"\U0001f504 {meta.get('context_tokens', 0)} tokens")
                         elif mode == "t2_confirmed":
-                            memory_info.append(f"🔄 t2 | {meta.get('context_tokens', 0)} tokens")
+                            memory_info.append(f"\U0001f504 t2 | {meta.get('context_tokens', 0)} tokens")
                         elif mode == "skip":
-                            memory_info.append("⚡ fast")
+                            memory_info.append("\u26a1 fast")
                         if meta.get("extracted", 0) > 0:
-                            memory_info.append(f"🧠 {meta['extracted']} extracted")
+                            memory_info.append(f"\U0001f9e0 {meta['extracted']} extracted")
                         if meta.get("cost"):
-                            memory_info.append(f"💰 ${meta['cost']:.4f}")
+                            memory_info.append(f"\U0001f4b0 ${meta['cost']:.4f}")
                         if memory_info:
                             st.caption(" | ".join(memory_info))
                 with col2:
-                    if st.button("📋", key=f"copy_{idx}", help="Copy response"):
+                    if st.button("\U0001f4cb", key=f"copy_{idx}", help="Copy response"):
                         copy_response_dialog(message["content"])
 
-    # Handle new input
     if prompt := st.chat_input("What's on your mind?"):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
-
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 response, error, result_meta = handle_message(prompt, openrouter_key, mnemo_client)
-
             if error:
                 st.error(error)
-                # FIX: Remove the stranded user message so the chat history doesn't break
                 st.session_state.messages.pop()
             else:
                 st.markdown(response)
-
-                # Display metadata
                 meta_parts = []
                 if result_meta.get("sessions_found", 0) > 0:
-                    meta_parts.append(f"📜 {result_meta['sessions_found']} past chats")
+                    meta_parts.append(f"\U0001f4dc {result_meta['sessions_found']} past chats")
                 if result_meta.get("cross_session_memories_used", 0) > 0:
-                    meta_parts.append(f"📚 {result_meta['cross_session_memories_used']} memories")
+                    meta_parts.append(f"\U0001f4da {result_meta['cross_session_memories_used']} memories")
                 mode = result_meta.get("mode", "")
                 if mode == "t1_direct":
-                    meta_parts.append(f"🔄 {result_meta.get('context_tokens', 0)} tokens")
+                    meta_parts.append(f"\U0001f504 {result_meta.get('context_tokens', 0)} tokens")
                 elif mode == "t2_confirmed":
-                    meta_parts.append(f"🔄 t2 | {result_meta.get('context_tokens', 0)} tokens")
+                    meta_parts.append(f"\U0001f504 t2 | {result_meta.get('context_tokens', 0)} tokens")
                 elif mode == "skip":
-                    meta_parts.append("⚡ fast")
+                    meta_parts.append("\u26a1 fast")
                 if result_meta.get("extracted", 0) > 0:
-                    meta_parts.append(f"🧠 {result_meta['extracted']} extracted")
-                meta_parts.append(f"💰 ${result_meta.get('cost', 0):.4f}")
+                    meta_parts.append(f"\U0001f9e0 {result_meta['extracted']} extracted")
+                meta_parts.append(f"\U0001f4b0 ${result_meta.get('cost', 0):.4f}")
                 st.caption(" | ".join(meta_parts))
-
                 st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": response,
-                    "metadata": result_meta,
+                    "role": "assistant", "content": response, "metadata": result_meta,
                 })
-
                 save_current_session()
 
 
 # ============================================================================
-# MAIN APP (v5.3: clean orchestrator)
+# MAIN APP (v6.0)
 # ============================================================================
 
 def main():
-    st.set_page_config(page_title="4o with Memory", page_icon="🧠", layout="wide")
-    st.title("🧠 4o with Memory")
-    st.caption("GPT-4o with warm, conversational style and persistent memory")
+    st.set_page_config(page_title="4o with Memory", page_icon="\U0001f9e0", layout="wide")
+    st.title("\U0001f9e0 4o with Memory")
+    st.caption("GPT-4o co-author + K2.5 memory curator | Dual-processor creative writing engine")
 
     if not DEFAULT_OPENROUTER_KEY or not DEFAULT_HF_KEY:
-        st.error("⚠️ **API Keys Not Configured!**")
+        st.error("\u26a0\ufe0f **API Keys Not Configured!**")
         st.markdown("""
         **For Streamlit Cloud:**
-        1. Go to your app's Settings → Secrets
+        1. Go to your app's Settings \u2192 Secrets
         2. Add your keys in TOML format:
         ```toml
         OPENROUTER_KEY = "sk-or-v1-your-key"
@@ -1173,10 +1118,8 @@ def main():
         """)
         st.stop()
 
-    # Initialize core client
     mnemo_client = init_client(DEFAULT_HF_KEY)
 
-    # Load session history on first run
     if "session_history_loaded" not in st.session_state:
         st.session_state.session_history_loaded = True
         st.session_state.session_history = []
@@ -1186,8 +1129,6 @@ def main():
                 sessions = storage.load_sessions(limit=MAX_SESSIONS_STORED)
                 if sessions:
                     st.session_state.session_history = sessions
-                
-                # FIX: Load persistent folders
                 if hasattr(storage, 'load_folder_state'):
                     st.session_state.session_folders = storage.load_folder_state()
         except Exception:
@@ -1200,7 +1141,6 @@ def main():
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Core engines
     if "loop_manager" not in st.session_state:
         st.session_state.loop_manager = LoopManager(mnemo_client=mnemo_client, openrouter_key=DEFAULT_OPENROUTER_KEY)
         st.session_state.loop_manager.load_from_mnemo(use_smart_extraction=False)
@@ -1208,15 +1148,25 @@ def main():
         st.session_state.smart_memory = SmartMemory()
     if "context_engine" not in st.session_state:
         st.session_state.context_engine = ContextEngine(mnemo_client=mnemo_client, openrouter_key=DEFAULT_OPENROUTER_KEY)
+    
     if "context_manager" not in st.session_state:
         st.session_state.context_manager = ContextWindowManager(loop_manager=st.session_state.loop_manager)
     else:
         st.session_state.context_manager.set_loop_manager(st.session_state.loop_manager)
+        
+    # v6.0 NEW INITIALIZATIONS
+    if "signal_processor" not in st.session_state:
+        st.session_state.signal_processor = SignalProcessor()
+        try:
+            st.session_state.signal_processor.update_threads_from_server(mnemo_client)
+        except Exception:
+            pass
+            
+    if "prefetch_engine" not in st.session_state:
+        st.session_state.prefetch_engine = PrefetchEngine()
 
-    # Render UI
     openrouter_key, hf_key = render_sidebar(mnemo_client, DEFAULT_OPENROUTER_KEY, DEFAULT_HF_KEY)
 
-    # FIX: Ensure the client updates its headers if the user typed a new key
     if mnemo_client.token != hf_key:
         mnemo_client.token = hf_key
         mnemo_client.session.headers.update({"Authorization": f"Bearer {hf_key}"})
@@ -1224,7 +1174,7 @@ def main():
     render_chat(openrouter_key, mnemo_client)
 
     st.divider()
-    st.caption("🧠 4o with Memory | GPT-4o + Mnemo v5.3 + Metadata Loops")
+    st.caption("\U0001f9e0 4o with Memory v6.0 | GPT-4o + K2.5 + Mnemo v6.0 + Threads & Knots")
 
 if __name__ == "__main__":
     main()
