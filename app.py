@@ -524,12 +524,9 @@ def extract_memories_from_file(content, filename, openrouter_key):
 
     all_memories, total_cost = [], 0
     for memories, cost in results:
-        if memories and isinstance(memories, list):
-            # FIX: Only keep elements that are actually dictionaries
-            valid_mems = [m for m in memories if isinstance(m, dict)]
-            all_memories.extend(valid_mems)
+        if memories:
+            all_memories.extend(memories)
         total_cost += cost
-        
     seen = set()
     unique = []
     for mem in all_memories:
@@ -607,14 +604,7 @@ Return ONLY a JSON object:
             if clean.endswith("```"):
                 clean = clean[:-3]
         parsed = json.loads(clean.strip())
-        
-        # FIX: Ensure we only return a list of dictionaries
-        raw_memories = parsed.get("memories", [])
-        if isinstance(raw_memories, list):
-            valid_memories = [m for m in raw_memories if isinstance(m, dict)]
-            return valid_memories, cost
-            
-        return [], cost
+        return parsed.get("memories", []), cost
     except Exception:
         return [], 0
 
