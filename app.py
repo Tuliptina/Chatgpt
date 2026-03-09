@@ -1137,8 +1137,14 @@ def render_consolidation_panel(openrouter_key):
                     st.error(f"Error: {result['error']}")
                 else:
                     st.session_state.last_consolidation = result["timestamp"]
-                    st.success(f"✅ Created {result['created']} new context entries! (existing memories untouched)")
-                    st.caption(f"Analyzed: {result['memories_analyzed']} memories | Cost: ${result['cost']:.4f}")
+                    created = result['created']
+                    k2_returned = result.get('k2_returned', '?')
+                    dedup_rejected = result.get('dedup_rejected', 0)
+                    if created > 0:
+                        st.success(f"✅ Created {created} new context entries! (existing memories untouched)")
+                    else:
+                        st.warning(f"K2 returned {k2_returned} entries but {dedup_rejected} were duplicates. Try again — K2 may generate different insights.")
+                    st.caption(f"Analyzed: {result['memories_analyzed']} memories | K2 returned: {k2_returned} | Dedup rejected: {dedup_rejected} | Stored: {created} | Cost: ${result['cost']:.4f}")
                     if result.get("new_entries"):
                         with st.expander("New entries created"):
                             for entry in result["new_entries"]:
