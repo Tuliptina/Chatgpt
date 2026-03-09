@@ -37,6 +37,8 @@ from signal_protocol import SignalProcessor
 from prefetch_engine import PrefetchEngine
 from memory_schema import parse_signals_from_response, get_signal_instruction
 
+
+
 # ============================================================================
 # CONFIGURATION (v6.0: Dual-Model Architecture)
 # ============================================================================
@@ -879,6 +881,48 @@ def render_sidebar(mnemo_client, openrouter_key, hf_key):
         render_memory_management(mnemo_client)
         st.divider()
         render_consolidation_panel(openrouter_key)
+
+        # v6.0.1: Inline migration (Streamlit Cloud has no terminal)
+        with st.expander("🔄 Migrate Blobs → Graph", expanded=False):
+            stats = mnemo_client.get_stats()
+            n_mem = stats.get("total_memories", 0)
+            n_cp = stats.get("total_connection_points", 0)
+            n_thr = stats.get("total_threads", 0)
+            n_knot = stats.get("total_knots", 0)
+            st.caption(f"Blobs: {n_mem} · CPs: {n_cp} · Threads: {n_thr} · Knots: {n_knot}")
+            if n_cp > 0:
+                st.success(f"✅ Already migrated — {n_cp} CPs exist.")
+            if n_mem > 0 and st.button("🚀 Run Migration", key="run_mig", type="primary", use_container_width=True):
+                from migration import run_migration
+                log_lines = []
+                log_box = st.empty()
+                def _mig_log(msg):
+                    log_lines.append(msg)
+                    log_box.code("\n".join(log_lines[-15:]), language=None)
+                with st.spinner("Migrating..."):
+                    results = run_migration(mnemo_client, openrouter_key,
+                                            phases=["decompose", "threads", "cleanup"],
+                                            progress_callback=_mig_log)
+                p1 = results.get("phase_results", {}).get("decompose", {})
+                p2 = results.get("phase_results", {}).get("threads", {})
+                cost = results.get("total_cost", 0)
+                st.success(
+                    f"✅ {p1.get('points_stored', 0)} CPs · "
+                    f"{p2.get('threads_created', 0)} threads · "
+                    f"{p2.get('knots_created', 0)} knots · ${cost:.4f}")
+                errs = []
+                for pd in results.get("phase_results", {}).values():
+                    errs.extend(pd.get("errors", []))
+                if errs:
+                    with st.expander(f"⚠️ {len(errs)} errors"):
+                        for e in errs[:20]:
+                            st.caption(e)
+                # Reload memory systems with new data
+                if "loop_manager" in st.session_state:
+                    st.session_state.loop_manager.load_from_mnemo(use_smart_extraction=False)
+                if "signal_processor" in st.session_state:
+                    st.session_state.signal_processor.update_threads_from_server(mnemo_client)
+
         st.divider()
 
         st.markdown("#### 💰 Usage")
