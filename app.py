@@ -2,7 +2,7 @@
 4o with Memory v6.0 — Dual-Processor Creative Writing Engine
 
 v6.0 changes:
-- DUAL MODEL: K2.5 for memory ops ($0.60/$3.00/M), GPT-4o for writing ($2.50/$15.00/M)
+- DUAL MODEL: K2 for memory ops ($0.60/$3.00/M), GPT-4o for writing ($2.50/$15.00/M)
 - SAMPLING: GPT-4o uses temperature=1.0, repetition_penalty=1.1, frequency/presence penalties
   for creative diversity. K2.5 uses temperature=0.2 for deterministic JSON extraction.
 - SYSTEM PROMPT: Split into conversation/recall/creative modes. Creative mode is tonally
@@ -55,7 +55,7 @@ MNEMO_URL = "https://athelaperk-mnemo-mcp.hf.space"
 
 # v6.0: Two models — writing (4o) and memory ops (K2.5)
 WRITING_MODEL_ID = "openai/gpt-4o-2024-11-20"
-MEMORY_MODEL_ID = "moonshotai/kimi-k2.5"
+MEMORY_MODEL_ID = "moonshotai/kimi-k2"
 
 # v6.0: Per-model sampling parameters
 WRITING_PARAMS = {
