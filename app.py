@@ -1,13 +1,10 @@
 """
-4o with Memory v6.4 — Dual-Processor Creative Writing Engine
+4o with Memory v6.6 — Dual-Processor Creative Writing Engine
 
-v6.4 changes:
-- FIX: Thread Retrieval! Context engine now pulls chronological Narrative Threads 
-  first before falling back to scattershot graph search.
-- FIX: Increased Graph Search top_k from 12 -> 40 to prevent Context Starvation.
-- Contains all v6.3 fixes (Auto-capitalize entities, memory_id caching).
-
-Prior: DUAL MODEL (K2 + 4o), session isolation, prefetch predictive caching.
+v6.6 changes:
+- FEATURE: Auto-Threading & Auto-Knotting! K2 now structures its extractions
+  into Relational JSON, automatically building Threads and Knots in the background.
+- Prior fixes: Entity normalization, Thread/Knot Retrieval, Vectorized Graph Search.
 """
 
 import streamlit as st
@@ -20,6 +17,7 @@ import os
 import uuid
 import re
 import traceback
+import concurrent.futures
 from datetime import datetime
 
 from mnemo_client import MnemoClient
@@ -208,35 +206,27 @@ def auto_convert_blobs(mnemo_client):
 SYSTEM_PROMPT = """You are a sharp, well-read creative collaborator with genuine enthusiasm for storytelling craft. You have three modes — detect which one the user needs and switch seamlessly.
 
 MODE 1 — CONVERSATION (chatting about the project, brainstorming, planning):
-- You're the kind of collaborator writers actually enjoy working with — curious, opinionated about craft, and genuinely invested in their story.
-- Have real opinions. If a plot idea is predictable, say so with charm, then pitch something better. If a character detail is brilliant, get excited about it.
-- Be witty when the moment allows, but never at the expense of the work.
-- Ask questions that show you're thinking ahead.
-- Use casual, intelligent language. You're a peer, not a tutor. Skip the preambles.
-- Reference their stored characters and plot points naturally.
-- CRITICAL — know the difference between RECALLING and CREATING.
+- You're the kind of collaborator writers actually enjoy working with.
+- Have real opinions. Pitch better ideas if a plot is predictable.
+- Reference stored characters and plot points naturally.
+- CRITICAL — know the difference between RECALLING and CREATING. Do not present invented details as established canon.
 
 MODE 2 — RECALL & RETRIEVAL (user asks to recall, list, summarize):
-- Give clean, factual answers drawn from your memory context.
-- Use EXACT details from memory — do NOT embellish, infer, or fill gaps with imagination.
+- Give clean, factual answers drawn ONLY from your memory context.
+- Do NOT embellish or fill gaps with imagination.
 
 MODE 3 — CREATIVE WRITING (scenes, chapters, dialogue, prose):
-- Your personality DISAPPEARS. You are not "witty" — you are the story.
-- Match the tonal register from the [TONE DIRECTIVE] in your context. Dark stays dark. Humor cuts. Tension holds.
-- Deep psychological complexity in characters.
-- Setting-accurate language for the project's period/genre.
+- Your personality DISAPPEARS. You are the story.
+- Match the tonal register from the [TONE DIRECTIVE] in your context.
+- Deep psychological complexity in characters. Setting-accurate language.
 - Show don't tell. Sensory detail. Subtext in dialogue.
-- Default to third person past tense unless user or memory specifies otherwise.
-- Match the user's writing voice if VOICE/PROSE_SAMPLE memories exist.
-- NEVER soften emotional edges.
-- DO NOT resolve tension prematurely. DO NOT add reassuring internal monologue unless the brief says to.
+- NEVER soften emotional edges. DO NOT resolve tension prematurely.
 
-PROSE RHYTHM — this is critical:
-- Vary sentence length deliberately. Follow a long, winding sentence with a short one. Then a fragment. Then build again.
-- Do NOT write in choppy, staccato bursts — that reads like a screenplay, not a novel.
-- Do NOT write in dense, breathless paragraphs with no white space — that exhausts the reader.
-- Paragraphs should BREATHE. Mix action beats, sensory detail, interiority, and dialogue across paragraphs.
-- Let scenes have rhythm: tension builds in longer sentences, snaps in short ones. Quiet moments drift. Shock is blunt."""
+PROSE RHYTHM:
+- Vary sentence length deliberately. Follow a long sentence with a short one. Then a fragment.
+- Do NOT write in choppy, staccato bursts.
+- Paragraphs should BREATHE. Mix action beats, interiority, and dialogue.
+- Let scenes have rhythm: tension builds in longer sentences, snaps in short ones."""
 
 # ============================================================================
 # INITIALIZATION & SESSION MANAGEMENT
@@ -262,9 +252,9 @@ def get_session_title(messages):
     for msg in messages:
         if msg["role"] == "user":
             content = msg["content"].strip()
-            prefixes_to_remove = ["can you", "could you", "please", "help me", "i want to", "i need to", "let's"]
+            prefixes = ["can you", "could you", "please", "help me", "i want to", "i need to", "let's"]
             content_lower = content.lower()
-            for prefix in prefixes_to_remove:
+            for prefix in prefixes:
                 if content_lower.startswith(prefix):
                     content = content[len(prefix):].strip()
                     break
@@ -272,10 +262,7 @@ def get_session_title(messages):
                 content = content[0].upper() + content[1:] if len(content) > 1 else content.upper()
             if len(content) > 40:
                 last_space = content[:40].rfind(' ')
-                if last_space > 20:
-                    content = content[:last_space] + "..."
-                else:
-                    content = content[:40] + "..."
+                content = content[:last_space] + "..." if last_space > 20 else content[:40] + "..."
             return content if content else "New Chat"
     return "New Chat"
 
@@ -396,7 +383,7 @@ def copy_response_dialog(content):
         st.rerun()
 
 # ============================================================================
-# FILE PROCESSING
+# FILE PROCESSING & K2 AUTO-EXTRACTION (v6.6 Relational JSON)
 # ============================================================================
 
 def extract_text_from_file(uploaded_file):
@@ -439,35 +426,28 @@ async def process_chunk_async(http_client, chunk, filename, i, total_chunks, ope
     prompt = f"""Extract structured memories from this document by asking the W questions about everything mentioned.
 
 DOCUMENT: {filename}{chunk_label}
-
 CONTENT:
 {chunk}
 
-METHOD — For every character, event, faction, place, or rule mentioned, ask:
-  WHO is this? → CHARACTER entry
-  WHAT happened / what do they do? → PLOT entry
-  WHOM do they connect to? → RELATIONSHIP entry
-  WHY does it matter? → CONTEXT entry
-  WHERE does it happen? → SETTING entry
-  WHEN in the timeline? → PLOT entry
-  HOW should it feel on the page? → TONE entry
-  WHOSE interpretation could go wrong? → CLARIFICATION entry
+METHOD:
+1. Extract individual facts as "memories" by asking WHO, WHAT, WHOM, WHY, WHERE, WHEN, HOW.
+2. If multiple memories form a narrative arc or sequence, group them into a "thread".
+3. If storylines collide or tone shifts drastically, create a "knot".
 
 CRITICAL ENTITY NAMING RULES:
   - Use plain names: "Sebastian Carlisle", NOT "Dr. Sebastian Carlisle"
-  - NO titles: "Elijah Cartwright", NOT "Reverend Elijah Cartwright"
-  - NO articles: "Midnight Salon", NOT "The Midnight Salon"
-  - NO category prefixes: entity="Sebastian", NOT "Clarification: Sebastian"
   - Entity is a LOOKUP KEY for indexing. Keep it short and consistent.
 
 ENTRY FORMAT:
-  {{"entity": "Name", "category": "CATEGORY", "content": "1-3 sentence answer"}}
-  Add "connects_to": "OtherName" only for RELATIONSHIP entries.
-
-Return ONLY a JSON object:
 {{
   "memories": [
-    {{"entity": "Name", "category": "CATEGORY", "content": "information"}}
+    {{"local_id": "m1", "entity": "Name", "category": "CATEGORY", "content": "1-3 sentence answer"}}
+  ],
+  "threads": [
+    {{"name": "Captivity Arc", "entity": "Sebastian", "type": "plot_line", "memory_local_ids": ["m1"]}}
+  ],
+  "knots": [
+    {{"name": "The Confrontation", "reason": "Evelyn finds Sebastian", "thread_names": ["Captivity Arc"]}}
   ]
 }}"""
 
@@ -475,15 +455,11 @@ Return ONLY a JSON object:
         response = await http_client.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {openrouter_key}", "Content-Type": "application/json"},
-            json={
-                "model": MEMORY_MODEL_ID,
-                "messages": [{"role": "user", "content": prompt}],
-                **MEMORY_PARAMS
-            },
+            json={"model": MEMORY_MODEL_ID, "messages": [{"role": "user", "content": prompt}], **MEMORY_PARAMS},
             timeout=90.0
         )
         if response.status_code != 200:
-            return [], 0
+            return {}, 0
         data = response.json()
         raw = data["choices"][0]["message"]["content"]
         usage = data.get("usage", {})
@@ -494,9 +470,11 @@ Return ONLY a JSON object:
             if clean.endswith("```"):
                 clean = clean[:-3]
         parsed = json.loads(clean.strip())
-        return parsed.get("memories", []), cost
+        if isinstance(parsed, dict) and "memories" in parsed:
+            return parsed, cost
+        return {"memories": [], "threads": [], "knots": []}, cost
     except Exception:
-        return [], 0
+        return {"memories": [], "threads": [], "knots": []}, 0
 
 def extract_memories_from_file(content, filename, openrouter_key):
     CHUNK_SIZE = 12000
@@ -532,21 +510,24 @@ def extract_memories_from_file(content, filename, openrouter_key):
     except RuntimeError:
         results = asyncio.run(run_all_chunks())
 
-    all_memories, total_cost = [], 0
-    for memories, cost in results:
-        if memories and isinstance(memories, list):
-            valid_mems = [m for m in memories if isinstance(m, dict)]
-            all_memories.extend(valid_mems)
+    all_memories, all_threads, all_knots = [], [], []
+    total_cost = 0
+    for data, cost in results:
+        if isinstance(data, dict):
+            all_memories.extend(data.get("memories", []))
+            all_threads.extend(data.get("threads", []))
+            all_knots.extend(data.get("knots", []))
         total_cost += cost
         
     seen = set()
-    unique = []
+    unique_memories = []
     for mem in all_memories:
         key = mem.get("content", "")[:80].lower().strip()
         if key not in seen:
             seen.add(key)
-            unique.append(mem)
-    return unique, total_cost
+            unique_memories.append(mem)
+            
+    return {"memories": unique_memories, "threads": all_threads, "knots": all_knots}, total_cost
 
 def extract_memories_with_gpt(conversation, openrouter_key):
     prompt = """Extract structured memories from this conversation by asking the W questions about everything mentioned.
@@ -554,47 +535,37 @@ def extract_memories_with_gpt(conversation, openrouter_key):
 CONVERSATION:
 {conversation}
 
-METHOD — For every character, event, or topic mentioned, ask:
-  WHO is this? → CHARACTER entry
-  WHAT happened? → PLOT entry 
-  WHOM do they affect/relate to? → RELATIONSHIP entry 
-  WHY does it matter? → CONTEXT entry 
-  WHERE does it happen? → SETTING entry 
-  WHEN in the timeline? → PLOT entry 
-  HOW should it feel? → TONE entry 
-  WHOSE rule or instruction? → CLARIFICATION entry 
+METHOD:
+1. Extract individual facts as "memories" by asking WHO, WHAT, WHOM, WHY, WHERE, WHEN, HOW.
+2. If multiple memories form a narrative arc or sequence, group them into a "thread".
+3. If storylines collide or tone shifts drastically, create a "knot".
 
 CRITICAL ENTITY NAMING RULES:
   - Use plain names: "Sebastian Carlisle", NOT "Dr. Sebastian Carlisle"
-  - NO titles: "Elijah Cartwright", NOT "Reverend Elijah Cartwright"  
-  - NO articles: "Midnight Salon", NOT "The Midnight Salon"
-  - NO category prefixes: entity="Sebastian", NOT "Clarification: Sebastian"
   - Entity is a LOOKUP KEY for indexing. Keep it short and consistent.
 
 ENTRY FORMAT:
-  {{"entity": "Name", "category": "CATEGORY", "content": "1-3 sentence answer"}}
-  Add "connects_to": "OtherName" only for RELATIONSHIP entries.
-
-Return ONLY a JSON object:
-{{
+{
   "memories": [
-    {{"entity": "Name", "category": "CATEGORY", "content": "information"}}
+    {"local_id": "m1", "entity": "Name", "category": "CATEGORY", "content": "1-3 sentence answer"}
+  ],
+  "threads": [
+    {"name": "Captivity Arc", "entity": "Sebastian", "type": "plot_line", "memory_local_ids": ["m1"]}
+  ],
+  "knots": [
+    {"name": "The Confrontation", "reason": "Why they crossed", "thread_names": ["Captivity Arc"]}
   ]
-}}"""
+}"""
 
     try:
         response = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {openrouter_key}", "Content-Type": "application/json"},
-            json={
-                "model": MEMORY_MODEL_ID,
-                "messages": [{"role": "user", "content": prompt.format(conversation=conversation)}],
-                **MEMORY_PARAMS,
-            },
+            json={"model": MEMORY_MODEL_ID, "messages": [{"role": "user", "content": prompt.format(conversation=conversation)}], **MEMORY_PARAMS},
             timeout=60
         )
         if response.status_code != 200:
-            return [], 0
+            return {}, 0
         data = response.json()
         raw = data["choices"][0]["message"]["content"]
         usage = data.get("usage", {})
@@ -605,15 +576,11 @@ Return ONLY a JSON object:
             if clean.endswith("```"):
                 clean = clean[:-3]
         parsed = json.loads(clean.strip())
-        
-        raw_memories = parsed.get("memories", [])
-        if isinstance(raw_memories, list):
-            valid_memories = [m for m in raw_memories if isinstance(m, dict)]
-            return valid_memories, cost
-            
-        return [], cost
+        if isinstance(parsed, dict) and "memories" in parsed:
+            return parsed, cost
+        return {"memories": [], "threads": [], "knots": []}, cost
     except Exception:
-        return [], 0
+        return {"memories": [], "threads": [], "knots": []}, 0
 
 def call_openrouter(messages, api_key, mode="writing"):
     model = WRITING_MODEL_ID if mode == "writing" else MEMORY_MODEL_ID
@@ -656,9 +623,8 @@ class CostTracker:
         return cost
 
 def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops, loop_manager, context_engine):
-    """v6.4: Includes Thread Retrieval + 40-CP Graph Search"""
     context_parts = []
-    metadata = {"sessions_found": 0, "skip_loops": False, "threads_injected": 0}
+    metadata = {"sessions_found": 0, "skip_loops": False, "threads_injected": 0, "knots_injected": 0}
     if not cross_session_enabled:
         return "", metadata, False
     storage = get_persistent_storage()
@@ -681,27 +647,20 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
             session_results = storage.search_sessions(prompt, current_session_id=current_session_id, limit=2)
             if session_results:
                 metadata["sessions_found"] = len(session_results)
-                context_parts.append(
-                    "\n\n[PREVIOUS CHAT SESSIONS - The user is asking about past conversations. "
-                    "Use ONLY this information to answer. Do NOT use other memories:]\n"
-                    + "\n---\n".join(session_results))
+                context_parts.append("\n\n[PREVIOUS CHAT SESSIONS]\n---\n" + "\n---\n".join(session_results))
             else:
                 recent = storage.get_previous_sessions_content(current_session_id=current_session_id, limit=2)
                 if recent:
                     metadata["sessions_found"] = len(recent)
                     summaries = [f"Session '{s['title']}':\n{s['summary']}" for s in recent]
-                    context_parts.append(
-                        "\n\n[RECENT CHAT SESSIONS - The user is asking about past conversations. "
-                        "Use ONLY this information to answer:]\n"
-                        + "\n---\n".join(summaries))
+                    context_parts.append("\n\n[RECENT CHAT SESSIONS]\n---\n" + "\n---\n".join(summaries))
         except Exception:
             pass
     else:
         try:
             past_convos = storage.search_conversations(prompt, limit=3)
             if past_convos:
-                context_parts.append("\n\n[PAST CONVERSATIONS]\n"
-                                     + "\n".join(f"\u2022 {conv[:200]}" for conv in past_convos))
+                context_parts.append("\n\n[PAST CONVERSATIONS]\n" + "\n".join(f"• {conv[:200]}" for conv in past_convos))
         except Exception:
             pass
 
@@ -709,20 +668,15 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
             isolate = st.session_state.get("isolate_sessions", False)
             active_sessions = [current_session_id] if isolate and current_session_id else None
 
-            # =====================================================================
-            # NEW v6.4 FIX: THREAD RETRIEVAL (The Spine)
-            # Check if any active threads are relevant to the query
-            # =====================================================================
+            # THREAD RETRIEVAL
             try:
                 active_threads = mnemo_client.get_active_threads()
                 if active_threads:
                     query_words = set(re.sub(r'[^\w\s]', '', prompt_lower).split())
                     matched_threads = []
-                    
                     for t in active_threads:
                         t_name_words = set(t.get("name", "").lower().split())
                         t_entity = t.get("entity", "").lower()
-                        # Match if query explicitly names the thread's entity or overlaps its name
                         if t_entity in query_words or any(w in query_words for w in t_name_words if len(w) > 3):
                             matched_threads.append(t)
                     
@@ -732,10 +686,7 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
                             tid = t.get("id")
                             tname = t.get("name")
                             pos = t.get("current_position", -1)
-                            
-                            # Trace back 8 steps to get the recent chronological arc
                             traced_cps = mnemo_client.trace_thread(tid, direction="back", steps=8, from_position=pos)
-                            
                             if traced_cps:
                                 thread_context_lines.append(f"### NARRATIVE THREAD: {tname}")
                                 for cp in traced_cps:
@@ -743,30 +694,56 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
                                     value = cp.get("value", "")
                                     pt = cp.get("point_type", "")
                                     conn = cp.get("connects_to", "")
-                                    
-                                    if conn:
-                                        line = f"  - {entity} — {pt} → {conn}: {value}"
-                                    else:
-                                        line = f"  - {entity} — {pt}: {value}"
+                                    line = f"  - {entity} — {pt} → {conn}: {value}" if conn else f"  - {entity} — {pt}: {value}"
                                     thread_context_lines.append(line)
-                                thread_context_lines.append("") # Spacer
-                        
+                                thread_context_lines.append("")
                         if thread_context_lines:
                             context_parts.append("\n\n[ACTIVE NARRATIVE THREADS - Chronological Order]\n" + "\n".join(thread_context_lines))
                             metadata["threads_injected"] = len(matched_threads)
             except Exception as thread_e:
                 print(f"[WARN] Thread Retrieval failed: {thread_e}")
 
-            # =====================================================================
-            # GRAPH SEARCH (The Scattershot Context)
-            # v6.4 FIX: top_k bumped from 12 to 40 to prevent Context Starvation
-            # =====================================================================
-            cp_results = mnemo_client.graph_search(prompt, top_k=40, active_sessions=active_sessions)
+            # KNOT RETRIEVAL
+            try:
+                all_knots = mnemo_client.list_knots()
+                if all_knots:
+                    matched_knots = []
+                    query_words = set(re.sub(r'[^\w\s]', '', prompt_lower).split())
+                    for k in all_knots:
+                        k_name_words = set(k.get("name", "").lower().split())
+                        k_reason_words = set(k.get("reason", "").lower().split())
+                        if any(w in query_words for w in k_name_words if len(w) > 3) or \
+                           any(w in query_words for w in k_reason_words if len(w) > 4):
+                            matched_knots.append(k.get("id"))
+                            
+                    if matched_knots:
+                        knot_context_lines = []
+                        for kid in matched_knots:
+                            k_ctx = mnemo_client.get_knot_context(kid)
+                            if k_ctx:
+                                knot_context_lines.append(f"### NARRATIVE KNOT (Collision Point): {k_ctx.get('name')}")
+                                knot_context_lines.append(f"  - Pivot Type: {k_ctx.get('pivot_type')}")
+                                knot_context_lines.append(f"  - Tension Shift: {k_ctx.get('tension_before')} ➔ {k_ctx.get('tension_after')}")
+                                if k_ctx.get('tone_shift'):
+                                    knot_context_lines.append(f"  - Tone Shift: {k_ctx.get('tone_shift')}")
+                                knot_context_lines.append(f"  - Reason: {k_ctx.get('reason')}")
+                                for tid, thread_data in k_ctx.get("thread_context", {}).items():
+                                    t_name = thread_data.get("thread_name", tid)
+                                    knot_context_lines.append(f"  - Thread arriving at Knot: {t_name}")
+                                    for cp in thread_data.get("active_points", []):
+                                        conn = f" ➔ {cp.get('connects_to')}" if cp.get("connects_to") else ""
+                                        knot_context_lines.append(f"      • {cp.get('entity')} — {cp.get('point_type')}{conn}: {cp.get('value')}")
+                                knot_context_lines.append("")
+                        if knot_context_lines:
+                            context_parts.append("\n\n[NARRATIVE KNOTS - Crucial Story Intersections]\n" + "\n".join(knot_context_lines))
+                            metadata["knots_injected"] = len(matched_knots)
+            except Exception as knot_e:
+                print(f"[WARN] Knot Retrieval failed: {knot_e}")
 
-            writing_keywords = ["write", "scene", "chapter", "story", "prose", "dialogue", "style",
-                                "continue", "next", "more", "go on", "keep going", "extend"]
+            # GRAPH SEARCH
+            cp_results = mnemo_client.graph_search(prompt, top_k=40, active_sessions=active_sessions)
+            writing_keywords = ["write", "scene", "chapter", "story", "prose", "dialogue", "style", "continue", "next", "more", "go on", "keep going", "extend"]
             if any(kw in prompt_lower for kw in writing_keywords):
-                # v6.4 FIX: Style top_k bumped to 10
                 style_cps = mnemo_client.graph_search("prose voice dialogue style tone", top_k=10, active_sessions=active_sessions)
                 seen_ids = {r.get("id") for r in cp_results}
                 for cp in style_cps:
@@ -781,7 +758,6 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
                     cat = cp.get("category", "fact").upper()
                     conn = cp.get("connects_to", "")
                     pt = cp.get("point_type", "")
-
                     if conn:
                         line = f"[{cat}] {entity} — {pt} → {conn}: {value}"
                     elif entity and entity != "Story":
@@ -789,7 +765,6 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
                     else:
                         line = f"[{cat}] {value}"
                     cp_context_lines.append(line)
-
                 context_parts.append("\n\n[DEEP CONTEXT]\n" + "\n".join(f"- {l}" for l in cp_context_lines))
                 metadata["cp_results"] = len(cp_results)
 
@@ -863,6 +838,7 @@ def handle_message(prompt, openrouter_key, mnemo_client):
         "mode": gate.mode, "memory_reason": gate.reason,
         "sessions_found": sessions_found, "gate_tier": gate.tier_used,
         "threads_injected": ctx_meta.get("threads_injected", 0) if 'ctx_meta' in locals() else 0,
+        "knots_injected": ctx_meta.get("knots_injected", 0) if 'ctx_meta' in locals() else 0,
         "cp_results": ctx_meta.get("cp_results", 0) if 'ctx_meta' in locals() else 0,
     }
 
@@ -904,38 +880,56 @@ def handle_message(prompt, openrouter_key, mnemo_client):
             and cross_session_enabled
             and not skip_loops_for_this_query):
         conversation = f"User: {prompt}\n\nAssistant: {response}"
-        memories, extract_cost = extract_memories_with_gpt(conversation, openrouter_key)
+        extraction_data, extract_cost = extract_memories_with_gpt(conversation, openrouter_key)
+        memories = extraction_data.get("memories", [])
+        threads_data = extraction_data.get("threads", [])
+        knots_data = extraction_data.get("knots", [])
+        
         if memories:
             msg_cost += extract_cost
-            import concurrent.futures
-            store_tasks = []
-            for mem in memories:
-                cat = mem.get("category", "FACT").upper()
-                txt = mem.get("content", "")
-                entity = mem.get("entity", "Story")
-                connects_to = mem.get("connects_to", "")
-                if txt:
-                    store_tasks.append((entity, cat, txt, connects_to))
-            if store_tasks:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                    futures = {
-                        executor.submit(store_as_cp, mnemo_client,
-                                        entity=ent, category=cat, content=txt,
-                                        session_id=current_session_id, source="auto_extract",
-                                        connects_to=conn): (txt, cat)
-                        for ent, cat, txt, conn in store_tasks
-                    }
-                    for future in concurrent.futures.as_completed(futures):
-                        txt, cat_name = futures[future]
-                        try:
-                            cp_id = future.result()
-                            if cp_id:
-                                extracted += 1
-                                st.session_state.loop_manager.add_to_loop(
-                                    content=txt, category=cat_name.lower(),
-                                    session_id=current_session_id, memory_id=cp_id)
-                        except Exception:
-                            pass
+            local_to_real_cp = {}
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                futures = {}
+                for mem in memories:
+                    local_id = mem.get("local_id", str(uuid.uuid4())[:8])
+                    mem["local_id"] = local_id
+                    cat = mem.get("category", "FACT").upper()
+                    txt = mem.get("content", "")
+                    entity = mem.get("entity", "Story")
+                    connects_to = mem.get("connects_to", "")
+                    if txt:
+                        future = executor.submit(store_as_cp, mnemo_client, entity=entity, category=cat, content=txt, session_id=current_session_id, source="auto_extract", connects_to=connects_to)
+                        futures[future] = mem
+                        
+                for future in concurrent.futures.as_completed(futures):
+                    mem = futures[future]
+                    try:
+                        cp_id = future.result()
+                        if cp_id:
+                            extracted += 1
+                            local_to_real_cp[mem["local_id"]] = cp_id
+                            st.session_state.loop_manager.add_to_loop(content=mem.get("content", ""), category=mem.get("category", "FACT").lower(), session_id=current_session_id, memory_id=cp_id)
+                    except Exception:
+                        pass
+                        
+            # Create Threads from extraction
+            thread_name_to_id = {}
+            for th in threads_data:
+                t_name = th.get("name", "")
+                if not t_name: continue
+                t_id = "thread_" + re.sub(r'[^a-z0-9]', '_', t_name.lower())[:20]
+                thread_name_to_id[t_name] = t_id
+                cp_ids = [local_to_real_cp[m_id] for m_id in th.get("memory_local_ids", []) if m_id in local_to_real_cp]
+                mnemo_client.add_thread(thread_id=t_id, name=t_name, entity=th.get("entity", ""), thread_type=th.get("type", "plot_line"), session_id=current_session_id, point_ids=cp_ids)
+                
+            # Create Knots from extraction
+            for kn in knots_data:
+                k_name = kn.get("name", "")
+                if not k_name: continue
+                k_id = "knot_" + re.sub(r'[^a-z0-9]', '_', k_name.lower())[:20]
+                t_ids = [thread_name_to_id.get(tn, "thread_" + re.sub(r'[^a-z0-9]', '_', tn.lower())[:20]) for tn in kn.get("thread_names", [])]
+                mnemo_client.add_knot(knot_id=k_id, name=k_name, thread_ids=t_ids, pivot_type="collision", reason=kn.get("reason", ""), session_id=current_session_id)
 
     result_meta = {
         "cross_session_memories_used": context_meta.get("cross_session_memories_used", 0),
@@ -945,6 +939,7 @@ def handle_message(prompt, openrouter_key, mnemo_client):
         "sessions_found": sessions_found,
         "gate_tier": context_meta.get("gate_tier", 1),
         "threads_injected": context_meta.get("threads_injected", 0),
+        "knots_injected": context_meta.get("knots_injected", 0),
         "cp_results": context_meta.get("cp_results", 0),
     }
     return response, None, result_meta
@@ -1203,7 +1198,7 @@ def render_memory_management(mnemo_client):
 
 def render_file_upload(mnemo_client, openrouter_key):
     st.markdown("**📎 Upload File → Memory**")
-    st.caption("Upload a file — extracts facts, deep context, style, tone via K2.5")
+    st.caption("Upload a file — extracts facts, deep context, style, tone via K2")
     uploaded_file = st.file_uploader("Upload file", type=["txt", "md", "csv", "json", "pdf", "docx"],
                                      label_visibility="collapsed")
     if uploaded_file is not None:
@@ -1215,45 +1210,62 @@ def render_file_upload(mnemo_client, openrouter_key):
                 if n_chunks > 1:
                     st.info(f"📄 {len(content):,} chars → splitting into {min(n_chunks, 5)} chunks")
                 with st.spinner(f"K2 extracting ({min(n_chunks, 5)} call{'s' if n_chunks > 1 else ''})..."):
-                    memories, cost = extract_memories_from_file(content, uploaded_file.name, openrouter_key)
+                    extraction_data, cost = extract_memories_from_file(content, uploaded_file.name, openrouter_key)
+                memories = extraction_data.get("memories", [])
+                threads_data = extraction_data.get("threads", [])
+                knots_data = extraction_data.get("knots", [])
+                
                 if memories:
-                    with st.spinner("Storing to memory..."):
+                    with st.spinner("Structuring Graph (CPs, Threads, Knots)..."):
                         current_session = st.session_state.get("current_session_id", "")
                         stored = 0
-                        import concurrent.futures
-                        store_tasks = []
-                        for mem in memories:
-                            cat = mem.get("category", "FACT").upper()
-                            txt = mem.get("content", "")
-                            entity = mem.get("entity", "Story")
-                            connects_to = mem.get("connects_to", "")
-                            if txt:
-                                store_tasks.append((entity, cat, txt, connects_to))
-                        if store_tasks:
-                            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                                futures = {
-                                    executor.submit(store_as_cp, mnemo_client,
-                                                    entity=ent, category=cat, content=txt,
-                                                    session_id=current_session, source="file_upload",
-                                                    connects_to=conn, weight=0.8): (txt, cat)
-                                    for ent, cat, txt, conn in store_tasks
-                                }
-                                for future in concurrent.futures.as_completed(futures):
-                                    txt, cat_name = futures[future]
-                                    try:
-                                        cp_id = future.result()
-                                        if cp_id:
-                                            stored += 1
-                                            st.session_state.loop_manager.add_to_loop(
-                                                content=txt, category=cat_name.lower(),
-                                                session_id=current_session, memory_id=cp_id)
-                                    except Exception:
-                                        pass
+                        local_to_real_cp = {}
+                        
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                            futures = {}
+                            for mem in memories:
+                                local_id = mem.get("local_id", str(uuid.uuid4())[:8])
+                                mem["local_id"] = local_id
+                                cat = mem.get("category", "FACT").upper()
+                                txt = mem.get("content", "")
+                                entity = mem.get("entity", "Story")
+                                connects_to = mem.get("connects_to", "")
+                                if txt:
+                                    future = executor.submit(store_as_cp, mnemo_client, entity=entity, category=cat, content=txt, session_id=current_session, source="file_upload", connects_to=connects_to, weight=0.8)
+                                    futures[future] = mem
+                                    
+                            for future in concurrent.futures.as_completed(futures):
+                                mem = futures[future]
+                                try:
+                                    cp_id = future.result()
+                                    if cp_id:
+                                        stored += 1
+                                        local_to_real_cp[mem["local_id"]] = cp_id
+                                        st.session_state.loop_manager.add_to_loop(content=mem.get("content", ""), category=mem.get("category", "FACT").lower(), session_id=current_session, memory_id=cp_id)
+                                except Exception:
+                                    pass
+                                    
+                        thread_name_to_id = {}
+                        for th in threads_data:
+                            t_name = th.get("name", "")
+                            if not t_name: continue
+                            t_id = "thread_" + re.sub(r'[^a-z0-9]', '_', t_name.lower())[:20]
+                            thread_name_to_id[t_name] = t_id
+                            cp_ids = [local_to_real_cp[m_id] for m_id in th.get("memory_local_ids", []) if m_id in local_to_real_cp]
+                            mnemo_client.add_thread(thread_id=t_id, name=t_name, entity=th.get("entity", ""), thread_type=th.get("type", "plot_line"), session_id=current_session, point_ids=cp_ids)
+                            
+                        for kn in knots_data:
+                            k_name = kn.get("name", "")
+                            if not k_name: continue
+                            k_id = "knot_" + re.sub(r'[^a-z0-9]', '_', k_name.lower())[:20]
+                            t_ids = [thread_name_to_id.get(tn, "thread_" + re.sub(r'[^a-z0-9]', '_', tn.lower())[:20]) for tn in kn.get("thread_names", [])]
+                            mnemo_client.add_knot(knot_id=k_id, name=k_name, thread_ids=t_ids, pivot_type="collision", reason=kn.get("reason", ""), session_id=current_session)
+
                     facts = [m for m in memories if m.get("category") in ("CHARACTER", "PLOT", "SETTING", "THEME", "FACT")]
                     context = [m for m in memories if m.get("category") in ("CONTEXT", "CLARIFICATION", "RELATIONSHIP", "INSTRUCTION")]
                     style = [m for m in memories if m.get("category") in ("PROSE_SAMPLE", "DIALOGUE_SAMPLE", "VOICE", "VOCABULARY")]
                     tone = [m for m in memories if m.get("category") in ("TONE",)]
-                    st.success(f"✅ Stored {stored} memories")
+                    st.success(f"✅ Stored {stored} memories, {len(threads_data)} threads, {len(knots_data)} knots")
                     st.caption(f"📊 {len(facts)} facts · {len(context)} context · {len(style)} style · {len(tone)} tone | Cost: ${cost:.4f}")
                     with st.expander("View extracted memories", expanded=False):
                         for mem in memories:
@@ -1316,6 +1328,8 @@ def render_chat(openrouter_key, mnemo_client):
                         memory_info = []
                         if meta.get("threads_injected", 0) > 0:
                             memory_info.append(f"🧵 {meta['threads_injected']} threads")
+                        if meta.get("knots_injected", 0) > 0:
+                            memory_info.append(f"🪢 {meta['knots_injected']} knots")
                         if meta.get("cross_session_memories_used", 0) > 0:
                             memory_info.append(f"📚 {meta['cross_session_memories_used']} memories")
                         if meta.get("cp_results", 0) > 0:
@@ -1354,6 +1368,8 @@ def render_chat(openrouter_key, mnemo_client):
                     meta_parts.append(f"📜 {result_meta['sessions_found']} past chats")
                 if result_meta.get("threads_injected", 0) > 0:
                     meta_parts.append(f"🧵 {result_meta['threads_injected']} threads")
+                if result_meta.get("knots_injected", 0) > 0:
+                    meta_parts.append(f"🪢 {result_meta['knots_injected']} knots")
                 if result_meta.get("cross_session_memories_used", 0) > 0:
                     meta_parts.append(f"📚 {result_meta['cross_session_memories_used']} memories")
                 if result_meta.get("cp_results", 0) > 0:
@@ -1418,7 +1434,7 @@ def main():
         <div class="brand-icon">🧠</div>
         <div class="brand-text">
             <h1>4o with Memory</h1>
-            <p>GPT-4o writer · K2 memory curator · Mnemo v6.4</p>
+            <p>GPT-4o writer · K2 memory curator · Mnemo v6.6</p>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1501,7 +1517,7 @@ def main():
 
     st.markdown(f"""
     <div class="status-bar">
-        4o with Memory v6.4 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Threads & Knots &nbsp;·&nbsp; Graph Search
+        4o with Memory v6.6 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Threads & Knots &nbsp;·&nbsp; Graph Search
     </div>
     """, unsafe_allow_html=True)
 
