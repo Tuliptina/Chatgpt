@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from mnemo_client import MnemoClient
 
 # v6.0: Memory model for smart extraction (matches app.py config)
-MEMORY_MODEL_ID = "moonshotai/kimi-k2-0905"
+MEMORY_MODEL_ID = "moonshotai/kimi-k2"
 
 
 # =============================================================================
