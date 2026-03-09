@@ -353,11 +353,9 @@ LAYER 4 - TONE: TONE (scene registers, humor types, emotional shifts, atmosphere
 BAD (fragmented):
   {{"category": "CHARACTER", "content": "Alistair is a professor"}}
   {{"category": "CHARACTER", "content": "Alistair fears dementia"}}
-  {{"category": "CHARACTER", "content": "Alistair funds an orphanage"}}
 
 GOOD (consolidated):
   {{"category": "CHARACTER", "content": "Alistair Fitzroy: late 30s pharmacology professor, Red Rose manipulator. Driven by fear of being forgotten — secretly funds an orphanage as legacy insurance. Terrified of developing dementia like his father. His scenes should feel clinical and precise, power expressed through control not violence."}}
-  {{"category": "RELATIONSHIP", "content": "Alistair → Sebastian: former friend turned captor. Alistair frames the captivity as medical care. Their dynamic is intellectual chess — Alistair respects Sebastian's mind while destroying his autonomy. Alistair → Elijah: estranged brothers, Alistair envies Elijah's peace."}}
 
 Return ONLY a JSON object:
 {{
@@ -737,7 +735,6 @@ def handle_message(prompt, openrouter_key, mnemo_client):
         memories, extract_cost = extract_memories_with_gpt(conversation, openrouter_key)
         if memories:
             msg_cost += extract_cost
-            # v6.0: Parallel storage — ~2.5x faster than sequential on Gradio API
             import concurrent.futures
             store_tasks = []
             for mem in memories:
@@ -746,7 +743,6 @@ def handle_message(prompt, openrouter_key, mnemo_client):
                 if txt:
                     meta = {"category": cat, "session_id": current_session_id}
                     store_tasks.append((f"[{cat}] {txt}", meta, cat))
-
             if store_tasks:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                     futures = {
@@ -782,9 +778,9 @@ def handle_message(prompt, openrouter_key, mnemo_client):
 
 def render_sidebar(mnemo_client, openrouter_key, hf_key):
     with st.sidebar:
-        st.header("\u2699\ufe0f Settings")
+        st.markdown("#### ⚙️ Settings")
 
-        with st.expander("\U0001f511 API Keys", expanded=False):
+        with st.expander("🔑 API Keys", expanded=False):
             or_key = st.text_input("OpenRouter API Key", value=DEFAULT_OPENROUTER_KEY, type="password")
             hf = st.text_input("HuggingFace Token", value=DEFAULT_HF_KEY, type="password")
 
@@ -792,7 +788,7 @@ def render_sidebar(mnemo_client, openrouter_key, hf_key):
         hf_key = hf or DEFAULT_HF_KEY
 
         st.divider()
-        st.subheader("\U0001f4ac Chat")
+        st.markdown("#### 💬 Chat")
 
         if st.button("\u2795 New Chat", use_container_width=True, type="primary"):
             start_new_chat()
@@ -802,11 +798,11 @@ def render_sidebar(mnemo_client, openrouter_key, hf_key):
         render_sessions_panel(mnemo_client, hf_key)
         st.divider()
 
-        with st.expander("\u2699\ufe0f Settings", expanded=False):
+        with st.expander("⚙️ File Upload & Settings", expanded=False):
             render_file_upload(mnemo_client, openrouter_key)
 
         st.divider()
-        st.subheader("\U0001f9e0 Memory Settings")
+        st.markdown("#### 🧠 Memory")
 
         cross_session_enabled = st.toggle("Cross-Session Memory", value=True,
                                           help="Remember across chat sessions")
@@ -829,16 +825,17 @@ def render_sidebar(mnemo_client, openrouter_key, hf_key):
             st.caption(f"\U0001f4ca {loop_stats['total_items']} memories | {loop_stats['total_metadata_tokens']} tokens")
 
         st.divider()
-        st.subheader("\U0001f4dd Add Memory")
+        st.markdown("#### 📝 Add Memory")
         render_memory_management(mnemo_client)
         st.divider()
         render_consolidation_panel(openrouter_key)
         st.divider()
 
-        st.subheader("\U0001f4b0 Costs")
-        st.caption(f"Messages: {st.session_state.get('message_count', 0)}")
-        st.caption(f"Total: ${st.session_state.get('total_cost', 0):.4f}")
-        st.caption(f"Writing: {WRITING_MODEL_ID.split('/')[-1]} | Memory: {MEMORY_MODEL_ID.split('/')[-1]}")
+        st.markdown("#### 💰 Usage")
+        msg_count = st.session_state.get('message_count', 0)
+        total_cost = st.session_state.get('total_cost', 0)
+        st.caption(f"{msg_count} messages · ${total_cost:.4f}")
+        st.caption(f"✍️ {WRITING_MODEL_ID.split('/')[-1]} · 🧠 {MEMORY_MODEL_ID.split('/')[-1]}")
 
     return openrouter_key, hf_key
 
@@ -846,7 +843,7 @@ def render_sidebar(mnemo_client, openrouter_key, hf_key):
 def render_sessions_panel(mnemo_client, hf_key):
     col_title, col_refresh = st.columns([3, 1])
     with col_title:
-        st.subheader("\U0001f4da Sessions")
+        st.markdown("#### 📚 Sessions")
     with col_refresh:
         if st.button("\U0001f504", key="refresh_sessions", help="Refresh from cloud"):
             try:
@@ -943,7 +940,6 @@ def render_file_upload(mnemo_client, openrouter_key):
                     with st.spinner("Storing to memory..."):
                         current_session = st.session_state.get("current_session_id", "")
                         stored = 0
-                        # v6.0: Parallel storage for file uploads
                         import concurrent.futures
                         store_tasks = []
                         for mem in memories:
@@ -952,7 +948,6 @@ def render_file_upload(mnemo_client, openrouter_key):
                             if txt:
                                 meta = {"category": cat, "session_id": current_session, "source": "file_upload"}
                                 store_tasks.append((f"[{cat}] {txt}", meta, cat))
-
                         if store_tasks:
                             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                                 futures = {
@@ -1134,12 +1129,12 @@ def render_chat(openrouter_key, mnemo_client):
                     if st.button("\U0001f4cb", key=f"copy_{idx}", help="Copy response"):
                         copy_response_dialog(message["content"])
 
-    if prompt := st.chat_input("What's on your mind?"):
+    if prompt := st.chat_input("Write a scene, ask a question, or just say hi..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
+            with st.spinner(""):
                 response, error, result_meta = handle_message(prompt, openrouter_key, mnemo_client)
             if error:
                 st.error(error)
@@ -1173,9 +1168,204 @@ def render_chat(openrouter_key, mnemo_client):
 # ============================================================================
 
 def main():
-    st.set_page_config(page_title="4o with Memory", page_icon="\U0001f9e0", layout="wide")
-    st.title("\U0001f9e0 4o with Memory")
-    st.caption("GPT-4o co-author + K2.5 memory curator | Dual-processor creative writing engine")
+    st.set_page_config(page_title="4o with Memory", page_icon="🧠", layout="wide", initial_sidebar_state="expanded")
+
+    # ── Modern AI App Theme ──────────────────────────────────────────
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap');
+
+    /* ── Global ── */
+    .stApp {
+        font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+    .stApp > header { background: transparent !important; }
+
+    /* ── Hide default Streamlit chrome ── */
+    #MainMenu, footer, .stDeployButton { display: none !important; }
+
+    /* ── Chat messages ── */
+    .stChatMessage {
+        border-radius: 16px !important;
+        padding: 1rem 1.25rem !important;
+        margin-bottom: 0.5rem !important;
+        border: 1px solid rgba(128, 128, 128, 0.08) !important;
+        backdrop-filter: blur(8px);
+        font-size: 0.95rem;
+        line-height: 1.7;
+        letter-spacing: 0.01em;
+    }
+    /* User messages */
+    .stChatMessage[data-testid="chat-message-user"] {
+        background: rgba(99, 102, 241, 0.06) !important;
+        border-left: 3px solid rgba(99, 102, 241, 0.4) !important;
+    }
+    /* Assistant messages */
+    .stChatMessage[data-testid="chat-message-assistant"] {
+        background: rgba(255, 255, 255, 0.02) !important;
+    }
+
+    /* ── Chat input ── */
+    .stChatInput > div {
+        border-radius: 24px !important;
+        border: 1px solid rgba(128, 128, 128, 0.15) !important;
+        transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    .stChatInput > div:focus-within {
+        border-color: rgba(99, 102, 241, 0.5) !important;
+        box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.08) !important;
+    }
+    .stChatInput textarea {
+        font-family: 'DM Sans', sans-serif !important;
+        font-size: 0.95rem !important;
+    }
+
+    /* ── Sidebar ── */
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg,
+            rgba(15, 15, 20, 0.97) 0%,
+            rgba(20, 20, 30, 0.95) 100%) !important;
+        border-right: 1px solid rgba(128, 128, 128, 0.08) !important;
+    }
+    section[data-testid="stSidebar"] .stMarkdown h1,
+    section[data-testid="stSidebar"] .stMarkdown h2,
+    section[data-testid="stSidebar"] .stMarkdown h3 {
+        font-family: 'DM Sans', sans-serif;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+    }
+    section[data-testid="stSidebar"] hr {
+        border-color: rgba(128, 128, 128, 0.1) !important;
+        margin: 0.75rem 0 !important;
+    }
+
+    /* ── Buttons ── */
+    .stButton > button {
+        border-radius: 12px !important;
+        font-family: 'DM Sans', sans-serif !important;
+        font-weight: 500 !important;
+        font-size: 0.85rem !important;
+        letter-spacing: 0.02em;
+        transition: all 0.15s ease;
+        border: 1px solid rgba(128, 128, 128, 0.12) !important;
+    }
+    .stButton > button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    }
+    .stButton > button[kind="primary"] {
+        background: linear-gradient(135deg, #6366f1 0%, #818cf8 100%) !important;
+        border: none !important;
+        color: white !important;
+    }
+    .stButton > button[kind="primary"]:hover {
+        background: linear-gradient(135deg, #5558e6 0%, #7578f0 100%) !important;
+    }
+
+    /* ── Toggle/checkbox ── */
+    .stToggle label span {
+        font-size: 0.85rem !important;
+    }
+
+    /* ── Expanders ── */
+    .streamlit-expanderHeader {
+        font-family: 'DM Sans', sans-serif !important;
+        font-weight: 500 !important;
+        font-size: 0.85rem !important;
+        border-radius: 10px !important;
+    }
+
+    /* ── Captions (metadata) ── */
+    .stChatMessage .stCaption, .stChatMessage caption {
+        font-family: 'JetBrains Mono', monospace !important;
+        font-size: 0.7rem !important;
+        opacity: 0.5;
+        letter-spacing: 0.03em;
+        transition: opacity 0.2s;
+    }
+    .stChatMessage:hover .stCaption, .stChatMessage:hover caption {
+        opacity: 0.8;
+    }
+
+    /* ── Spinner ── */
+    .stSpinner > div {
+        border-radius: 12px !important;
+    }
+
+    /* ── Code blocks in chat ── */
+    .stChatMessage pre {
+        border-radius: 10px !important;
+        font-family: 'JetBrains Mono', monospace !important;
+        font-size: 0.85rem !important;
+    }
+
+    /* ── Tabs (sidebar) ── */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 2px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 8px;
+        font-size: 0.8rem;
+        font-family: 'DM Sans', sans-serif;
+    }
+
+    /* ── Toast/alerts ── */
+    .stAlert {
+        border-radius: 12px !important;
+    }
+
+    /* ── Brand header ── */
+    .brand-header {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.25rem 0 0.5rem;
+    }
+    .brand-header .brand-icon {
+        font-size: 1.8rem;
+        line-height: 1;
+    }
+    .brand-header .brand-text h1 {
+        font-family: 'DM Sans', sans-serif;
+        font-size: 1.5rem;
+        font-weight: 600;
+        letter-spacing: -0.03em;
+        margin: 0;
+        padding: 0;
+        line-height: 1.2;
+    }
+    .brand-header .brand-text p {
+        font-family: 'DM Sans', sans-serif;
+        font-size: 0.75rem;
+        opacity: 0.45;
+        margin: 0.15rem 0 0;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        font-weight: 500;
+    }
+
+    /* ── Status pill (bottom bar) ── */
+    .status-bar {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.65rem;
+        opacity: 0.35;
+        letter-spacing: 0.05em;
+        text-align: center;
+        padding: 0.5rem 0;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # ── Brand Header ──
+    st.markdown("""
+    <div class="brand-header">
+        <div class="brand-icon">🧠</div>
+        <div class="brand-text">
+            <h1>4o with Memory</h1>
+            <p>GPT-4o writer · K2 memory curator · Mnemo v6.0</p>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
     if not DEFAULT_OPENROUTER_KEY or not DEFAULT_HF_KEY:
         st.error("\u26a0\ufe0f **API Keys Not Configured!**")
@@ -1245,8 +1435,11 @@ def main():
 
     render_chat(openrouter_key, mnemo_client)
 
-    st.divider()
-    st.caption("\U0001f9e0 4o with Memory v6.0 | GPT-4o + K2.5 + Mnemo v6.0 + Threads & Knots")
+    st.markdown(f"""
+    <div class="status-bar">
+        4o with Memory v6.0 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Threads & Knots &nbsp;·&nbsp; Graph Search
+    </div>
+    """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
