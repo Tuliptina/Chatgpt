@@ -43,7 +43,7 @@ class GradioTransport:
     the data array. This class handles parsing that automatically.
     """
 
-    def __init__(self, base_url: str, timeout: int = 30):
+    def __init__(self, base_url: str, timeout: int = 60):
         self.base_url = base_url.rstrip("/")
         self.api_base = f"{self.base_url}/gradio_api/call"
         self.timeout = timeout
@@ -314,11 +314,12 @@ class MnemoClient:
 
     def add_thread(self, thread_id: str, name: str, entity: str = "",
                    thread_type: str = "plot_line",
-                   session_id: str = "") -> Optional[str]:
+                   session_id: str = "", point_ids: List[str] = None) -> Optional[str]:
         """Create a narrative thread. Returns thread ID or None."""
+        pts_json = json.dumps(point_ids or [])
         result = self._call(
             "create_thread_api",
-            thread_id, name, entity, thread_type, session_id,
+            thread_id, name, entity, thread_type, session_id, pts_json
         )
         if result and isinstance(result, dict):
             return result.get("id")
