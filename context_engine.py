@@ -7,7 +7,7 @@ Two key features:
    (CONTEXT, RELATIONSHIP, CLARIFICATION, TIMELINE, TONE) from raw facts
 
 v6.0 changes:
-- consolidate_memories() now routes to MEMORY_MODEL_ID (K2) instead of GPT-4o
+- consolidate_memories() now routes to MEMORY_MODEL_ID (K2.5) instead of GPT-4o
   (~77% cost reduction on consolidation runs)
 - K2.5 cost rates: $0.60/$3.00 per M tokens (was $2.50/$15.00)
 - TONE entries added to consolidation output categories
@@ -134,13 +134,19 @@ class ContextEngine:
             "dedup_rejected": 0,
         }
 
-        # Fetch all memories via MnemoClient
+        # Fetch all data — both legacy blobs and ConnectionPoints
         try:
-            all_memories = self.mnemo.list_memories()
-            if not all_memories:
+            all_memories = self.mnemo.list_memories() or []
+            # v6.1: Also fetch ConnectionPoints
+            all_points = []
+            if hasattr(self.mnemo, 'list_points'):
+                all_points = self.mnemo.list_points(limit=500) or []
+            
+            total = len(all_memories) + len(all_points)
+            if total == 0:
                 return {"error": "No memories to consolidate or API unreachable", "created": 0}
 
-            results["memories_analyzed"] = len(all_memories)
+            results["memories_analyzed"] = total
 
         except Exception as e:
             return {"error": f"Fetch error: {e}", "created": 0}
@@ -149,6 +155,7 @@ class ContextEngine:
         facts = []
         existing_context = []
 
+        # From legacy blobs
         for mem in all_memories:
             content = mem.get("content", "")
             if any(content.startswith(f"[{tag}]") for tag in
@@ -158,6 +165,24 @@ class ContextEngine:
                 continue
             else:
                 facts.append(content)
+
+        # From ConnectionPoints
+        CONTEXT_TYPES = {"context_note", "clarification", "relationship", "tone_directive", "timeline"}
+        for cp in all_points:
+            entity = cp.get("entity", "")
+            value = cp.get("value", "")
+            point_type = cp.get("point_type", "")
+            conn = cp.get("connects_to", "")
+            if point_type in CONTEXT_TYPES:
+                line = f"{entity}: {value}" if entity else value
+                if conn:
+                    line = f"{entity} → {conn}: {value}"
+                existing_context.append(line)
+            else:
+                line = f"{entity}: {value}" if entity else value
+                if conn:
+                    line = f"{entity} → {conn}: {value}"
+                facts.append(line)
 
         if not facts:
             return {"error": "No facts to analyze (only context entries exist)", "created": 0}
@@ -292,20 +317,43 @@ Return ONLY a JSON object:
                 continue
 
             try:
-                meta = {
-                    "category": category,
-                    "source": "consolidation",
-                    "created": datetime.now().isoformat()
+                import re
+                # Parse entity from content for RELATIONSHIP entries
+                entity = "Story"
+                connects_to = ""
+                if category == "RELATIONSHIP":
+                    arrow_match = re.match(r'(\w+)\s*(?:→|->)\s*(\w+)', entry_content)
+                    if arrow_match:
+                        entity = arrow_match.group(1)
+                        connects_to = arrow_match.group(2)
+                else:
+                    # Try first proper noun
+                    name_match = re.match(r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', entry_content)
+                    if name_match:
+                        entity = name_match.group(1)
+
+                # Map category to CP fields
+                CONSOL_MAP = {
+                    "CONTEXT": ("fact", "context_note"),
+                    "RELATIONSHIP": ("relationship", "relationship"),
+                    "CLARIFICATION": ("fact", "clarification"),
+                    "TIMELINE": ("plot", "timeline"),
+                    "TONE": ("tone", "tone_directive"),
                 }
-                mem_id = self.mnemo.add(f"[{category}] {entry_content}", metadata=meta, priority=1.2)
-                if mem_id:
+                cp_cat, point_type = CONSOL_MAP.get(category, ("fact", "general"))
+
+                cp_id = self.mnemo.add_point(
+                    entity=entity, point_type=point_type, value=entry_content,
+                    connects_to=connects_to, reason="", weight="0.7",
+                    category=cp_cat, session_id="", source="consolidation",
+                )
+                if cp_id:
                     stored += 1
                     results["new_entries"].append({
                         "category": category,
                         "content": entry_content[:100] + "..." if len(entry_content) > 100 else entry_content
                     })
-                    # Also add to existing_context to prevent self-duplication within this batch
-                    existing_context.append(f"[{category}] {entry_content}")
+                    existing_context.append(entry_content)
             except Exception:
                 continue
 
