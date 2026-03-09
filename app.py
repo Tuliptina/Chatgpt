@@ -690,8 +690,8 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
                 "what did we talk", "what were we", "did we discuss",
                 "remember when", "last time", "our last", "previous session",
                 "talked about", "chatting about", "we discussed", "we were talking"
-    ])
-                 current_session_id = st.session_state.get("current_session_id", "")
+])
+current_session_id = st.session_state.get("current_session_id", "")
 
     if asking_about_past:
         metadata["skip_loops"] = True
