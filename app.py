@@ -79,21 +79,25 @@ MAX_SESSIONS_STORED = 20
 MNEMO_HOT_PATH_TIMEOUT = 4.0
 
 # v6.0: System prompt — split personality. Warm for conversation, invisible for creative.
-SYSTEM_PROMPT = """You have two modes. Detect which one the user needs and switch seamlessly.
+SYSTEM_PROMPT = """You are a sharp, well-read creative collaborator with genuine enthusiasm for storytelling craft. You have three modes — detect which one the user needs and switch seamlessly.
 
-MODE 1 — CONVERSATION (chatting about the project, questions, planning):
-- Warm and direct, like a knowledgeable collaborator
-- Natural, conversational tone
-- Ask thoughtful follow-up questions when needed
+MODE 1 — CONVERSATION (chatting about the project, brainstorming, planning):
+- You're the kind of collaborator writers actually enjoy working with — curious, opinionated about craft, and genuinely invested in their story.
+- Have real opinions. If a plot idea is predictable, say so with charm, then pitch something better. If a character detail is brilliant, get excited about it.
+- Be witty when the moment allows, but never at the expense of the work. Your humor should make the writer smile, not feel patronized.
+- Ask questions that show you're thinking ahead — "If Alistair finds out about the orphanage in Book 2, does that change how he treats Elijah in the captivity arc?"
+- Use casual, intelligent language. You're a peer, not a tutor. Skip the preambles — no "Great question!" or "That's a fascinating idea!"
+- When the user is stuck, don't just list options. Pitch your favorite and explain why it excites you, then offer alternatives.
+- Reference their stored characters and plot points naturally, like you've been working on this together for months.
 
-MODE 2 — RECALL & RETRIEVAL (user asks you to recall, list, summarize):
+MODE 2 — RECALL & RETRIEVAL (user asks to recall, list, summarize):
 - Give clean, factual answers drawn from your memory context
 - Use EXACT details from memory — do NOT embellish, infer, or fill gaps with imagination
-- If memory doesn't contain something, say so honestly
-- Structure clearly: bullet points or short paragraphs
+- If memory doesn't contain something, say so: "I don't have that stored — want to tell me so I can remember it?"
+- Structure clearly when listing multiple items, but keep it conversational for single facts
 
 MODE 3 — CREATIVE WRITING (scenes, chapters, dialogue, prose):
-- Your personality DISAPPEARS. You are not "warm" — you are the story.
+- Your personality DISAPPEARS. You are not "witty" — you are the story.
 - Match the tonal register from the [TONE DIRECTIVE] in your context. Dark stays dark. Humor cuts. Tension holds.
 - Deep psychological complexity in characters
 - Setting-accurate language for the project's period/genre
@@ -116,7 +120,7 @@ PROSE RHYTHM — this is critical:
 - Read your output as a reader would. If every sentence is the same length, rewrite.
 
 When in doubt about which mode: ask the user.
-Always acknowledge context from memory naturally."""
+Reference stored memories naturally, as if you've been collaborating on this project for a long time."""
 
 
 # ============================================================================
@@ -439,7 +443,7 @@ def extract_memories_from_file(content, filename, openrouter_key):
 # ============================================================================
 
 def extract_memories_with_gpt(conversation, openrouter_key):
-    """v6.0: Routes to MEMORY_MODEL_ID for extraction. Produces consolidated memories."""
+    """v6.0: Routes to MEMORY_MODEL_ID for extraction. All 4 layers including deep context."""
     prompt = f"""Analyze this conversation and extract what's worth remembering long-term.
 
 CONVERSATION:
@@ -450,25 +454,39 @@ RULES:
 - Each memory should be a self-contained paragraph with CONTEXT, not a bare fact.
 - Combine character traits, relationships, and details into one entry per character.
 - Include WHY things matter, not just WHAT they are.
-- Aim for 3-8 memories, each 1-3 sentences long.
+- Aim for 3-10 memories, each 1-3 sentences long.
 - If a fact is trivial or obvious from context, skip it.
+- ALWAYS extract at least one CONTEXT or RELATIONSHIP entry if characters interact.
 
-Categories:
-- CHARACTER: Who they are, traits, fears, motivations, relationships — all in one entry per character
-- PLOT: What happened and WHY it matters, consequences, what it sets up
+Extract in ALL 4 layers:
+
+LAYER 1 — FACTS:
+- CHARACTER: Who they are, traits, fears, motivations — one entry per character
+- PLOT: What happened, why it matters, what it sets up
 - SETTING: Where/when, atmosphere, sensory details
 - THEME: Recurring ideas, symbols, philosophical tensions
-- STYLE: Writing voice, prose patterns, dialogue quirks
+- FACT: Other important details
+
+LAYER 2 — DEEP CONTEXT (critical for preventing misinterpretation):
+- CONTEXT: Deeper meaning behind a fact that could be misunderstood without explanation
+- CLARIFICATION: "When X is mentioned, it means Y, NOT Z" — prevents common misreadings
+- RELATIONSHIP: "A → B: nature of relationship, dynamics, power balance, emotional undercurrent"
+- INSTRUCTION: Explicit user instructions about how to write/handle something
+
+LAYER 3 — STYLE:
+- STYLE: Writing voice, prose patterns, dialogue quirks, vocabulary preferences
+
+LAYER 4 — TONE:
 - TONE: How scenes should FEEL — emotional registers, humor types, do-nots
-- FACT: Other important details worth tracking
 
-BAD example (too fragmented):
+BAD example (too fragmented, no context layer):
   {{"category": "CHARACTER", "content": "Sebastian is a doctor"}}
-  {{"category": "CHARACTER", "content": "Sebastian has dark humor"}}
-  {{"category": "CHARACTER", "content": "Sebastian works at St Bartholomew's"}}
+  {{"category": "CHARACTER", "content": "Alistair is Sebastian's rival"}}
 
-GOOD example (consolidated):
+GOOD example (consolidated with context layer):
   {{"category": "CHARACTER", "content": "Sebastian Carlisle is a late-20s anatomy lecturer at St Bartholomew's with a working-class background. He uses dry, dark humor as a coping mechanism — it should cut, not charm. He dissociates under stress rather than emoting."}}
+  {{"category": "RELATIONSHIP", "content": "Alistair → Sebastian: former friend turned captor. Alistair frames the captivity as medical care — their dynamic is intellectual chess. Alistair respects Sebastian's mind while systematically destroying his autonomy."}}
+  {{"category": "CONTEXT", "content": "When Sebastian goes quiet in a scene, it signals dissociation, not calm. His silence is a trauma response — never write it as peaceful acceptance."}}
 
 Return ONLY a JSON object:
 {{
@@ -1074,19 +1092,37 @@ def render_memory_management(mnemo_client):
 
 
 def render_consolidation_panel(openrouter_key):
-    with st.expander("\U0001f9e0 Memory Consolidation", expanded=False):
-        st.caption("Analyze memories & generate deep context entries (via K2.5)")
+    with st.expander("🧠 Memory Consolidation", expanded=False):
+        st.caption("Generates **new** CONTEXT, RELATIONSHIP, and TONE entries from your existing facts. Never removes existing memories — purely additive.")
         last_consol = st.session_state.get("last_consolidation")
         if last_consol:
             st.caption(f"Last run: {last_consol[:16]}")
-        if st.button("\U0001f9e0 Consolidate Now", use_container_width=True):
-            with st.spinner("K2.5 analyzing memories... (this may take 30-60 seconds)"):
+
+        # Show what will be analyzed
+        try:
+            mnemo_client = st.session_state.get("mnemo_client")
+            if mnemo_client:
+                all_mems = mnemo_client.list_memories()
+                facts = [m for m in all_mems if not any(
+                    m.get("content", "").startswith(f"[{tag}]")
+                    for tag in ("CONTEXT", "RELATIONSHIP", "CLARIFICATION", "TIMELINE", "CONVERSATION", "SESSION")
+                )]
+                existing_context = [m for m in all_mems if any(
+                    m.get("content", "").startswith(f"[{tag}]")
+                    for tag in ("CONTEXT", "RELATIONSHIP", "CLARIFICATION", "TIMELINE")
+                )]
+                st.caption(f"📊 {len(facts)} facts to analyze · {len(existing_context)} context entries already exist")
+        except Exception:
+            pass
+
+        if st.button("🧠 Generate Deep Context", use_container_width=True):
+            with st.spinner("K2 analyzing memories... (generates new entries, never removes existing)"):
                 result = st.session_state.context_engine.consolidate_memories(openrouter_key)
                 if result.get("error"):
                     st.error(f"Error: {result['error']}")
                 else:
                     st.session_state.last_consolidation = result["timestamp"]
-                    st.success(f"\u2705 Created {result['created']} new context entries!")
+                    st.success(f"✅ Created {result['created']} new context entries! (existing memories untouched)")
                     st.caption(f"Analyzed: {result['memories_analyzed']} memories | Cost: ${result['cost']:.4f}")
                     if result.get("new_entries"):
                         with st.expander("New entries created"):
