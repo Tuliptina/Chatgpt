@@ -56,7 +56,7 @@ MNEMO_URL = "https://athelaperk-mnemo.hf.space"
 
 # v6.0: Two models — writing (4o) and memory ops (K2)
 WRITING_MODEL_ID = "openai/gpt-4o-2024-11-20"
-MEMORY_MODEL_ID = "moonshotai/kimi-k2"
+MEMORY_MODEL_ID = "moonshotai/kimi-k2-0905"
 
 # v6.0: Per-model sampling parameters
 WRITING_PARAMS = {
@@ -683,41 +683,41 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
                                      + "\n".join(f"\u2022 {conv[:200]}" for conv in past_convos))
         except Exception:
             pass
-        if not use_loops:
-            try:
-                # v6.1: Check isolation toggle and pass to client
-                isolate = st.session_state.get("isolate_sessions", False)
-                active_sessions = [current_session_id] if isolate and current_session_id else None
+        # v6.1: Always search ConnectionPoints — loops only affect token optimization, not retrieval
+        try:
+            # Check isolation toggle and pass to client
+            isolate = st.session_state.get("isolate_sessions", False)
+            active_sessions = [current_session_id] if isolate and current_session_id else None
+            
+            cp_results = mnemo_client.graph_search(prompt, top_k=12, active_sessions=active_sessions)
+            
+            writing_keywords = ["write", "scene", "chapter", "story", "prose", "dialogue", "style"]
+            if any(kw in prompt.lower() for kw in writing_keywords):
+                style_cps = mnemo_client.graph_search("prose voice dialogue style tone", top_k=5, active_sessions=active_sessions)
+                seen_ids = {r.get("id") for r in cp_results}
+                for cp in style_cps:
+                    if cp.get("id") not in seen_ids:
+                        cp_results.append(cp)
+                        
+            memories = []
+            for cp in cp_results:
+                entity = cp.get("entity", "")
+                value = cp.get("value", "")
+                cat = cp.get("category", "fact").upper()
+                conn = cp.get("connects_to", "")
+                if conn:
+                    content = f"[{cat}] {entity} → {conn}: {value}"
+                elif entity and entity != "Story":
+                    content = f"[{cat}] {entity}: {value}"
+                else:
+                    content = f"[{cat}] {value}"
+                memories.append({"content": content, "score": cp.get("score", 0)})
                 
-                cp_results = mnemo_client.graph_search(prompt, top_k=12, active_sessions=active_sessions)
-                
-                writing_keywords = ["write", "scene", "chapter", "story", "prose", "dialogue", "style"]
-                if any(kw in prompt.lower() for kw in writing_keywords):
-                    style_cps = mnemo_client.graph_search("prose voice dialogue style tone", top_k=5, active_sessions=active_sessions)
-                    seen_ids = {r.get("id") for r in cp_results}
-                    for cp in style_cps:
-                        if cp.get("id") not in seen_ids:
-                            cp_results.append(cp)
-                            
-                memories = []
-                for cp in cp_results:
-                    entity = cp.get("entity", "")
-                    value = cp.get("value", "")
-                    cat = cp.get("category", "fact").upper()
-                    conn = cp.get("connects_to", "")
-                    if conn:
-                        content = f"[{cat}] {entity} → {conn}: {value}"
-                    elif entity and entity != "Story":
-                        content = f"[{cat}] {entity}: {value}"
-                    else:
-                        content = f"[{cat}] {value}"
-                    memories.append({"content": content, "score": cp.get("score", 0)})
-                    
-                enriched, enrich_meta = context_engine.build_rich_context(prompt, memories)
-                if enriched:
-                    context_parts.append(f"\n\n[DEEP CONTEXT]\n{enriched}")
-            except Exception:
-                pass
+            enriched, enrich_meta = context_engine.build_rich_context(prompt, memories)
+            if enriched:
+                context_parts.append(f"\n\n[DEEP CONTEXT]\n{enriched}")
+        except Exception:
+            pass
 
     return "".join(context_parts), metadata, metadata["skip_loops"]
 
