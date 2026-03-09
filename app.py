@@ -53,7 +53,7 @@ DEFAULT_OPENROUTER_KEY = get_secret("OPENROUTER_KEY", "")
 DEFAULT_HF_KEY = get_secret("HF_KEY", "")
 MNEMO_URL = "https://athelaperk-mnemo.hf.space"
 
-# v6.0: Two models — writing (4o) and memory ops (K2.5)
+# v6.0: Two models — writing (4o) and memory ops (K2)
 WRITING_MODEL_ID = "openai/gpt-4o-2024-11-20"
 MEMORY_MODEL_ID = "moonshotai/kimi-k2"
 
@@ -89,6 +89,9 @@ MODE 1 — CONVERSATION (chatting about the project, brainstorming, planning):
 - Use casual, intelligent language. You're a peer, not a tutor. Skip the preambles — no "Great question!" or "That's a fascinating idea!"
 - When the user is stuck, don't just list options. Pitch your favorite and explain why it excites you, then offer alternatives.
 - Reference their stored characters and plot points naturally, like you've been working on this together for months.
+- CRITICAL — know the difference between RECALLING and CREATING:
+  RECALLING (stating what exists in the story): ONLY state what your memory context contains. If you're not sure who does something or how an event plays out, say "I don't have that stored — here's what I do have" or ask the user. Never present invented details AS IF they're established canon.
+  CREATING (pitching new ideas, brainstorming, suggesting): Go wild. Pitch bold ideas, suggest plot twists, propose character moments. But always frame these as suggestions — "What if Alistair..." or "I'd love to see a scene where..." — never as "In the story, Alistair does X" when X isn't in memory.
 
 MODE 2 — RECALL & RETRIEVAL (user asks to recall, list, summarize):
 - Give clean, factual answers drawn from your memory context
@@ -346,6 +349,14 @@ RULES:
 - You MUST include CONTEXT, RELATIONSHIP, and CLARIFICATION entries — not just CHARACTER/PLOT facts.
 - At least 30% of entries should be LAYER 2 (CONTEXT, RELATIONSHIP, CLARIFICATION, INSTRUCTION).
 
+AGENT ATTRIBUTION — critical for accuracy:
+- Always specify WHO does WHAT to WHOM. Never say "tattooing happens" — say "ISABELLA tattoos Sebastian."
+- When multiple characters are involved in a sequence, name each person's specific role.
+- Always specify OUTCOMES: does a rescue succeed or fail? Does a plan work or backfire?
+- When two characters could plausibly do the same thing, explicitly say which one does it.
+- BAD: "captivity involves tattooing and drug protocols"
+- GOOD: "ALISTAIR manages drug protocols; ISABELLA performs the ritual tattooing"
+
 LAYER 1 — FACTS:
 - CHARACTER: Who they are, traits, fears, motivations — one entry per character
 - PLOT: What happened, why it matters, what it sets up
@@ -472,6 +483,13 @@ RULES:
 - If a fact is trivial or obvious from context, skip it.
 - ALWAYS extract at least one CONTEXT or RELATIONSHIP entry if characters interact.
 - At least 30% of entries should be LAYER 2 (CONTEXT, RELATIONSHIP, CLARIFICATION).
+
+AGENT ATTRIBUTION — critical for accuracy:
+- Always specify WHO does WHAT to WHOM. Never say "the rescue fails" — say "EVELYN's rescue of Sebastian succeeds/fails."
+- When multiple characters are involved, name each person's specific role.
+- Always specify OUTCOMES: does something succeed or fail? What's the result?
+- BAD: "captivity involves tattooing and drug protocols"
+- GOOD: "ALISTAIR manages drug protocols; ISABELLA performs the ritual tattooing — their roles are distinct"
 
 Extract in ALL 4 layers:
 
