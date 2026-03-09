@@ -1,30 +1,18 @@
 """
-Smart Memory System (v6.0)
+Smart Memory System (v6.6)
 
 Reduces latency by detecting which queries need memory lookup.
+Contains fixes for v6.6 narrative structures.
 
-PROBLEM: Searching memory for EVERY query adds 500ms-2s latency.
-SOLUTION: Two-tier injection gate that progressively filters queries.
-
-v6.0 changes:
-- ContextWindowManager.build_optimized_context() now accepts active_sessions
-  parameter for session isolation toggle. When set, only memories from
-  listed sessions are included in the loop context.
-- SmartMemory gate logic unchanged — two-tier gate works the same.
+v6.6 changes:
+- CRITICAL FIX: Continuations ("go on", "next") now return needs_memory=True. 
+  Writing the next scene requires active Threads, Knots, and Style CPs.
+- CRITICAL FIX: Short follow-ups now return needs_memory=True. Passes them 
+  to Tier 2 so case-insensitive Graph Search can catch lowercase entities.
 
 Two-tier injection gate:
   Tier 1 — SmartMemory.analyze(): Fast local regex/pattern analysis.
-      Zero latency. Produces a QueryAnalysis with confidence score.
-      - High-confidence SKIP (greetings, acks, continuations): done.
-      - High-confidence USE (explicit references, creative writing): done.
-      - Moderate-confidence USE (factual, named entities, general): → Tier 2.
-
-  Tier 2 — Mnemo server's /should_inject endpoint: Semantic analysis
-      using the server's own knowledge of what's stored. ~200ms.
-      Only called for moderate-confidence Tier 1 decisions. Can veto
-      injection if the query has no semantic overlap with stored memories.
-
-  app.py's handle_message() calls two_tier_gate() as the single entry point.
+  Tier 2 — Mnemo server's /should_inject endpoint: Semantic validation.
 """
 
 import re
@@ -38,8 +26,8 @@ class QueryType(Enum):
     """Types of queries and their memory needs"""
     GREETING = "greeting"           # hi, hello, hey → NO MEMORY
     SIMPLE_RESPONSE = "simple"      # ok, thanks, sure → NO MEMORY
-    CONTINUATION = "continuation"   # continue, go on → NO MEMORY (use conversation)
-    FOLLOWUP = "followup"           # what about X, and Y? → MAYBE MEMORY
+    CONTINUATION = "continuation"   # continue, go on → USE MEMORY (needs Threads/Style)
+    FOLLOWUP = "followup"           # what about X? → USE MEMORY (check Tier 2)
     FACTUAL = "factual"             # who is, what is → USE MEMORY
     CREATIVE = "creative"           # write, describe, create → USE MEMORY
     REFERENCE = "reference"         # my novel, my character → USE MEMORY
@@ -58,65 +46,26 @@ class QueryAnalysis:
 
 @dataclass
 class GateDecision:
-    """Result of the full two-tier injection gate.
-
-    Returned by SmartMemory.two_tier_gate(). Contains everything
-    the caller needs to decide whether to retrieve memory context.
-    """
     should_retrieve: bool
-    tier_used: int          # 1 = local only, 2 = Mnemo consulted
+    tier_used: int          
     reason: str
     confidence: float
     query_type: QueryType
     keywords: List[str]
-    mnemo_confidence: float = 0.0  # Tier 2 confidence (0.0 if not consulted)
+    mnemo_confidence: float = 0.0  
 
     @property
     def mode(self) -> str:
-        """Return a short label for metadata display."""
         if not self.should_retrieve:
             return "skip"
         if self.tier_used == 1:
-            return "t1_direct"   # Tier 1 high-confidence → straight to retrieval
-        return "t2_confirmed"    # Tier 2 confirmed retrieval
+            return "t1_direct"   
+        return "t2_confirmed"    
 
-
-# Tier 2 is only consulted when Tier 1 confidence falls below this threshold.
-# Above this: Tier 1 is confident enough to decide alone (saves ~200ms).
-# Below this: Tier 2's semantic check adds real signal.
-#
-# Current confidence map:
-#   REFERENCE=0.95, CREATIVE=0.90  → skip Tier 2 (explicit memory need)
-#   FACTUAL=0.85, NAMES=0.85       → consult Tier 2
-#   GENERAL=0.60                   → consult Tier 2
 TIER_2_THRESHOLD = 0.90
 
 
 class SmartMemory:
-    """
-    Two-tier memory injection gate.
-
-    Primary entry point: two_tier_gate(query, mnemo_client, conversation_length)
-
-    Tier 1 (local, ~0ms):
-      Regex/pattern analysis. High-confidence decisions (greetings,
-      explicit references, creative requests) are returned immediately
-      without a network call. Saves ~200ms on obvious cases.
-
-    Tier 2 (remote, ~200ms):
-      Only called for moderate-confidence Tier 1 results (FACTUAL,
-      named entities, GENERAL queries). Asks Mnemo's /should_inject
-      endpoint whether the query has semantic overlap with stored
-      memories. Can veto retrieval for queries like "what is
-      photosynthesis" that have no stored context.
-
-    Fallback: If mnemo_client is None or unavailable, Tier 1 decision
-    is used directly (same behavior as v5.1).
-
-    Backward compat: should_use_memory() still works as a Tier-1-only
-    gate for callers that don't have a MnemoClient reference.
-    """
-
     # Patterns that DON'T need memory
     GREETING_PATTERNS = [
         r'^(hi|hello|hey|howdy|greetings|good morning|good afternoon|good evening)[\s\!\.\?]*$',
@@ -128,13 +77,13 @@ class SmartMemory:
         r'^(sounds good|makes sense|that works|i agree|exactly|correct|true|false)[\s\!\.\?]*$',
     ]
 
+    # Patterns that NEED memory
     CONTINUATION_PATTERNS = [
         r'^(continue|go on|keep going|more|next|proceed|carry on)[\s\!\.\?]*$',
         r'^(and then|what happens next|then what|go ahead)[\s\!\.\?]*$',
         r'^(continue writing|keep writing|write more|extend this)[\s\!\.\?]*$',
     ]
 
-    # Patterns that NEED memory
     REFERENCE_PATTERNS = [
         r'\b(my|our)\s+(novel|story|book|character|plot|setting|world|outline|project)\b',
         r'\b(the|that)\s+(character|villain|protagonist|antagonist|hero|heroine)\b',
@@ -154,7 +103,6 @@ class SmartMemory:
         r'\b(scene|chapter|dialogue|conversation|story|poem|script)\b',
     ]
 
-    # Named entity indicators (single or multi-word capitalized names)
     NAME_PATTERN = r'\b[A-Z][a-z]{2,}\b'
 
     def __init__(self):
@@ -167,16 +115,6 @@ class SmartMemory:
         self.name_re = re.compile(self.NAME_PATTERN)
 
     def analyze(self, query: str, conversation_length: int = 0) -> QueryAnalysis:
-        """
-        Analyze query to determine if memory search is needed.
-
-        Args:
-            query: The user's message
-            conversation_length: Number of messages in current conversation
-
-        Returns:
-            QueryAnalysis with decision and reasoning
-        """
         query_clean = query.strip()
         keywords = self._extract_keywords(query_clean)
 
@@ -190,10 +128,11 @@ class SmartMemory:
             if pattern.match(query_clean):
                 return QueryAnalysis(QueryType.SIMPLE_RESPONSE, False, 0.95, [], "Simple response - no memory needed")
 
-        # 3. Continuation requests - NO MEMORY
+        # 3. Continuation requests - USE MEMORY (v6.6 FIX: True)
+        # We must retrieve active Threads, Knots, and Tone CPs to continue writing accurately.
         for pattern in self.continuation_re:
             if pattern.match(query_clean):
-                return QueryAnalysis(QueryType.CONTINUATION, False, 0.90, [], "Continuation request - using conversation context")
+                return QueryAnalysis(QueryType.CONTINUATION, True, 0.95, [], "Continuation request - fetching active Threads and Style")
 
         # 4. Reference to stored info - USE MEMORY
         for pattern in self.reference_re:
@@ -229,15 +168,16 @@ class SmartMemory:
             return QueryAnalysis(QueryType.REFERENCE, True, 0.85, real_names + keywords,
                                  f"Named entities detected: {real_names}")
 
-        # 8. Short queries in active conversation - likely follow-up
+        # 8. Short queries in active conversation
+        # v6.6 FIX: Needs to be True with 0.70 confidence so it passes to Tier 2.
+        # This allows the case-insensitive Graph Search to catch lowercase entity names.
         if len(query_clean.split()) <= 5 and conversation_length > 2:
-            return QueryAnalysis(QueryType.FOLLOWUP, False, 0.70, keywords, "Short follow-up in active conversation")
+            return QueryAnalysis(QueryType.FOLLOWUP, True, 0.70, keywords, "Short follow-up in active conversation")
 
         # 9. Default - USE MEMORY for safety
-        return QueryAnalysis(QueryType.GENERAL, True, 0.60, keywords, "General query - using memory for context")
+        return QueryAnalysis(QueryType.GENERAL, True, 0.60, keywords, "General query - passing to Tier 2")
 
     def _extract_keywords(self, query: str) -> List[str]:
-        """Extract meaningful keywords for memory search"""
         stopwords = {
             'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
             'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
@@ -258,44 +198,14 @@ class SmartMemory:
         return [w for w in words if w not in stopwords and len(w) > 2][:10]
 
     def should_use_memory(self, query: str, conversation_length: int = 0) -> Tuple[bool, str]:
-        """Tier 1 only gate — backward compatibility.
-
-        Returns (needs_memory, reason). Use two_tier_gate() for full
-        two-tier analysis when a MnemoClient is available.
-        """
         analysis = self.analyze(query, conversation_length)
         return analysis.needs_memory, analysis.reason
 
     def two_tier_gate(self, query: str, mnemo_client=None,
                       conversation_length: int = 0) -> GateDecision:
-        """Full two-tier injection gate.
-
-        This is the primary entry point for app.py's handle_message().
-
-        Flow:
-          1. Run Tier 1 (local regex analysis)
-          2. If Tier 1 says SKIP → return skip immediately
-          3. If Tier 1 says USE with high confidence (≥ 0.90) → retrieve
-             (explicit references and creative writing always need context)
-          4. If Tier 1 says USE with moderate confidence (< 0.90) →
-             consult Tier 2 (Mnemo /should_inject) for semantic validation
-          5. If Tier 2 vetoes → return skip
-          6. If Tier 2 confirms → return retrieve
-
-        If mnemo_client is None or unavailable, falls back to Tier 1
-        decision for moderate-confidence cases (same as v5.1 behavior).
-
-        Args:
-            query: The user's message.
-            mnemo_client: Optional MnemoClient instance for Tier 2.
-            conversation_length: Number of messages in current conversation.
-
-        Returns:
-            GateDecision with should_retrieve, tier_used, reason, etc.
-        """
         analysis = self.analyze(query, conversation_length)
 
-        # --- Tier 1 SKIP: greetings, acks, continuations, short follow-ups ---
+        # --- Tier 1 SKIP ---
         if not analysis.needs_memory:
             return GateDecision(
                 should_retrieve=False,
@@ -306,7 +216,7 @@ class SmartMemory:
                 keywords=analysis.keywords,
             )
 
-        # --- Tier 1 high-confidence USE: explicit references, creative -------
+        # --- Tier 1 high-confidence USE ---
         if analysis.confidence >= TIER_2_THRESHOLD:
             return GateDecision(
                 should_retrieve=True,
@@ -317,9 +227,8 @@ class SmartMemory:
                 keywords=analysis.keywords,
             )
 
-        # --- Moderate confidence: consult Tier 2 if available ----------------
+        # --- Moderate confidence: consult Tier 2 ---
         if mnemo_client is None:
-            # No client → fall back to Tier 1 decision
             return GateDecision(
                 should_retrieve=True,
                 tier_used=1,
@@ -332,7 +241,6 @@ class SmartMemory:
         try:
             should_inject, inject_reason, inject_confidence = mnemo_client.should_inject(query)
         except Exception:
-            # Tier 2 failed → fall back to Tier 1
             return GateDecision(
                 should_retrieve=True,
                 tier_used=1,
@@ -365,31 +273,14 @@ class SmartMemory:
 
 
 # =============================================================================
-# CONTEXT WINDOW MANAGER (with Loop System Integration)
+# CONTEXT WINDOW MANAGER 
 # =============================================================================
 
 class ContextWindowManager:
-    """
-    Manages context window with INTEGRATED loop system.
-
-    GPT-4o limits:
-    - Context window: 128,000 tokens
-    - Max output: 16,384 tokens
-    - Recommended input: ~100,000 tokens (leave room for output)
-
-    v6.0: build_optimized_context() now accepts active_sessions parameter
-    for session isolation. Passes it through to LoopManager.build_context().
-
-    v5.1: estimate_tokens() delegates to utils.estimate_tokens().
-    Delegates memory retrieval to LoopManager.build_context().
-    """
-
-    # GPT-4o limits
     MAX_CONTEXT = 128_000
     MAX_OUTPUT = 16_384
     SAFE_INPUT_LIMIT = 100_000
 
-    # Token budgets
     BUDGET_SYSTEM_PROMPT = 1_500
     BUDGET_MEMORY_FULL = 3_000
     BUDGET_MEMORY_META = 1_000
@@ -401,18 +292,15 @@ class ContextWindowManager:
         self.loop_manager = loop_manager
 
     def set_loop_manager(self, loop_manager):
-        """Set or update the loop manager"""
         self.loop_manager = loop_manager
 
     def estimate_tokens(self, text: str) -> int:
-        """Estimate token count — delegates to utils.estimate_tokens()."""
         return estimate_tokens(text)
 
     def estimate_messages_tokens(self, messages: List[dict]) -> int:
-        """Estimate tokens for a list of messages"""
         total = 0
         for msg in messages:
-            total += 4  # overhead per message
+            total += 4  
             total += self.estimate_tokens(msg.get("content", ""))
         return total
 
@@ -425,21 +313,6 @@ class ContextWindowManager:
         use_loops: bool = True,
         active_sessions: list = None,
     ) -> Tuple[List[dict], dict]:
-        """
-        Build fully optimized context with loop-based memory.
-
-        v6.0: Accepts active_sessions for session isolation. Passes it
-        through to LoopManager.build_context() which filters tokens.
-
-        Combines:
-        1. System prompt
-        2. Loop-based memory injection (delegated to LoopManager)
-        3. Conversation history (limited to max_messages)
-        4. Current query
-
-        Returns:
-            (messages_list, stats_dict)
-        """
         stats = {
             "system_tokens": 0,
             "memory_full_tokens": 0,
@@ -457,24 +330,20 @@ class ContextWindowManager:
         enhanced_system = system_prompt
         stats["system_tokens"] = self.estimate_tokens(system_prompt)
 
-        # Delegate memory context to LoopManager.build_context()
         if use_loops and self.loop_manager:
-            # v6.0: Pass active_sessions for session isolation filter
             context_string, loop_meta = self.loop_manager.build_context(
                 query, active_sessions=active_sessions
             )
             if context_string:
                 enhanced_system = f"{system_prompt}\n\n{context_string}"
 
-            stats["memory_full_tokens"] = loop_meta.get("full_content_injected", 0) * 50  # estimate
+            stats["memory_full_tokens"] = loop_meta.get("full_content_injected", 0) * 50  
             stats["memory_meta_tokens"] = loop_meta.get("metadata_injected", 0) * 15
             stats["memory_items_full"] = loop_meta.get("full_content_injected", 0)
             stats["memory_items_meta"] = loop_meta.get("metadata_injected", 0)
 
-        # Build messages array
         messages = [{"role": "system", "content": enhanced_system}]
 
-        # Conversation history (limited)
         recent_history = conversation_history[-max_messages:]
         stats["conversation_messages"] = len(recent_history)
 
@@ -486,7 +355,6 @@ class ContextWindowManager:
 
         stats["conversation_tokens"] = self.estimate_messages_tokens(recent_history)
 
-        # Add current query only if not already the last message
         if (not recent_history
                 or recent_history[-1].get("content") != query
                 or recent_history[-1].get("role") != "user"):
