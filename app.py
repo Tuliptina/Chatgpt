@@ -63,7 +63,6 @@ WRITING_PARAMS = {
     "repetition_penalty": 1.1,
     "frequency_penalty": 0.2,
     "presence_penalty": 0.3,
-    "max_tokens": 4000,
 }
 
 MEMORY_PARAMS = {
