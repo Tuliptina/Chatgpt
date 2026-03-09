@@ -418,62 +418,46 @@ def extract_text_from_file(uploaded_file):
     return content
 
 async def process_chunk_async(http_client, chunk, filename, i, total_chunks, openrouter_key):
-    """v6.0: Routes to MEMORY_MODEL_ID. All 4 layers with mandatory deep context."""
+    """v6.1: W-method extraction — asks W questions about every fact in the document."""
     chunk_label = f" (part {i+1}/{total_chunks})" if total_chunks > 1 else ""
-    prompt = f"""Analyze this document and extract everything worth remembering.
+    prompt = f"""Extract structured memories from this document by asking the W questions about everything mentioned.
 
 DOCUMENT: {filename}{chunk_label}
 
 CONTENT:
 {chunk}
 
-RULES:
-- CONSOLIDATE related facts into single rich entries. One entry per character, per plot arc, per theme.
-- Each memory should be 1-3 sentences with CONTEXT — not bare facts.
-- Include WHY things matter narratively, not just WHAT they are.
-- You MUST include CONTEXT, RELATIONSHIP, and CLARIFICATION entries — not just CHARACTER/PLOT facts.
-- At least 30% of entries should be LAYER 2 (CONTEXT, RELATIONSHIP, CLARIFICATION, INSTRUCTION).
+METHOD — For every character, event, faction, place, or rule mentioned, ask:
+  WHO is this? → CHARACTER entry (traits, fears, motivations, background)
+  WHAT happened / what do they do? → PLOT entry (events, schemes, outcomes)
+  WHOM do they connect to? → RELATIONSHIP entry (dynamics, power balance, emotional undercurrent)
+  WHY does it matter? → CONTEXT entry (deeper meaning, narrative function, what could be misread)
+  WHERE does it happen? → SETTING entry (location, atmosphere, sensory detail)
+  WHEN in the timeline? → PLOT entry (sequence, book number, what precedes/follows)
+  HOW should it feel on the page? → TONE entry (register, humor type, do-nots)
+  WHOSE interpretation could go wrong? → CLARIFICATION entry (prevent specific misreadings)
 
-AGENT ATTRIBUTION — critical for accuracy:
-- Always specify WHO does WHAT to WHOM. Never say "tattooing happens" — say "ISABELLA tattoos Sebastian."
-- When multiple characters are involved in a sequence, name each person's specific role.
-- Always specify OUTCOMES: does a rescue succeed or fail? Does a plan work or backfire?
-- When two characters could plausibly do the same thing, explicitly say which one does it.
-- BAD: "captivity involves tattooing and drug protocols"
-- GOOD: "ALISTAIR manages drug protocols; ISABELLA performs the ritual tattooing"
+Apply every applicable W to every entity. If the text mentions 5 characters, that's potentially 5 WHO + 5 HOW + multiple WHOM entries. Let the content drive the count.
 
-LAYER 1 — FACTS:
-- CHARACTER: Who they are, traits, fears, motivations — one entry per character
-- PLOT: What happened, why it matters, what it sets up
-- SETTING: Where/when, atmosphere
-- THEME: Recurring ideas, symbols
-- FACT: Other important details
+ENTRY FORMAT:
+  {{"entity": "Name", "category": "CATEGORY", "content": "1-3 sentence answer"}}
+  Add "connects_to": "OtherName" only for RELATIONSHIP entries.
 
-LAYER 2 — DEEP CONTEXT (MANDATORY — include at least 2-3 of these):
-- CONTEXT: Why something matters, what could be misunderstood, deeper meaning
-- RELATIONSHIP: How two characters relate — dynamics, power balance, emotional undercurrent
-- CLARIFICATION: "When X happens, it means Y, NOT Z" — prevents misinterpretation
-- INSTRUCTION: Explicit rules about how to write/handle something
+CATEGORIES: CHARACTER, PLOT, SETTING, THEME, FACT, CONTEXT, CLARIFICATION, RELATIONSHIP, INSTRUCTION, STYLE, TONE
 
-LAYER 3 — STYLE:
-- PROSE_SAMPLE / DIALOGUE_SAMPLE / VOICE / VOCABULARY
-
-LAYER 4 — TONE:
-- TONE: How scenes should feel, humor types, emotional registers, do-nots
-
-EXAMPLES (notice the mix of layers — each has an entity):
-  {{"entity": "Alistair", "category": "CHARACTER", "content": "Late 30s pharmacology professor, Red Rose manipulator. Driven by fear of being forgotten. Terrified of developing dementia like his father."}}
-  {{"entity": "Alistair", "connects_to": "Sebastian", "category": "RELATIONSHIP", "content": "Former friend turned captor. Alistair frames captivity as medical care. Their dynamic is intellectual chess — Alistair respects Sebastian's mind while destroying his autonomy."}}
-  {{"entity": "Alistair", "connects_to": "Elijah", "category": "RELATIONSHIP", "content": "Estranged brothers. Alistair envies Elijah's peace and spiritual conviction. Their father disowned Elijah — Alistair secretly resents that Elijah escaped while he inherited the burden."}}
-  {{"entity": "Red Rose Society", "category": "CONTEXT", "content": "NOT a simple villain organization. It's a decentralized medical order practicing social Darwinism — members believe they're advancing humanity through controlled suffering. Writing them as mustache-twirling villains undermines the story's philosophical spine."}}
-  {{"entity": "Sebastian", "category": "CLARIFICATION", "content": "When Sebastian goes quiet in a scene, it signals dissociation — a trauma response. Never write his silence as peaceful acceptance or stoic strength. It's shutdown, not calm."}}
-  {{"entity": "Story", "category": "CONTEXT", "content": "The legal-ethical gap is the series' central philosophical spine: what is ethical is not always legal, and vice versa. Every faction represents a different position on this spectrum."}}
-  {{"entity": "Alistair", "category": "TONE", "content": "Alistair's scenes: clinical precision, cold menace. Power through control, never raised voices. His humor is dry and cutting — it should make the reader uneasy, not laugh."}}
+EXAMPLE — if text mentions "Isabella orchestrates a ritual pregnancy using Sebastian's blood":
+  WHO: {{"entity": "Isabella", "category": "CHARACTER", "content": "Cult founder who fuses medicine with occultism. Views Sebastian as raw material for transcendence, not a person."}}
+  WHAT: {{"entity": "Isabella", "category": "PLOT", "content": "Orchestrates ritual pregnancy using Sebastian's blood and arcane protocols. The child is a living experiment, not born from love."}}
+  WHOM: {{"entity": "Isabella", "connects_to": "Sebastian", "category": "RELATIONSHIP", "content": "Captor and symbolic spouse. Her devotion is coercion dressed as care — she seduces with tenderness while embedding control."}}
+  WHY: {{"entity": "Story", "category": "CONTEXT", "content": "The ritual pregnancy critiques how women's reproductive power can be weaponized by ideology — Isabella is both perpetrator and product of patriarchal science's rejection."}}
+  HOW: {{"entity": "Isabella", "category": "TONE", "content": "Devotional menace. Breastfeeding as sacrament. The horror comes from her sincerity, not cruelty — she genuinely believes she's saving him."}}
+  WHOSE: {{"entity": "Sebastian", "category": "CLARIFICATION", "content": "Sebastian did NOT consent to fatherhood. The child is conceived through ritual coercion. Never frame this as a love story."}}
+  WHERE: {{"entity": "Blackwood Estate", "category": "SETTING", "content": "Gothic manor blending clinical sterility with occult intimacy. Medical equipment beside ritual altars. White linens stained with ink and blood."}}
 
 Return ONLY a JSON object:
 {{
   "memories": [
-    {{"entity": "Name or Story", "category": "CATEGORY", "content": "consolidated entry", "connects_to": "optional target entity"}}
+    {{"entity": "Name", "category": "CATEGORY", "content": "information"}}
   ]
 }}"""
 
@@ -494,7 +478,12 @@ Return ONLY a JSON object:
         raw = data["choices"][0]["message"]["content"]
         usage = data.get("usage", {})
         cost = (usage.get("prompt_tokens", 0) * 0.47 + usage.get("completion_tokens", 0) * 2.00) / 1_000_000
-        parsed = json.loads(raw)
+        clean = raw.strip()
+        if clean.startswith("```"):
+            clean = clean.split("\n", 1)[-1]
+            if clean.endswith("```"):
+                clean = clean[:-3]
+        parsed = json.loads(clean.strip())
         return parsed.get("memories", []), cost
     except Exception:
         return [], 0
@@ -553,63 +542,42 @@ def extract_memories_from_file(content, filename, openrouter_key):
 # ============================================================================
 
 def extract_memories_with_gpt(conversation, openrouter_key):
-    """v6.0: Routes to MEMORY_MODEL_ID for extraction. All 4 layers including deep context."""
-    prompt = f"""Analyze this conversation and extract what's worth remembering long-term.
+    """v6.1: W-method extraction — content density drives yield, not thresholds."""
+    prompt = f"""Extract structured memories from this conversation by asking the W questions about everything mentioned.
 
 CONVERSATION:
 {conversation}
 
-RULES:
-- CONSOLIDATE related facts into single rich entries. Do NOT split into atomic fragments.
-- Each memory should be a self-contained paragraph with CONTEXT, not a bare fact.
-- Combine character traits, relationships, and details into one entry per character.
-- Include WHY things matter, not just WHAT they are.
-- Aim for 3-10 memories, each 1-3 sentences long.
-- If a fact is trivial or obvious from context, skip it.
-- ALWAYS extract at least one CONTEXT or RELATIONSHIP entry if characters interact.
-- At least 30% of entries should be LAYER 2 (CONTEXT, RELATIONSHIP, CLARIFICATION).
+METHOD — For every character, event, or topic mentioned, ask:
+  WHO is this? → CHARACTER entry (traits, fears, motivations)
+  WHAT happened? → PLOT entry (events, outcomes, consequences)
+  WHOM do they affect/relate to? → RELATIONSHIP entry (dynamics, power, emotion)
+  WHY does it matter? → CONTEXT entry (deeper meaning, what could be misunderstood)
+  WHERE does it happen? → SETTING entry (location, atmosphere)
+  WHEN in the timeline? → PLOT entry (sequence, what comes before/after)
+  HOW should it feel? → TONE entry (emotional register, humor type, do-nots)
+  WHOSE rule or instruction? → CLARIFICATION entry (prevent misinterpretation)
 
-AGENT ATTRIBUTION — critical for accuracy:
-- Always specify WHO does WHAT to WHOM. Never say "the rescue fails" — say "EVELYN's rescue of Sebastian succeeds/fails."
-- When multiple characters are involved, name each person's specific role.
-- Always specify OUTCOMES: does something succeed or fail? What's the result?
-- BAD: "captivity involves tattooing and drug protocols"
-- GOOD: "ALISTAIR manages drug protocols; ISABELLA performs the ritual tattooing — their roles are distinct"
+Not every W applies to every fact. Skip what doesn't fit. But if a W applies, create the entry.
 
-Extract in ALL 4 layers:
+ENTRY FORMAT:
+  {{"entity": "Name", "category": "CATEGORY", "content": "1-3 sentence answer to the W question"}}
+  Add "connects_to": "OtherName" only for RELATIONSHIP entries.
 
-LAYER 1 — FACTS:
-- CHARACTER: Who they are, traits, fears, motivations — one entry per character
-- PLOT: What happened, why it matters, what it sets up
-- SETTING: Where/when, atmosphere, sensory details
-- THEME: Recurring ideas, symbols, philosophical tensions
-- FACT: Other important details
+CATEGORIES: CHARACTER, PLOT, SETTING, THEME, FACT, CONTEXT, CLARIFICATION, RELATIONSHIP, INSTRUCTION, STYLE, TONE
 
-LAYER 2 — DEEP CONTEXT (critical for preventing misinterpretation):
-- CONTEXT: Deeper meaning behind a fact that could be misunderstood without explanation
-- CLARIFICATION: "When X is mentioned, it means Y, NOT Z" — prevents common misreadings
-- RELATIONSHIP: "A → B: nature of relationship, dynamics, power balance, emotional undercurrent"
-- INSTRUCTION: Explicit user instructions about how to write/handle something
-
-LAYER 3 — STYLE:
-- STYLE: Writing voice, prose patterns, dialogue quirks, vocabulary preferences
-
-LAYER 4 — TONE:
-- TONE: How scenes should FEEL — emotional registers, humor types, do-nots
-
-BAD example (too fragmented, no context layer):
-  {{"category": "CHARACTER", "content": "Sebastian is a doctor"}}
-  {{"category": "CHARACTER", "content": "Alistair is Sebastian's rival"}}
-
-GOOD example (consolidated with context layer):
-  {{"entity": "Sebastian", "category": "CHARACTER", "content": "Sebastian Carlisle is a late-20s anatomy lecturer at St Bartholomew's with a working-class background. He uses dry, dark humor as a coping mechanism — it should cut, not charm. He dissociates under stress rather than emoting."}}
-  {{"entity": "Alistair", "connects_to": "Sebastian", "category": "RELATIONSHIP", "content": "Former friend turned captor. Alistair frames the captivity as medical care — their dynamic is intellectual chess. Alistair respects Sebastian's mind while systematically destroying his autonomy."}}
-  {{"entity": "Sebastian", "category": "CONTEXT", "content": "When Sebastian goes quiet in a scene, it signals dissociation, not calm. His silence is a trauma response — never write it as peaceful acceptance."}}
+EXAMPLE — if the conversation mentions "Alistair drugs Sebastian during captivity":
+  WHO: {{"entity": "Alistair", "category": "CHARACTER", "content": "Pharmacology professor who uses drug protocols as control. Frames coercion as mentorship."}}
+  WHAT: {{"entity": "Sebastian", "category": "PLOT", "content": "Alistair administers escalating drug regimen during Blackwood Estate captivity, creating enforced dependency."}}
+  WHOM: {{"entity": "Alistair", "connects_to": "Sebastian", "category": "RELATIONSHIP", "content": "Captor and former friend. Alistair respects Sebastian's intellect while systematically destroying his autonomy through pharmacological control."}}
+  WHY: {{"entity": "Story", "category": "CONTEXT", "content": "The drug protocols critique how Victorian medical authority can be weaponized — 'treatment' as ownership."}}
+  HOW: {{"entity": "Alistair", "category": "TONE", "content": "Drug scenes should feel clinical and methodical. Alistair's calm is the horror — no raised voices, no visible cruelty."}}
+  WHOSE: {{"entity": "Sebastian", "category": "CLARIFICATION", "content": "Sebastian's trembling under drugs is bodily accusation, not weakness. Never write it as willing submission."}}
 
 Return ONLY a JSON object:
 {{
   "memories": [
-    {{"entity": "Name or Story", "category": "CATEGORY", "content": "consolidated fact with context", "connects_to": "optional target entity for relationships"}}
+    {{"entity": "Name", "category": "CATEGORY", "content": "information"}}
   ]
 }}"""
 
@@ -621,9 +589,8 @@ Return ONLY a JSON object:
                 "model": MEMORY_MODEL_ID,
                 "messages": [{"role": "user", "content": prompt}],
                 **MEMORY_PARAMS,
-                "max_tokens": 1500,
             },
-            timeout=45
+            timeout=60
         )
         if response.status_code != 200:
             return [], 0
@@ -631,7 +598,12 @@ Return ONLY a JSON object:
         raw = data["choices"][0]["message"]["content"]
         usage = data.get("usage", {})
         cost = (usage.get("prompt_tokens", 0) * 0.47 + usage.get("completion_tokens", 0) * 2.00) / 1_000_000
-        parsed = json.loads(raw)
+        clean = raw.strip()
+        if clean.startswith("```"):
+            clean = clean.split("\n", 1)[-1]
+            if clean.endswith("```"):
+                clean = clean[:-3]
+        parsed = json.loads(clean.strip())
         return parsed.get("memories", []), cost
     except Exception:
         return [], 0
