@@ -1,11 +1,13 @@
 """
-4o with Memory v6.3.1 — Dual-Processor Creative Writing Engine
+4o with Memory v6.4 — Dual-Processor Creative Writing Engine
 
-v6.3.1 changes:
-- FIX: Auto-capitalize lowercase entities (prevents K2 memories collapsing into "Story")
-- FIX: Pass memory_id=cp_id to add_to_loop so full content isn't dropped from context window
+v6.4 changes:
+- FIX: Thread Retrieval! Context engine now pulls chronological Narrative Threads 
+  first before falling back to scattershot graph search.
+- FIX: Increased Graph Search top_k from 12 -> 40 to prevent Context Starvation.
+- Contains all v6.3 fixes (Auto-capitalize entities, memory_id caching).
 
-Prior: DUAL MODEL (K2 + 4o), session isolation, threads & knots, CPs.
+Prior: DUAL MODEL (K2 + 4o), session isolation, prefetch predictive caching.
 """
 
 import streamlit as st
@@ -140,7 +142,6 @@ def normalize_entity(raw_entity: str) -> str:
     if len(ew) == 1 and ew[0] in NON_ENTITY_WORDS:
         return "Story"
     
-    # v6.3.1 FIX: Auto-capitalize instead of destroying lowercase entities
     words = entity.split()
     if not any(w[0].isupper() for w in words if len(w) > 0):
         entity = entity.title()
@@ -209,24 +210,24 @@ SYSTEM_PROMPT = """You are a sharp, well-read creative collaborator with genuine
 MODE 1 — CONVERSATION (chatting about the project, brainstorming, planning):
 - You're the kind of collaborator writers actually enjoy working with — curious, opinionated about craft, and genuinely invested in their story.
 - Have real opinions. If a plot idea is predictable, say so with charm, then pitch something better. If a character detail is brilliant, get excited about it.
-- Be witty when the moment allows, but never at the expense of the work. Your humor should make the writer smile, not feel patronized.
+- Be witty when the moment allows, but never at the expense of the work.
 - Ask questions that show you're thinking ahead.
 - Use casual, intelligent language. You're a peer, not a tutor. Skip the preambles.
 - Reference their stored characters and plot points naturally.
 - CRITICAL — know the difference between RECALLING and CREATING.
 
 MODE 2 — RECALL & RETRIEVAL (user asks to recall, list, summarize):
-- Give clean, factual answers drawn from your memory context
-- Use EXACT details from memory — do NOT embellish, infer, or fill gaps with imagination
+- Give clean, factual answers drawn from your memory context.
+- Use EXACT details from memory — do NOT embellish, infer, or fill gaps with imagination.
 
 MODE 3 — CREATIVE WRITING (scenes, chapters, dialogue, prose):
 - Your personality DISAPPEARS. You are not "witty" — you are the story.
 - Match the tonal register from the [TONE DIRECTIVE] in your context. Dark stays dark. Humor cuts. Tension holds.
-- Deep psychological complexity in characters
-- Setting-accurate language for the project's period/genre
+- Deep psychological complexity in characters.
+- Setting-accurate language for the project's period/genre.
 - Show don't tell. Sensory detail. Subtext in dialogue.
-- Default to third person past tense unless user or memory specifies otherwise
-- Match the user's writing voice if VOICE/PROSE_SAMPLE memories exist
+- Default to third person past tense unless user or memory specifies otherwise.
+- Match the user's writing voice if VOICE/PROSE_SAMPLE memories exist.
 - NEVER soften emotional edges.
 - DO NOT resolve tension prematurely. DO NOT add reassuring internal monologue unless the brief says to.
 
@@ -347,7 +348,7 @@ def rename_session_dialog(session_id, current_title):
     new_name = st.text_input("New name:", value=current_title, key=f"rename_input_{session_id}")
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("\U0001f4be Save", use_container_width=True):
+        if st.button("💾 Save", use_container_width=True):
             if new_name and new_name.strip():
                 new_title = new_name.strip()
                 if "custom_titles" not in st.session_state:
@@ -365,7 +366,7 @@ def rename_session_dialog(session_id, current_title):
                     save_current_session()
             st.rerun()
     with col2:
-        if st.button("\u274c Cancel", use_container_width=True):
+        if st.button("❌ Cancel", use_container_width=True):
             st.rerun()
 
 @st.dialog("Move Session")
@@ -374,7 +375,7 @@ def move_session_dialog(session_id):
     target_folder = st.selectbox("Move to:", folders, key=f"move_target_{session_id}")
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("\U0001f4c2 Move", use_container_width=True):
+        if st.button("📁 Move", use_container_width=True):
             for f in st.session_state.session_folders:
                 if session_id in st.session_state.session_folders[f]:
                     st.session_state.session_folders[f].remove(session_id)
@@ -384,14 +385,14 @@ def move_session_dialog(session_id):
                 storage.save_folder_state(st.session_state.session_folders)
             st.rerun()
     with col2:
-        if st.button("\u274c Cancel", use_container_width=True):
+        if st.button("❌ Cancel", use_container_width=True):
             st.rerun()
 
 @st.dialog("Copy Response")
 def copy_response_dialog(content):
-    st.markdown("**\U0001f4cb Copy this text:**")
+    st.markdown("**📋 Copy this text:**")
     st.code(content, language=None)
-    if st.button("\u2705 Done", use_container_width=True):
+    if st.button("✅ Done", use_container_width=True):
         st.rerun()
 
 # ============================================================================
@@ -443,29 +444,25 @@ CONTENT:
 {chunk}
 
 METHOD — For every character, event, faction, place, or rule mentioned, ask:
-  WHO is this? → CHARACTER entry (traits, fears, motivations, background)
-  WHAT happened / what do they do? → PLOT entry (events, schemes, outcomes)
-  WHOM do they connect to? → RELATIONSHIP entry (dynamics, power balance, emotional undercurrent)
-  WHY does it matter? → CONTEXT entry (deeper meaning, narrative function, what could be misread)
-  WHERE does it happen? → SETTING entry (location, atmosphere, sensory detail)
-  WHEN in the timeline? → PLOT entry (sequence, book number, what precedes/follows)
-  HOW should it feel on the page? → TONE entry (register, humor type, do-nots)
-  WHOSE interpretation could go wrong? → CLARIFICATION entry (prevent specific misreadings)
+  WHO is this? → CHARACTER entry
+  WHAT happened / what do they do? → PLOT entry
+  WHOM do they connect to? → RELATIONSHIP entry
+  WHY does it matter? → CONTEXT entry
+  WHERE does it happen? → SETTING entry
+  WHEN in the timeline? → PLOT entry
+  HOW should it feel on the page? → TONE entry
+  WHOSE interpretation could go wrong? → CLARIFICATION entry
 
 CRITICAL ENTITY NAMING RULES:
   - Use plain names: "Sebastian Carlisle", NOT "Dr. Sebastian Carlisle"
   - NO titles: "Elijah Cartwright", NOT "Reverend Elijah Cartwright"
   - NO articles: "Midnight Salon", NOT "The Midnight Salon"
   - NO category prefixes: entity="Sebastian", NOT "Clarification: Sebastian"
-  - For organizations: "Red Rose Society", "Progressive Women's Society"
-  - For concepts without a named entity: use "Story" as the entity
   - Entity is a LOOKUP KEY for indexing. Keep it short and consistent.
 
 ENTRY FORMAT:
   {{"entity": "Name", "category": "CATEGORY", "content": "1-3 sentence answer"}}
   Add "connects_to": "OtherName" only for RELATIONSHIP entries.
-
-CATEGORIES: CHARACTER, PLOT, SETTING, THEME, FACT, CONTEXT, CLARIFICATION, RELATIONSHIP, INSTRUCTION, STYLE, TONE
 
 Return ONLY a JSON object:
 {{
@@ -572,15 +569,11 @@ CRITICAL ENTITY NAMING RULES:
   - NO titles: "Elijah Cartwright", NOT "Reverend Elijah Cartwright"  
   - NO articles: "Midnight Salon", NOT "The Midnight Salon"
   - NO category prefixes: entity="Sebastian", NOT "Clarification: Sebastian"
-  - For organizations: "Red Rose Society", "Progressive Women's Society"
-  - For concepts without a named entity: use "Story" as the entity
   - Entity is a LOOKUP KEY for indexing. Keep it short and consistent.
 
 ENTRY FORMAT:
   {{"entity": "Name", "category": "CATEGORY", "content": "1-3 sentence answer"}}
   Add "connects_to": "OtherName" only for RELATIONSHIP entries.
-
-CATEGORIES: CHARACTER, PLOT, SETTING, THEME, FACT, CONTEXT, CLARIFICATION, RELATIONSHIP, INSTRUCTION, STYLE, TONE
 
 Return ONLY a JSON object:
 {{
@@ -663,8 +656,9 @@ class CostTracker:
         return cost
 
 def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops, loop_manager, context_engine):
+    """v6.4: Includes Thread Retrieval + 40-CP Graph Search"""
     context_parts = []
-    metadata = {"sessions_found": 0, "skip_loops": False}
+    metadata = {"sessions_found": 0, "skip_loops": False, "threads_injected": 0}
     if not cross_session_enabled:
         return "", metadata, False
     storage = get_persistent_storage()
@@ -715,12 +709,65 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
             isolate = st.session_state.get("isolate_sessions", False)
             active_sessions = [current_session_id] if isolate and current_session_id else None
 
-            cp_results = mnemo_client.graph_search(prompt, top_k=12, active_sessions=active_sessions)
+            # =====================================================================
+            # NEW v6.4 FIX: THREAD RETRIEVAL (The Spine)
+            # Check if any active threads are relevant to the query
+            # =====================================================================
+            try:
+                active_threads = mnemo_client.get_active_threads()
+                if active_threads:
+                    query_words = set(re.sub(r'[^\w\s]', '', prompt_lower).split())
+                    matched_threads = []
+                    
+                    for t in active_threads:
+                        t_name_words = set(t.get("name", "").lower().split())
+                        t_entity = t.get("entity", "").lower()
+                        # Match if query explicitly names the thread's entity or overlaps its name
+                        if t_entity in query_words or any(w in query_words for w in t_name_words if len(w) > 3):
+                            matched_threads.append(t)
+                    
+                    if matched_threads:
+                        thread_context_lines = []
+                        for t in matched_threads:
+                            tid = t.get("id")
+                            tname = t.get("name")
+                            pos = t.get("current_position", -1)
+                            
+                            # Trace back 8 steps to get the recent chronological arc
+                            traced_cps = mnemo_client.trace_thread(tid, direction="back", steps=8, from_position=pos)
+                            
+                            if traced_cps:
+                                thread_context_lines.append(f"### NARRATIVE THREAD: {tname}")
+                                for cp in traced_cps:
+                                    entity = cp.get("entity", "")
+                                    value = cp.get("value", "")
+                                    pt = cp.get("point_type", "")
+                                    conn = cp.get("connects_to", "")
+                                    
+                                    if conn:
+                                        line = f"  - {entity} — {pt} → {conn}: {value}"
+                                    else:
+                                        line = f"  - {entity} — {pt}: {value}"
+                                    thread_context_lines.append(line)
+                                thread_context_lines.append("") # Spacer
+                        
+                        if thread_context_lines:
+                            context_parts.append("\n\n[ACTIVE NARRATIVE THREADS - Chronological Order]\n" + "\n".join(thread_context_lines))
+                            metadata["threads_injected"] = len(matched_threads)
+            except Exception as thread_e:
+                print(f"[WARN] Thread Retrieval failed: {thread_e}")
+
+            # =====================================================================
+            # GRAPH SEARCH (The Scattershot Context)
+            # v6.4 FIX: top_k bumped from 12 to 40 to prevent Context Starvation
+            # =====================================================================
+            cp_results = mnemo_client.graph_search(prompt, top_k=40, active_sessions=active_sessions)
 
             writing_keywords = ["write", "scene", "chapter", "story", "prose", "dialogue", "style",
                                 "continue", "next", "more", "go on", "keep going", "extend"]
-            if any(kw in prompt.lower() for kw in writing_keywords):
-                style_cps = mnemo_client.graph_search("prose voice dialogue style tone", top_k=5, active_sessions=active_sessions)
+            if any(kw in prompt_lower for kw in writing_keywords):
+                # v6.4 FIX: Style top_k bumped to 10
+                style_cps = mnemo_client.graph_search("prose voice dialogue style tone", top_k=10, active_sessions=active_sessions)
                 seen_ids = {r.get("id") for r in cp_results}
                 for cp in style_cps:
                     if cp.get("id") not in seen_ids:
@@ -815,6 +862,8 @@ def handle_message(prompt, openrouter_key, mnemo_client):
         "context_tokens": context_stats.get("total_tokens", 0),
         "mode": gate.mode, "memory_reason": gate.reason,
         "sessions_found": sessions_found, "gate_tier": gate.tier_used,
+        "threads_injected": ctx_meta.get("threads_injected", 0) if 'ctx_meta' in locals() else 0,
+        "cp_results": ctx_meta.get("cp_results", 0) if 'ctx_meta' in locals() else 0,
     }
 
     response, input_tokens, output_tokens, error = call_openrouter(messages, openrouter_key, mode="writing")
@@ -882,7 +931,6 @@ def handle_message(prompt, openrouter_key, mnemo_client):
                             cp_id = future.result()
                             if cp_id:
                                 extracted += 1
-                                # v6.3.1 FIX: Added memory_id=cp_id
                                 st.session_state.loop_manager.add_to_loop(
                                     content=txt, category=cat_name.lower(),
                                     session_id=current_session_id, memory_id=cp_id)
@@ -896,6 +944,8 @@ def handle_message(prompt, openrouter_key, mnemo_client):
         "extracted": extracted, "cost": msg_cost,
         "sessions_found": sessions_found,
         "gate_tier": context_meta.get("gate_tier", 1),
+        "threads_injected": context_meta.get("threads_injected", 0),
+        "cp_results": context_meta.get("cp_results", 0),
     }
     return response, None, result_meta
 
@@ -1059,7 +1109,6 @@ def render_memory_management(mnemo_client):
                                     session_id=current_session, source="manual")
                 if cp_id:
                     st.success(f"✅ Saved [{memory_category}] for {memory_entity}")
-                    # v6.3.1 FIX: Added memory_id=cp_id
                     st.session_state.loop_manager.add_to_loop(
                         content=memory_content, category=memory_category.lower(),
                         session_id=current_session, memory_id=cp_id)
@@ -1195,7 +1244,6 @@ def render_file_upload(mnemo_client, openrouter_key):
                                         cp_id = future.result()
                                         if cp_id:
                                             stored += 1
-                                            # v6.3.1 FIX: Added memory_id=cp_id
                                             st.session_state.loop_manager.add_to_loop(
                                                 content=txt, category=cat_name.lower(),
                                                 session_id=current_session, memory_id=cp_id)
@@ -1266,6 +1314,8 @@ def render_chat(openrouter_key, mnemo_client):
                     if "metadata" in message:
                         meta = message["metadata"]
                         memory_info = []
+                        if meta.get("threads_injected", 0) > 0:
+                            memory_info.append(f"🧵 {meta['threads_injected']} threads")
                         if meta.get("cross_session_memories_used", 0) > 0:
                             memory_info.append(f"📚 {meta['cross_session_memories_used']} memories")
                         if meta.get("cp_results", 0) > 0:
@@ -1302,6 +1352,8 @@ def render_chat(openrouter_key, mnemo_client):
                 meta_parts = []
                 if result_meta.get("sessions_found", 0) > 0:
                     meta_parts.append(f"📜 {result_meta['sessions_found']} past chats")
+                if result_meta.get("threads_injected", 0) > 0:
+                    meta_parts.append(f"🧵 {result_meta['threads_injected']} threads")
                 if result_meta.get("cross_session_memories_used", 0) > 0:
                     meta_parts.append(f"📚 {result_meta['cross_session_memories_used']} memories")
                 if result_meta.get("cp_results", 0) > 0:
@@ -1366,7 +1418,7 @@ def main():
         <div class="brand-icon">🧠</div>
         <div class="brand-text">
             <h1>4o with Memory</h1>
-            <p>GPT-4o writer · K2 memory curator · Mnemo v6.3.1</p>
+            <p>GPT-4o writer · K2 memory curator · Mnemo v6.4</p>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1449,7 +1501,7 @@ def main():
 
     st.markdown(f"""
     <div class="status-bar">
-        4o with Memory v6.3.1 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Threads & Knots &nbsp;·&nbsp; Graph Search
+        4o with Memory v6.4 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Threads & Knots &nbsp;·&nbsp; Graph Search
     </div>
     """, unsafe_allow_html=True)
 
