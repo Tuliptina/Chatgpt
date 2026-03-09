@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from mnemo_client import MnemoClient
 
 # v6.3 FIX: Updated model ID
-MEMORY_MODEL_ID = "moonshotai/kimi-k2"
+MEMORY_MODEL_ID = "moonshotai/kimi-k2-0905"
 
 
 # =============================================================================
