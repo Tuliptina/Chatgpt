@@ -275,8 +275,6 @@ class MnemoClient:
     def graph_search(self, query: str, top_k: int = 15, active_sessions: List[str] = None) -> List[Dict]:
         """Graph search for ConnectionPoints. Returns list of CP dicts."""
         sessions_str = json.dumps(active_sessions) if active_sessions else "[]"
-        
-        # Pass the 3rd argument to the API
         result = self._call("graph_search_api", query, str(top_k), sessions_str)
         if result and isinstance(result, list):
             return result
