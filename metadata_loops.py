@@ -266,35 +266,84 @@ class LoopManager:
 
     def load_from_mnemo(self, use_smart_extraction: bool = False):
         """Load memories from Mnemo via MnemoClient and convert to metadata tokens.
+        v6.1: Reads BOTH legacy blobs AND ConnectionPoints.
         v6.0: Extracts session_id from metadata. Detects TONE category.
         """
-        memories = self.mnemo.list_memories()
-        for mem in memories:
-            content = mem.get("content", "")
-            mem_id = mem.get("id", "")
-            mem_meta = mem.get("metadata", {})
-            session_id = mem_meta.get("session_id", "")
+        # --- Load legacy blob memories ---
+        try:
+            memories = self.mnemo.list_memories()
+            for mem in memories:
+                content = mem.get("content", "")
+                mem_id = mem.get("id", "")
+                mem_meta = mem.get("metadata", {})
+                session_id = mem_meta.get("session_id", "")
 
-            category = "general"
-            cl = content.lower()
-            if "[character]" in cl: category = "character"
-            elif "[plot]" in cl: category = "plot"
-            elif "[setting]" in cl: category = "setting"
-            elif "[theme]" in cl: category = "theme"
-            elif "[style]" in cl: category = "style"
-            elif "[tone]" in cl: category = "tone"
-            elif "[fact]" in cl: category = "fact"
+                category = "general"
+                cl = content.lower()
+                if "[character]" in cl: category = "character"
+                elif "[plot]" in cl: category = "plot"
+                elif "[setting]" in cl: category = "setting"
+                elif "[theme]" in cl: category = "theme"
+                elif "[style]" in cl: category = "style"
+                elif "[tone]" in cl: category = "tone"
+                elif "[fact]" in cl: category = "fact"
 
-            if use_smart_extraction:
-                token = self.extractor.extract_smart(content, category)
-            else:
-                token = self.extractor.extract_simple(content, category)
-            token.full_content_ref = mem_id
-            token.session_id = session_id  # v6.0: Track session ownership
+                if use_smart_extraction:
+                    token = self.extractor.extract_smart(content, category)
+                else:
+                    token = self.extractor.extract_simple(content, category)
+                token.full_content_ref = mem_id
+                token.session_id = session_id
 
-            if category in self.loops:
-                self.loops[category].add_token(token)
-            self.content_cache[mem_id] = content
+                if category in self.loops:
+                    self.loops[category].add_token(token)
+                self.content_cache[mem_id] = content
+        except Exception:
+            pass
+
+        # --- v6.1: Load ConnectionPoints ---
+        try:
+            if hasattr(self.mnemo, 'list_points'):
+                points = self.mnemo.list_points(limit=500)
+                for cp in points:
+                    cp_id = cp.get("id", "")
+                    if cp_id in self.content_cache:
+                        continue  # Already loaded (avoid duplicates)
+
+                    entity = cp.get("entity", "")
+                    value = cp.get("value", "")
+                    category = cp.get("category", "fact")
+                    conn = cp.get("connects_to", "")
+                    session_id = cp.get("session_id", "")
+
+                    # Format content string for the loop system
+                    if conn:
+                        content = f"[{category.upper()}] {entity} → {conn}: {value}"
+                    elif entity and entity != "Story":
+                        content = f"[{category.upper()}] {entity}: {value}"
+                    else:
+                        content = f"[{category.upper()}] {value}"
+
+                    # Map CP categories to loop categories
+                    loop_cat = category if category in self.loops else "general"
+                    if category in ("relationship",):
+                        loop_cat = "fact"  # relationships go into fact loop
+                    if loop_cat not in self.loops:
+                        loop_cat = "general"
+
+                    if use_smart_extraction:
+                        token = self.extractor.extract_smart(content, loop_cat)
+                    else:
+                        token = self.extractor.extract_simple(content, loop_cat)
+                    token.full_content_ref = cp_id
+                    token.session_id = session_id
+
+                    if loop_cat in self.loops:
+                        self.loops[loop_cat].add_token(token)
+                    self.content_cache[cp_id] = content
+        except Exception:
+            pass
+
         self._trim_cache()
 
     def _trim_cache(self):
