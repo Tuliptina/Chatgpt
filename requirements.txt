@@ -1,4 +1,4 @@
-# 4o with Memory v7.0 — Streamlit Client
+# 4o with Memory v7.1 — Streamlit Client
 # Includes embedded Mnemo engine (SQLite + FAISS + NumPy)
 
 streamlit
@@ -10,11 +10,16 @@ tiktoken
 python-docx
 huggingface_hub>=0.20.0
 
+# v7.1: Cloudflare R2 sync (replaces HF Datasets as primary backup)
+boto3
+
 # v7.0: Local Mnemo engine dependencies (for Option D embedded mode)
-# CPU-only torch to avoid ~2GB CUDA download
---index-url https://download.pytorch.org/whl/cpu
---extra-index-url https://pypi.org/simple
-torch
-sentence-transformers>=2.2.2
+# PRIMARY encoder: Cloudflare Workers AI (uses `requests`, already listed above)
+# No PyTorch, no sentence-transformers needed → saves ~310MB RAM on Streamlit Cloud.
+# FALLBACK encoder: Uncomment the 3 lines below ONLY if Cloudflare is unavailable:
+# --index-url https://download.pytorch.org/whl/cpu
+# --extra-index-url https://pypi.org/simple
+# torch
+# sentence-transformers>=2.2.2
 faiss-cpu>=1.7.0
 numpy>=1.24.0
