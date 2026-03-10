@@ -1,17 +1,22 @@
 """
-Context Engine - Deep Context Generation and Memory Consolidation
+Context Engine - Deep Context Generation, Memory Consolidation, and Thread/Knot Synthesis
+
+v7.1 changes:
+- NEW: Thread/knot generation moved here from per-message extraction (app.py).
+  Threads and knots created during consolidation have session_id="" and
+  source="consolidation", making them immune to session deletion.
+  This fixes the bug where deleting a session wiped structural narrative elements.
+- NEW: _generate_threads_and_knots() method — analyzes all CPs to find
+  narrative sequences (threads) and intersection points (knots).
 
 v6.9.1 changes:
 - FIX: Updated K2 cost rates to current OpenRouter pricing ($0.55/$2.20 per M)
 - FIX: consolidate_memories() now uses robust JSON parsing (brace-depth matching)
-  instead of fragile markdown fence stripping that failed on K2 preamble text.
 
 v6.0 changes:
 - consolidate_memories() routes to MEMORY_MODEL_ID (K2) instead of GPT-4o
 - TONE entries added to consolidation output categories
 - build_rich_context() groups by entity when ConnectionPoints are present
-
-v5.1: build_rich_context() is pure formatter, consolidate at priority=1.2.
 """
 
 import json
@@ -100,6 +105,7 @@ class ContextEngine:
         results = {
             "timestamp": datetime.now().isoformat(), "memories_analyzed": 0,
             "new_entries": [], "created": 0, "cost": 0.0, "k2_returned": 0, "dedup_rejected": 0,
+            "threads_created": 0, "knots_created": 0,
         }
 
         try:
@@ -248,7 +254,168 @@ Return ONLY a JSON object:
                 continue
 
         results["created"] = stored
+
+        # =====================================================================
+        # v7.1: THREAD/KNOT STRUCTURAL PASS
+        # Moved from per-message extraction to consolidation so threads/knots
+        # have session_id="" and are immune to session deletion.
+        # =====================================================================
+        if len(all_points) >= 5:
+            try:
+                t_created, k_created, tk_cost = self._generate_threads_and_knots(
+                    all_points, api_key)
+                results["threads_created"] = t_created
+                results["knots_created"] = k_created
+                results["cost"] += tk_cost
+            except Exception as e:
+                print(f"[CONSOLIDATION] Thread/knot pass failed: {e}")
+
         return results
+
+    def _generate_threads_and_knots(self, all_points: List[Dict],
+                                     api_key: str) -> Tuple[int, int, float]:
+        """Analyze all CPs to identify narrative threads and knots.
+
+        Creates threads/knots with session_id="" so they survive session deletion.
+        Returns (threads_created, knots_created, cost).
+        """
+        # Build summary of all CPs for the LLM
+        summary_lines = []
+        for cp in all_points[:150]:  # Cap to avoid token overflow
+            cp_id = cp.get("id", "?")
+            entity = cp.get("entity", "?")
+            cat = cp.get("category", "?")
+            value = cp.get("value", "")[:80]
+            conn = cp.get("connects_to", "")
+            conn_str = f" → {conn}" if conn else ""
+            summary_lines.append(f"[{cp_id}] {entity}{conn_str} ({cat}): {value}")
+
+        summary_text = "\n".join(summary_lines)
+
+        # Get existing threads to avoid duplicates
+        existing_threads = []
+        try:
+            existing_threads = self.mnemo.get_active_threads() or []
+        except Exception:
+            pass
+        existing_names = {t.get("name", "").lower() for t in existing_threads}
+
+        prompt = f"""You are analyzing a story's memory database to identify narrative structure.
+
+EXISTING CONNECTION POINTS:
+{summary_text}
+
+EXISTING THREADS (do NOT duplicate these):
+{', '.join(existing_names) if existing_names else '(none yet)'}
+
+IDENTIFY:
+1. THREADS: Narrative sequences where 3+ CPs form a chronological or causal chain.
+   Each thread needs a name, the primary entity, a type (plot_line, character_arc,
+   thematic_thread, or setting_evolution), and the CP IDs that belong to it.
+
+2. KNOTS: Points where two or more threads collide or intersect.
+   Each knot needs a name, the thread names that intersect, and why.
+
+RULES:
+- Only create threads from 3+ CPs that form a clear sequence.
+- Only create knots where threads genuinely intersect.
+- Do NOT recreate threads that already exist.
+- If no clear new threads or knots exist, return empty arrays.
+- Use the exact CP IDs (e.g., "cp_abc123") from the data above.
+
+Return ONLY a valid JSON object:
+{{
+  "threads": [
+    {{"name": "Captivity Arc", "entity": "Sebastian", "type": "plot_line", "cp_ids": ["cp_abc", "cp_def", "cp_ghi"]}}
+  ],
+  "knots": [
+    {{"name": "Blackwood Arrival", "thread_names": ["Captivity Arc", "Isabella's Obsession"], "reason": "Sebastian enters Isabella's territory"}}
+  ]
+}}"""
+
+        try:
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": MEMORY_MODEL_ID,
+                    "messages": [
+                        {"role": "system", "content": "You are a narrative structure analyst. Return ONLY valid JSON. No markdown, no explanation."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.2, "max_tokens": 2000,
+                },
+                timeout=90
+            )
+            if response.status_code != 200:
+                print(f"[THREADS] API error {response.status_code}")
+                return 0, 0, 0
+
+            data = response.json()
+            usage = data.get("usage", {})
+            cost = (usage.get("prompt_tokens", 0) * MEMORY_COST_INPUT +
+                    usage.get("completion_tokens", 0) * MEMORY_COST_OUTPUT)
+
+            raw = data["choices"][0]["message"]["content"]
+            parsed = _extract_json(raw)
+            if not parsed:
+                print(f"[THREADS] JSON parse failed. Preview: {raw[:300]}")
+                return 0, 0, cost
+
+            threads = parsed.get("threads", [])
+            knots = parsed.get("knots", [])
+            print(f"[THREADS] K2 returned {len(threads)} threads, {len(knots)} knots")
+
+        except Exception as e:
+            print(f"[THREADS] Exception: {e}")
+            return 0, 0, 0
+
+        # Store threads (with session_id="" — immune to session deletion)
+        threads_created = 0
+        thread_name_to_id = {}
+        for th in threads:
+            t_name = th.get("name", "")
+            if not t_name or t_name.lower() in existing_names:
+                continue  # Skip duplicates
+            t_id = "thread_" + re.sub(r'[^a-z0-9]', '_', t_name.lower())[:20]
+            thread_name_to_id[t_name] = t_id
+            cp_ids = th.get("cp_ids", [])
+            try:
+                self.mnemo.add_thread(
+                    thread_id=t_id, name=t_name,
+                    entity=th.get("entity", ""),
+                    thread_type=th.get("type", "plot_line"),
+                    session_id="",  # NOT tied to any session
+                    point_ids=cp_ids,
+                )
+                threads_created += 1
+            except Exception as e:
+                print(f"[THREADS] Failed to create thread '{t_name}': {e}")
+
+        # Store knots (with session_id="" — immune to session deletion)
+        knots_created = 0
+        for kn in knots:
+            k_name = kn.get("name", "")
+            if not k_name:
+                continue
+            k_id = "knot_" + re.sub(r'[^a-z0-9]', '_', k_name.lower())[:20]
+            t_ids = [
+                thread_name_to_id.get(tn, "thread_" + re.sub(r'[^a-z0-9]', '_', tn.lower())[:20])
+                for tn in kn.get("thread_names", [])
+            ]
+            try:
+                self.mnemo.add_knot(
+                    knot_id=k_id, name=k_name,
+                    thread_ids=t_ids,
+                    pivot_type="collision",
+                    reason=kn.get("reason", ""),
+                    session_id="",  # NOT tied to any session
+                )
+                knots_created += 1
+            except Exception as e:
+                print(f"[THREADS] Failed to create knot '{k_name}': {e}")
+
+        return threads_created, knots_created, cost
 
     def should_consolidate(self, last_consolidation=None, message_count: int = 0, new_memories_since: int = 0) -> bool:
         if last_consolidation:
