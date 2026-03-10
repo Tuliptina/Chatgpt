@@ -444,8 +444,8 @@ CREATE TABLE IF NOT EXISTS memories (
 );
 CREATE INDEX IF NOT EXISTS idx_mem_ns ON memories(namespace);
 CREATE INDEX IF NOT EXISTS idx_mem_tier ON memories(tier);
-CREATE INDEX IF NOT EXISTS idx_mem_session ON memories(session_id);
-CREATE INDEX IF NOT EXISTS idx_mem_source ON memories(source);
+-- NOTE: idx_mem_session and idx_mem_source are created by _migrate_memories_columns()
+-- to avoid errors on existing databases that lack those columns during schema init.
 
 -- FTS for blob memories
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
