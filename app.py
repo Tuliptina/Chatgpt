@@ -27,7 +27,7 @@ import traceback
 import concurrent.futures
 from datetime import datetime
 
-from mnemo_client import MnemoClient
+from mnemo_client import MnemoClient, LocalMnemoClient, ResilientMnemoClient, create_mnemo_client
 from metadata_loops import LoopManager, LoopConfig
 from smart_memory import SmartMemory, ContextWindowManager
 from session_store import SessionStore
@@ -256,7 +256,14 @@ PROSE RHYTHM — this is critical:
 
 def init_client(hf_key):
     if "mnemo_client" not in st.session_state:
-        st.session_state.mnemo_client = MnemoClient(base_url=MNEMO_URL, token=hf_key)
+        # v7.0: Auto mode — tries local engine first (SQLite + FAISS + NumPy),
+        # falls back to remote Gradio API if local fails.
+        # To force a specific mode: mode="local" or mode="remote"
+        st.session_state.mnemo_client = create_mnemo_client(
+            mode="auto", token=hf_key,
+            db_path=os.path.join(os.path.expanduser("~"), ".mnemo", "mnemo.db"),
+            base_url=MNEMO_URL,
+        )
     return st.session_state.mnemo_client
 
 def get_persistent_storage(hf_key=None, client=None):
@@ -1420,6 +1427,12 @@ def render_sidebar(mnemo_client, openrouter_key, hf_key):
         st.caption(f"{msg_count} messages · ${total_cost:.4f}")
         st.caption(f"✍️ {WRITING_MODEL_ID.split('/')[-1]} · 🧠 {MEMORY_MODEL_ID.split('/')[-1]}")
 
+        # v7.0: Show memory backend mode
+        mnemo = st.session_state.get("mnemo_client")
+        if mnemo and hasattr(mnemo, 'mode'):
+            mode_icons = {"local": "⚡ Local (SQLite)", "remote": "🌐 Remote (Gradio)", "unavailable": "❌ Unavailable"}
+            st.caption(f"💾 {mode_icons.get(mnemo.mode, mnemo.mode)}")
+
     return openrouter_key, hf_key
 
 def render_sessions_panel(mnemo_client, hf_key):
@@ -1879,7 +1892,7 @@ def main():
         <div class="brand-icon">🧠</div>
         <div class="brand-text">
             <h1>4o with Memory</h1>
-            <p>GPT-4o writer · K2 memory curator · Mnemo v6.9.3</p>
+            <p>GPT-4o writer · K2 memory curator · Mnemo v7.0 (local)</p>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1963,7 +1976,7 @@ def main():
 
     st.markdown(f"""
     <div class="status-bar">
-        4o with Memory v6.9.3 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Threads & Knots &nbsp;·&nbsp; Graph Search
+        4o with Memory v7.0 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Local SQLite + FAISS + NumPy &nbsp;·&nbsp; Threads & Knots
     </div>
     """, unsafe_allow_html=True)
 
