@@ -435,6 +435,8 @@ CREATE TABLE IF NOT EXISTS memories (
     quality_score  REAL DEFAULT 0.5,
     access_count   INTEGER DEFAULT 0,
     priority       REAL DEFAULT 1.0,
+    session_id     TEXT DEFAULT '',
+    source         TEXT DEFAULT 'auto_extract',
     created_at     REAL NOT NULL,
     last_accessed  REAL NOT NULL,
     metadata       TEXT DEFAULT '{}',
@@ -442,6 +444,8 @@ CREATE TABLE IF NOT EXISTS memories (
 );
 CREATE INDEX IF NOT EXISTS idx_mem_ns ON memories(namespace);
 CREATE INDEX IF NOT EXISTS idx_mem_tier ON memories(tier);
+CREATE INDEX IF NOT EXISTS idx_mem_session ON memories(session_id);
+CREATE INDEX IF NOT EXISTS idx_mem_source ON memories(source);
 
 -- FTS for blob memories
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
@@ -488,9 +492,46 @@ class MnemoDB:
         self._write_conn.executescript(SCHEMA_SQL)
         self._write_conn.commit()
 
+        # Schema migration: add session_id/source columns to memories table
+        # (for existing .db files created before v7.1)
+        self._migrate_memories_columns()
+
         self._read_pool: queue.Queue = queue.Queue(maxsize=4)
         for _ in range(4):
             self._read_pool.put(self._create_connection(readonly=True))
+
+    def _migrate_memories_columns(self):
+        """Add session_id and source columns to memories if missing (v7.0→v7.1).
+
+        Also backfills existing rows by extracting values from the metadata JSON blob.
+        """
+        cursor = self._write_conn.execute("PRAGMA table_info(memories)")
+        existing_cols = {row[1] for row in cursor.fetchall()}
+
+        if "session_id" not in existing_cols:
+            log.info("Migrating memories table: adding session_id column")
+            print("[MIGRATE] Adding session_id column to memories table")
+            self._write_conn.execute("ALTER TABLE memories ADD COLUMN session_id TEXT DEFAULT ''")
+            # Backfill from metadata JSON
+            self._write_conn.execute("""
+                UPDATE memories SET session_id = COALESCE(json_extract(metadata, '$.session_id'), '')
+                WHERE metadata LIKE '%session_id%'
+            """)
+
+        if "source" not in existing_cols:
+            log.info("Migrating memories table: adding source column")
+            print("[MIGRATE] Adding source column to memories table")
+            self._write_conn.execute("ALTER TABLE memories ADD COLUMN source TEXT DEFAULT 'auto_extract'")
+            # Backfill from metadata JSON
+            self._write_conn.execute("""
+                UPDATE memories SET source = COALESCE(json_extract(metadata, '$.source'), 'auto_extract')
+                WHERE metadata LIKE '%source%'
+            """)
+
+        # Create indexes if they don't exist (idempotent)
+        self._write_conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_session ON memories(session_id)")
+        self._write_conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_source ON memories(source)")
+        self._write_conn.commit()
 
     def _create_connection(self, readonly: bool = False) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
@@ -1045,12 +1086,11 @@ class MnemoEngine:
             """, (session_id, *PROTECTED))
             cp_deleted = cur.rowcount
 
-            # Delete blobs
-            cur2 = conn.execute("""
+            # Delete blobs (using proper columns now, not json_extract)
+            cur2 = conn.execute(f"""
                 DELETE FROM memories
-                WHERE json_extract(metadata, '$.session_id') = ?
-                  AND COALESCE(json_extract(metadata, '$.source'), '') NOT IN (""" + placeholders + ")",
-                (session_id, *PROTECTED))
+                WHERE session_id = ? AND source NOT IN ({placeholders})
+            """, (session_id, *PROTECTED))
             blob_deleted = cur2.rowcount
 
         total = cp_deleted + blob_deleted
@@ -1515,7 +1555,12 @@ class MnemoEngine:
     def add(self, content: str, namespace: str = "default",
             metadata: dict = None, priority: float = 1.0) -> Optional[str]:
         memory_id = self._generate_id(content, namespace)
-        meta_json = json.dumps(metadata or {})
+        meta = metadata or {}
+
+        # Extract session_id and source into proper columns (not buried in JSON)
+        session_id = meta.pop("session_id", "")
+        source = meta.pop("source", "auto_extract")
+        meta_json = json.dumps(meta)  # Remaining metadata only
 
         with self.db.read() as conn:
             existing = conn.execute("SELECT id FROM memories WHERE id = ?", (memory_id,)).fetchone()
@@ -1539,10 +1584,10 @@ class MnemoEngine:
             conn.execute("""
                 INSERT INTO memories
                 (id, content, tier, namespace, quality_score, access_count, priority,
-                 created_at, last_accessed, metadata, embedding)
-                VALUES (?, ?, 'semantic', ?, ?, 0, ?, ?, ?, ?, ?)
+                 session_id, source, created_at, last_accessed, metadata, embedding)
+                VALUES (?, ?, 'semantic', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
             """, (memory_id, content, namespace, quality, priority,
-                  time.time(), time.time(), meta_json, emb_blob))
+                  session_id, source, time.time(), time.time(), meta_json, emb_blob))
 
         self._blob_faiss.add(memory_id, embedding)
         self._create_links(memory_id, embedding, namespace, content)
@@ -1721,6 +1766,7 @@ class MnemoEngine:
                     "tier": mem["tier"], "namespace": mem["namespace"],
                     "quality_score": round(mem["quality_score"], 3),
                     "access_count": mem["access_count"], "priority": mem["priority"],
+                    "session_id": mem["session_id"], "source": mem["source"],
                     "created_at": mem["created_at"], "last_accessed": mem["last_accessed"],
                     "metadata": json.loads(mem["metadata"] or "{}"),
                 }
@@ -1751,6 +1797,7 @@ class MnemoEngine:
             "id": r["id"], "content": r["content"], "tier": r["tier"],
             "namespace": r["namespace"], "quality_score": round(r["quality_score"], 3),
             "access_count": r["access_count"], "priority": r["priority"],
+            "session_id": r["session_id"], "source": r["source"],
             "created_at": r["created_at"], "last_accessed": r["last_accessed"],
             "metadata": json.loads(r["metadata"] or "{}"),
         } for r in rows]
@@ -2037,17 +2084,28 @@ class MnemoEngine:
             if emb is None:
                 emb = self._get_embedding(mdata.get("content", ""))
             emb_blob = emb.astype(np.float32).tobytes()
-            meta_json = json.dumps(mdata.get("metadata", {}))
+
+            # Extract session_id/source from old metadata blob into proper columns
+            old_meta = mdata.get("metadata", {})
+            if isinstance(old_meta, str):
+                try:
+                    old_meta = json.loads(old_meta)
+                except Exception:
+                    old_meta = {}
+            session_id = old_meta.pop("session_id", mdata.get("session_id", ""))
+            source = old_meta.pop("source", mdata.get("source", "auto_extract"))
+            meta_json = json.dumps(old_meta)  # Remaining metadata only
 
             with self.db.write() as conn:
                 conn.execute("""
                     INSERT OR IGNORE INTO memories
                     (id, content, tier, namespace, quality_score, access_count, priority,
-                     created_at, last_accessed, metadata, embedding)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     session_id, source, created_at, last_accessed, metadata, embedding)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (mid, mdata["content"], mdata.get("tier", "semantic"),
                       mdata.get("namespace", "default"), mdata.get("quality_score", 0.5),
                       mdata.get("access_count", 0), mdata.get("priority", 1.0),
+                      session_id, source,
                       mdata.get("created_at", time.time()), mdata.get("last_accessed", time.time()),
                       meta_json, emb_blob))
             imported += 1
