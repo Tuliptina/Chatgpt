@@ -1,17 +1,13 @@
 """
-4o with Memory v6.9.3 — Dual-Processor Creative Writing Engine
+4o with Memory v7.1 — Dual-Processor Creative Writing Engine
 
-v6.9.3 changes:
-- NEW: Sequential W-method extraction. Prompt tells K2 to go step-by-step through 9
-  W-questions in order (WHO→WHY→WHOM→WHICH→WHEN→WHERE→HOW→WHAT→CLARIFICATION)
-  so it doesn't fixate on CHARACTER and starve later categories. Each step re-reads
-  the text for its specific question.
-- NEW: Output explicitly framed as ConnectionPoints (CPs) for graph database storage,
-  not generic "memories." JSON format matches store_as_cp() expectations.
-- NEW: MOTIVATION category added to CATEGORY_TO_CP mapping → ("character", "motivation").
-  Previously fell through to ("fact", "general").
-- CHANGED: INPUT_CHUNK_CHARS = 25K (~4K words). Smaller chunks = naturally bounded output.
-- Keeps: Auto-scaling, thread/knot structural pass, truncation salvage, robust JSON parsing.
+v7.1 changes:
+- NEW: Integrated Memory Editor directly into app.py. No external dependencies.
+- NEW: Inline editing for ConnectionPoints with dynamic ID re-hashing (Delete + Insert).
+- NEW: Auto-syncs manual edits to the fast-cache Loop Manager.
+- OPTIMIZED: Removed Thread/Knot synthesis from real-time chat extraction. 
+  Chat extraction is now purely for atomic facts (faster, cheaper), leaving 
+  structural narrative generation to the asynchronous Consolidation pass.
 """
 
 import streamlit as st
@@ -64,12 +60,6 @@ WRITING_PARAMS = {
     "max_tokens": 16384,
 }
 
-# v6.9.1 FIX: Removed response_format and repetition_penalty
-# K2 on OpenRouter doesn't support response_format: json_object — it either
-# returns a 400 error or ignores it, causing extraction to silently fail.
-# max_tokens=4096 is the practical ceiling for K2 on OpenRouter — providers
-# silently cap output regardless of what you request. We scale by adding
-# more parallel chunks instead of trying higher output budgets.
 MEMORY_PARAMS = {
     "temperature": 0.2,
     "frequency_penalty": 0.0,
@@ -256,9 +246,6 @@ PROSE RHYTHM — this is critical:
 
 def init_client(hf_key):
     if "mnemo_client" not in st.session_state:
-        # v7.0: Auto mode — tries local engine first (SQLite + FAISS + NumPy),
-        # falls back to remote Gradio API if local fails.
-        # To force a specific mode: mode="local" or mode="remote"
         st.session_state.mnemo_client = create_mnemo_client(
             mode="auto", token=hf_key,
             db_path=os.path.join(os.path.expanduser("~"), ".mnemo", "mnemo.db"),
@@ -352,14 +339,12 @@ def delete_session(session_id):
     st.session_state.session_history = [
         s for s in st.session_state.get("session_history", []) if s["id"] != session_id
     ]
-    # Delete session record from SessionStore (HF Dataset persistence)
     try:
         storage = get_persistent_storage()
         if storage:
             storage.delete_session(session_id)
     except Exception as e:
         print(f"[WARN] session store delete: {type(e).__name__}: {e}")
-    # Cascade delete CPs, threads, knots from Mnemo backend
     try:
         mnemo_client = st.session_state.get("mnemo_client")
         if mnemo_client:
@@ -367,7 +352,6 @@ def delete_session(session_id):
             print(f"[INFO] Mnemo cascade delete for {session_id}: {result}")
     except Exception as e:
         print(f"[WARN] Mnemo cascade delete failed: {type(e).__name__}: {e}")
-    # Remove loop tokens
     if "loop_manager" in st.session_state:
         lm = st.session_state.loop_manager
         if hasattr(lm, 'remove_session_tokens'):
@@ -426,7 +410,7 @@ def copy_response_dialog(content):
         st.rerun()
 
 # ============================================================================
-# FILE PROCESSING & K2 AUTO-EXTRACTION (v6.9.1 — Fixed JSON extraction)
+# FILE PROCESSING & K2 AUTO-EXTRACTION 
 # ============================================================================
 
 def extract_text_from_file(uploaded_file):
@@ -464,21 +448,8 @@ def extract_text_from_file(uploaded_file):
         content = f"[Error reading file: {str(e)}]"
     return content
 
-
-# v6.9.1 FIX: Robust JSON extraction from K2 responses
 def extract_json_from_response(raw: str) -> dict:
-    """Robustly extract JSON from K2 response text.
-    
-    K2 on OpenRouter doesn't support response_format, so it may return JSON:
-    - Directly as a JSON object
-    - Wrapped in ```json ... ``` markdown fences  
-    - With preamble text before the JSON
-    - With trailing text after the JSON
-    - TRUNCATED mid-object when max_tokens is hit (Strategy 4 salvages these)
-    """
     clean = raw.strip()
-    
-    # Strategy 1: Direct JSON parse (best case)
     try:
         parsed = json.loads(clean)
         if isinstance(parsed, dict):
@@ -486,7 +457,6 @@ def extract_json_from_response(raw: str) -> dict:
     except json.JSONDecodeError:
         pass
     
-    # Strategy 2: Strip markdown fences
     if "```" in clean:
         fence_patterns = [
             r'```json\s*\n?(.*?)\n?```',
@@ -502,7 +472,6 @@ def extract_json_from_response(raw: str) -> dict:
                 except json.JSONDecodeError:
                     continue
     
-    # Strategy 3: Brace-depth matching — find outermost { ... }
     first_brace = clean.find('{')
     if first_brace >= 0:
         depth = 0
@@ -520,41 +489,22 @@ def extract_json_from_response(raw: str) -> dict:
                         pass
                     break
     
-    # Strategy 4: SALVAGE — JSON was truncated (max_tokens hit mid-output).
-    # json.loads() is all-or-nothing, so even 34 valid memories get thrown away
-    # because the 35th was cut mid-word. Instead, regex-extract every complete
-    # memory object and reconstruct the wrapper.
     if '"memories"' in clean or '"local_id"' in clean:
         salvaged = _salvage_truncated_memories(clean)
         if salvaged:
             n = len(salvaged.get("memories", []))
             print(f"[K2 EXTRACT] JSON truncated — salvaged {n} complete memories from partial response")
             return salvaged
-    
     return {}
 
-
 def _salvage_truncated_memories(raw: str) -> dict:
-    """Extract individual complete memory objects from truncated JSON.
-    
-    When K2 hits max_tokens, the JSON is cut mid-object:
-      {"memories": [{"local_id":"m1",...}, {"local_id":"m2",...}, {"local_id":"m35","content":"trunc
-    
-    json.loads() rejects the entire thing. This function regex-extracts every
-    COMPLETE {...} object that has the required fields, discards the broken
-    last one, and reconstructs the wrapper.
-    """
-    # Find all complete JSON objects that look like memories
-    # Each memory has at minimum: local_id OR entity + content
     memory_pattern = re.compile(
-        r'\{[^{}]*?"(?:local_id|entity)"[^{}]*?"content"\s*:\s*"[^"]*"[^{}]*?\}',
+        r'\{[^{}]*?"(?:local_id|entity)"[^{}]*?"content"\s*:\s*"(?:\\.|[^"\\])*"[^{}]*?\}',
         re.DOTALL
     )
-    
     matches = memory_pattern.findall(raw)
     if not matches:
         return {}
-    
     memories = []
     for match in matches:
         try:
@@ -563,11 +513,8 @@ def _salvage_truncated_memories(raw: str) -> dict:
                 memories.append(obj)
         except json.JSONDecodeError:
             continue
-    
     if not memories:
         return {}
-    
-    # Also try to salvage any complete thread objects
     threads = []
     thread_pattern = re.compile(
         r'\{[^{}]*?"name"\s*:\s*"[^"]*"[^{}]*?"memory_local_ids"\s*:\s*\[[^\]]*\][^{}]*?\}',
@@ -580,30 +527,13 @@ def _salvage_truncated_memories(raw: str) -> dict:
                 threads.append(obj)
         except json.JSONDecodeError:
             continue
-    
     return {"memories": memories, "threads": threads, "knots": []}
 
-
-# =============================================================================
-# AUTO-SCALE EXTRACTION PIPELINE (v6.9.2)
-# =============================================================================
-# SEQUENTIAL W-METHOD EXTRACTION PIPELINE (v6.9.3)
-# =============================================================================
-# Single prompt per chunk with STEP-BY-STEP W-question ordering.
-# K2 re-reads the text for each W-question in order so nothing gets missed.
-# Output framed as ConnectionPoints (CPs) for graph database storage.
-# Auto-scaler controls call count via input chunking (~4K words/chunk).
-# Thread/Knot structuring is a separate lightweight pass using the results.
-# =============================================================================
-
-# Input chunking — smaller chunks = naturally bounded output
-INPUT_CHUNK_CHARS = 25000   # ~4K words per chunk — produces ~30-40 memories each
-INPUT_CHUNK_OVERLAP = 2000  # overlap so entities aren't split mid-description
+INPUT_CHUNK_CHARS = 25000 
+INPUT_CHUNK_OVERLAP = 2000 
 MAX_INPUT_CHUNKS = 10
 
-
 def _build_extraction_prompt(content: str, filename: str, chunk_label: str = "") -> str:
-    """Build sequential W-method extraction prompt — outputs CPs, not blobs."""
     return f"""You are a memory extraction engine for a creative writing system. Your output will be stored as ConnectionPoints (CPs) in a graph database.
 
 DOCUMENT: {filename}{chunk_label}
@@ -670,15 +600,13 @@ Respond with ONLY a valid JSON object — no preamble, no markdown fences:
 The 9 examples above correspond 1:1 to the 9 steps:
   m1=WHO, m2=WHY, m3=WHOM, m4=WHICH, m5=WHEN, m6=WHERE, m7=HOW, m8=WHAT, m9=CLARIFICATION"""
 
-
 async def _extract_chunk_async(http_client, chunk, filename, chunk_idx, total_chunks, openrouter_key):
-    """Extract W-method guided memories from a single input chunk."""
     chunk_label = f" (part {chunk_idx+1}/{total_chunks})" if total_chunks > 1 else ""
     prompt = _build_extraction_prompt(chunk, filename, chunk_label)
 
     try:
         response = await http_client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            "[https://openrouter.ai/api/v1/chat/completions](https://openrouter.ai/api/v1/chat/completions)",
             headers={"Authorization": f"Bearer {openrouter_key}", "Content-Type": "application/json"},
             json={"model": MEMORY_MODEL_ID, "messages": [{"role": "user", "content": prompt}], **MEMORY_PARAMS},
             timeout=120.0
@@ -704,7 +632,6 @@ async def _extract_chunk_async(http_client, chunk, filename, chunk_idx, total_ch
                 if memories:
                     break
 
-        # Ensure every memory has required fields
         for mem in memories:
             if not mem.get("local_id"):
                 mem["local_id"] = f"m_{uuid.uuid4().hex[:6]}"
@@ -719,9 +646,7 @@ async def _extract_chunk_async(http_client, chunk, filename, chunk_idx, total_ch
         traceback.print_exc()
         return [], 0
 
-
 async def _extract_threads_async(http_client, memories_summary, openrouter_key):
-    """Structural pass: group extracted memories into threads and knots."""
     prompt = f"""You are given a list of extracted story memories. Identify:
 1. THREADS: Narrative sequences where 3+ memories form a chronological or causal chain.
 2. KNOTS: Points where two or more threads collide or intersect.
@@ -747,7 +672,7 @@ RULES:
 
     try:
         response = await http_client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            "[https://openrouter.ai/api/v1/chat/completions](https://openrouter.ai/api/v1/chat/completions)",
             headers={"Authorization": f"Bearer {openrouter_key}", "Content-Type": "application/json"},
             json={"model": MEMORY_MODEL_ID, "messages": [{"role": "user", "content": prompt}], **MEMORY_PARAMS},
             timeout=120.0
@@ -775,9 +700,7 @@ RULES:
         print(f"[K2 THREADS] Exception: {type(e).__name__}: {e}")
         return [], [], 0
 
-
 def calculate_extraction_plan(content: str) -> dict:
-    """Auto-scale: chunk by input quality (~4K words/chunk) for W-method extraction."""
     words = len(content.split())
     chars = len(content)
 
@@ -786,7 +709,7 @@ def calculate_extraction_plan(content: str) -> dict:
     else:
         n_chunks = min(max(1, -(-chars // INPUT_CHUNK_CHARS)), MAX_INPUT_CHUNKS)
 
-    total_calls = n_chunks + 1  # extraction chunks + 1 thread pass
+    total_calls = n_chunks + 1  
 
     plan = {
         "n_chunks": n_chunks,
@@ -798,17 +721,9 @@ def calculate_extraction_plan(content: str) -> dict:
           f"+ 1 thread pass = {total_calls} calls")
     return plan
 
-
 def extract_memories_from_file(content, filename, openrouter_key):
-    """v6.9.3: Sequential W-method extraction as ConnectionPoints.
-
-    Single prompt per chunk with step-by-step W-questions (WHO→WHY→WHOM→WHICH→
-    WHEN→WHERE→HOW→WHAT→CLARIFICATION). Chunks scale by input quality (~4K words).
-    Thread/knot structural pass runs after all extraction.
-    """
     plan = calculate_extraction_plan(content)
 
-    # Split input into chunks if needed
     if len(content) <= INPUT_CHUNK_CHARS:
         chunks = [content]
     else:
@@ -826,10 +741,14 @@ def extract_memories_from_file(content, filename, openrouter_key):
             start = end - INPUT_CHUNK_OVERLAP
 
     async def run_extraction():
+        semaphore = asyncio.Semaphore(3)
+        async def sem_extract(http_client, chunk, filename, i, total, key):
+            async with semaphore:
+                return await _extract_chunk_async(http_client, chunk, filename, i, total, key)
+
         async with httpx.AsyncClient() as http_client:
-            # Pass 1: Extract memories from all chunks in parallel
             tasks = [
-                _extract_chunk_async(http_client, chunk, filename, i, len(chunks), openrouter_key)
+                sem_extract(http_client, chunk, filename, i, len(chunks), openrouter_key)
                 for i, chunk in enumerate(chunks)
             ]
             chunk_results = await asyncio.gather(*tasks)
@@ -840,7 +759,6 @@ def extract_memories_from_file(content, filename, openrouter_key):
                 all_memories.extend(memories)
                 total_cost += cost
 
-            # Deduplicate across chunks
             seen = set()
             unique_memories = []
             for mem in all_memories:
@@ -849,7 +767,6 @@ def extract_memories_from_file(content, filename, openrouter_key):
                     seen.add(key)
                     unique_memories.append(mem)
 
-            # Pass 2: Thread/Knot structural pass
             threads, knots = [], []
             if len(unique_memories) >= 5:
                 summary_lines = []
@@ -880,6 +797,7 @@ def extract_memories_from_file(content, filename, openrouter_key):
     return {"memories": memories, "threads": threads, "knots": knots}, cost, plan
 
 
+# v7.1.1 FIX: Pruned conversational prompt (no Threads/Knots logic)
 def extract_memories_with_gpt(conversation, openrouter_key):
     prompt = """You are a memory extraction engine for a creative writing system. Your output will be stored as ConnectionPoints (CPs) in a graph database.
 
@@ -887,7 +805,6 @@ CONVERSATION:
 {conversation}
 
 EXTRACTION METHOD — Go through the conversation step by step, one W-question at a time, IN THIS ORDER:
-
 STEP 1 — WHO (CHARACTER): Extract every character mentioned — identity, traits, appearance, backstory.
 STEP 2 — WHY (MOTIVATION): For each character, extract drives, fears, goals, secrets, philosophy.
 STEP 3 — WHOM/WHOSE (RELATIONSHIP): Extract connections between characters. MUST include "connects_to" field.
@@ -898,7 +815,7 @@ STEP 7 — HOW (TONE): Extract writing directives, voice, style, motifs, do-nots
 STEP 8 — WHAT (FACT): Extract remaining world-building, factions, systems, lore.
 STEP 9 — CLARIFICATION: Extract author corrections, instructions, meta-decisions.
 
-W-WORD → CATEGORY MAPPING (use these exact category values):
+W-WORD → CATEGORY MAPPING:
   WHO → CHARACTER | WHY → MOTIVATION | WHOM/WHOSE → RELATIONSHIP
   WHICH → PLOT | WHEN → TIMELINE | WHERE → SETTING
   HOW → TONE | WHAT → FACT | meta → CLARIFICATION
@@ -912,62 +829,46 @@ Respond with ONLY a valid JSON object — no preamble, no markdown fences:
 {{
   "memories": [
     {{"local_id": "m1", "entity": "Alistair Fitzroy", "category": "CHARACTER", "content": "Late 30s professor of pharmacology at Cambridge, impeccably dressed with cold grey eyes."}},
-    {{"local_id": "m2", "entity": "Alistair Fitzroy", "category": "MOTIVATION", "content": "Terrified of dementia. Would rather be remembered as a monster than forgotten. Addicted to the feeling of discovery."}},
-    {{"local_id": "m3", "entity": "Alistair Fitzroy", "category": "RELATIONSHIP", "connects_to": "Sebastian Carlisle", "content": "Oversees Sebastian's drug regimen; views him as both experiment and failure."}},
-    {{"local_id": "m4", "entity": "Sebastian Carlisle", "category": "PLOT", "content": "License revoked after surgical mistake caused by opium-tampered blood samples."}},
-    {{"local_id": "m5", "entity": "Sebastian Carlisle", "category": "TIMELINE", "content": "Captivity arc in Book 3 follows the laudanum moral panic in Book 2."}},
-    {{"local_id": "m6", "entity": "Blackwood Estate", "category": "SETTING", "content": "Remote estate where Sebastian is held. Isabella's territory."}},
-    {{"local_id": "m7", "entity": "Alistair Fitzroy", "category": "TONE", "content": "Scenes feel clinical and cold. Power through precision, not theatrics."}},
-    {{"local_id": "m8", "entity": "Red Rose Society", "category": "FACT", "content": "Elite decentralized medical order operating through legacy mentorship and institutional control."}},
-    {{"local_id": "m9", "entity": "Story", "category": "CLARIFICATION", "content": "Never use Dr. prefix in narration. Hands motif: stillness equals control."}}
-  ],
-  "threads": [
-    {{"name": "Captivity Arc", "entity": "Sebastian", "type": "plot_line", "memory_local_ids": ["m3", "m4"]}}
-  ],
-  "knots": []
-}}
+    {{"local_id": "m2", "entity": "Alistair Fitzroy", "category": "RELATIONSHIP", "connects_to": "Sebastian Carlisle", "content": "Oversees Sebastian's drug regimen; views him as both experiment and failure."}}
+  ]
+}}"""
 
-The 9 examples above correspond 1:1 to the 9 steps:
-  m1=WHO, m2=WHY, m3=WHOM, m4=WHICH, m5=WHEN, m6=WHERE, m7=HOW, m8=WHAT, m9=CLARIFICATION"""
-
-    # v6.9.1 FIX: Proper error handling
     try:
         response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            "[https://openrouter.ai/api/v1/chat/completions](https://openrouter.ai/api/v1/chat/completions)",
             headers={"Authorization": f"Bearer {openrouter_key}", "Content-Type": "application/json"},
             json={"model": MEMORY_MODEL_ID, "messages": [{"role": "user", "content": prompt.format(conversation=conversation)}], **MEMORY_PARAMS},
             timeout=60
         )
         if response.status_code != 200:
             print(f"[K2 CONV EXTRACT] API error {response.status_code}: {response.text[:300]}")
-            return {"memories": [], "threads": [], "knots": []}, 0
+            return {"memories": []}, 0
             
         data = response.json()
         raw = data["choices"][0]["message"]["content"]
         usage = data.get("usage", {})
         cost = (usage.get("prompt_tokens", 0) * 0.55 + usage.get("completion_tokens", 0) * 2.20) / 1_000_000
         
-        # v6.9.1: Use robust JSON extraction
         parsed = extract_json_from_response(raw)
         
         if not parsed:
             print(f"[K2 CONV EXTRACT] JSON parse failed. Raw preview: {raw[:500]}")
-            return {"memories": [], "threads": [], "knots": []}, cost
+            return {"memories": []}, cost
         
         if "memories" in parsed:
             return parsed, cost
         
         for alt_key in ("results", "items", "data", "points", "extractions"):
             if alt_key in parsed:
-                return {"memories": parsed[alt_key], "threads": parsed.get("threads", []), "knots": parsed.get("knots", [])}, cost
+                return {"memories": parsed[alt_key]}, cost
         
         print(f"[K2 CONV EXTRACT] No 'memories' key. Keys: {list(parsed.keys())}")
-        return {"memories": [], "threads": [], "knots": []}, cost
+        return {"memories": []}, cost
         
     except Exception as e:
         print(f"[K2 CONV EXTRACT] Exception: {type(e).__name__}: {e}")
         traceback.print_exc()
-        return {"memories": [], "threads": [], "knots": []}, 0
+        return {"memories": []}, 0
 
 def call_openrouter(messages, api_key, mode="writing"):
     model = WRITING_MODEL_ID if mode == "writing" else MEMORY_MODEL_ID
@@ -975,7 +876,7 @@ def call_openrouter(messages, api_key, mode="writing"):
     try:
         body = {"model": model, "messages": messages, **params}
         response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            "[https://openrouter.ai/api/v1/chat/completions](https://openrouter.ai/api/v1/chat/completions)",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json=body, timeout=120
         )
@@ -1293,13 +1194,11 @@ def handle_message(prompt, openrouter_key, mnemo_client):
         conversation = f"User: {prompt}\n\nAssistant: {response}"
         extraction_data, extract_cost = extract_memories_with_gpt(conversation, openrouter_key)
         memories = extraction_data.get("memories", [])
-        threads_data = extraction_data.get("threads", [])
-        knots_data = extraction_data.get("knots", [])
         
         if memories:
             msg_cost += extract_cost
-            local_to_real_cp = {}
             
+            # v7.1.1: Pruned Thread and Knot extraction loop logic from here
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                 futures = {}
                 for mem in memories:
@@ -1319,7 +1218,6 @@ def handle_message(prompt, openrouter_key, mnemo_client):
                         cp_id = future.result()
                         if cp_id:
                             extracted += 1
-                            local_to_real_cp[mem["local_id"]] = cp_id
                             
                             cat_upper = mem.get("category", "FACT").upper()
                             ent = mem.get("entity", "Story")
@@ -1336,22 +1234,6 @@ def handle_message(prompt, openrouter_key, mnemo_client):
                             st.session_state.loop_manager.add_to_loop(content=loop_content, category=cat_upper.lower(), session_id=current_session_id, memory_id=cp_id)
                     except Exception as e:
                         print(f"[WARN] extraction storage: {type(e).__name__}: {e}")
-                        
-            thread_name_to_id = {}
-            for th in threads_data:
-                t_name = th.get("name", "")
-                if not t_name: continue
-                t_id = "thread_" + re.sub(r'[^a-z0-9]', '_', t_name.lower())[:20]
-                thread_name_to_id[t_name] = t_id
-                cp_ids = [local_to_real_cp[m_id] for m_id in th.get("memory_local_ids", []) if m_id in local_to_real_cp]
-                mnemo_client.add_thread(thread_id=t_id, name=t_name, entity=th.get("entity", ""), thread_type=th.get("type", "plot_line"), session_id=current_session_id, point_ids=cp_ids)
-                
-            for kn in knots_data:
-                k_name = kn.get("name", "")
-                if not k_name: continue
-                k_id = "knot_" + re.sub(r'[^a-z0-9]', '_', k_name.lower())[:20]
-                t_ids = [thread_name_to_id.get(tn, "thread_" + re.sub(r'[^a-z0-9]', '_', tn.lower())[:20]) for tn in kn.get("thread_names", [])]
-                mnemo_client.add_knot(knot_id=k_id, name=k_name, thread_ids=t_ids, pivot_type="collision", reason=kn.get("reason", ""), session_id=current_session_id)
 
     result_meta = {
         "cross_session_memories_used": context_meta.get("cross_session_memories_used", 0),
@@ -1365,6 +1247,239 @@ def handle_message(prompt, openrouter_key, mnemo_client):
         "cp_results": context_meta.get("cp_results", 0),
     }
     return response, None, result_meta
+
+
+# ============================================================================
+# MEMORY EDITOR COMPONENT
+# ============================================================================
+
+EDITOR_CATEGORIES = ["character", "motivation", "plot", "setting", "timeline", "theme", "tone", "style", "fact", "clarification", "relationship"]
+
+def render_memory_management(mnemo_client, key_prefix: str = "memedit"):
+    st.markdown("### 🧠 Memory Editor")
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        search = st.text_input("Search memories", placeholder="Type to filter...",
+                                key=f"{key_prefix}_search", label_visibility="collapsed")
+    with col2:
+        cat_filter = st.selectbox("Category", ["All"] + EDITOR_CATEGORIES, key=f"{key_prefix}_cat_filter",
+                                   label_visibility="collapsed")
+
+    try:
+        all_points = mnemo_client.list_points(limit=500)
+    except Exception as e:
+        st.error(f"Failed to load memories: {e}")
+        return
+
+    if not all_points:
+        st.info("No memories stored yet.")
+        _render_add_new(mnemo_client, key_prefix)
+        return
+
+    filtered = all_points
+    if search:
+        search_lower = search.lower()
+        filtered = [cp for cp in filtered if (
+            search_lower in cp.get("entity", "").lower() or
+            search_lower in cp.get("value", "").lower() or
+            search_lower in cp.get("connects_to", "").lower() or
+            search_lower in cp.get("reason", "").lower() or
+            search_lower in cp.get("id", "").lower()
+        )]
+    if cat_filter != "All":
+        filtered = [cp for cp in filtered if cp.get("category", "").lower() == cat_filter.lower()]
+
+    st.caption(f"Showing {len(filtered)} of {len(all_points)} memories")
+
+    for i, cp in enumerate(filtered):
+        _render_cp_card(mnemo_client, cp, i, key_prefix)
+
+    st.divider()
+    _render_add_new(mnemo_client, key_prefix)
+
+    st.markdown("---")
+    if st.button("🧹 Clear ALL Memories", use_container_width=True):
+        st.session_state.confirm_clear = True
+    if st.session_state.get("confirm_clear"):
+        st.warning("⚠️ Delete ALL memories?")
+        ccol1, ccol2 = st.columns(2)
+        with ccol1:
+            if st.button("Yes, delete all"):
+                mnemo_client.clear()
+                st.session_state.confirm_clear = False
+                st.rerun()
+        with ccol2:
+            if st.button("Cancel"):
+                st.session_state.confirm_clear = False
+                st.rerun()
+
+def _render_cp_card(mnemo_client, cp: dict, index: int, key_prefix: str):
+    cp_id = cp.get("id", "")
+    entity = cp.get("entity", "")
+    value = cp.get("value", "")
+    category = cp.get("category", "fact").lower()
+    connects_to = cp.get("connects_to", "")
+
+    preview = f"**{entity}**"
+    if connects_to:
+        preview += f" → {connects_to}"
+    preview += f": {value[:60]}{'...' if len(value) > 60 else ''}"
+
+    cat_colors = {
+        "character": "🟣", "motivation": "🟣", "plot": "🔴", "timeline": "🔴",
+        "setting": "🟢", "theme": "🔵", "tone": "🟡", "style": "🟠",
+        "fact": "⚪", "clarification": "⚪", "relationship": "🟤",
+    }
+    cat_icon = cat_colors.get(category, "⚪")
+
+    with st.expander(f"{cat_icon} {preview}", expanded=False):
+        _render_edit_form(mnemo_client, cp, index, key_prefix)
+
+def _render_edit_form(mnemo_client, cp: dict, index: int, key_prefix: str):
+    cp_id = cp.get("id", "")
+    k = f"{key_prefix}_{index}"
+    cat = cp.get("category", "fact").lower()
+    
+    if cat not in EDITOR_CATEGORIES:
+        cat = "fact"
+
+    col1, col2 = st.columns(2)
+    with col1:
+        new_entity = st.text_input("Entity", value=cp.get("entity", ""), key=f"{k}_entity")
+        new_category = st.selectbox("Category", EDITOR_CATEGORIES, index=EDITOR_CATEGORIES.index(cat), key=f"{k}_cat")
+    with col2:
+        new_connects_to = st.text_input("Connects to", value=cp.get("connects_to", ""), key=f"{k}_conn")
+        new_weight = st.slider("Weight", 0.0, 1.0, float(cp.get("weight", 0.5)), 0.05, key=f"{k}_weight")
+
+    new_value = st.text_area("Value", value=cp.get("value", ""), height=100, key=f"{k}_value")
+    new_reason = st.text_input("Reason", value=cp.get("reason", ""), key=f"{k}_reason")
+
+    st.caption(f"ID: `{cp_id}` · Source: {cp.get('source', '')} · Type: {cp.get('point_type', '')}")
+
+    bcol1, bcol2, bcol3 = st.columns([1, 1, 2])
+    with bcol1:
+        if st.button("💾 Save", key=f"{k}_save", type="primary"):
+            _save_changes(mnemo_client, cp, new_entity, new_value, new_connects_to,
+                          new_reason, new_weight, new_category, k)
+    with bcol2:
+        if st.button("🗑️ Delete", key=f"{k}_del"):
+            st.session_state[f"{k}_confirm_delete"] = True
+
+    if st.session_state.get(f"{k}_confirm_delete"):
+        st.warning("Are you sure?")
+        dcol1, dcol2 = st.columns(2)
+        with dcol1:
+            if st.button("Yes, delete", key=f"{k}_del_yes", type="primary"):
+                try:
+                    mnemo_client.delete_point(cp_id)
+                    st.success("Deleted!")
+                    st.session_state.pop(f"{k}_confirm_delete", None)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Delete failed: {e}")
+        with dcol2:
+            if st.button("Cancel", key=f"{k}_del_no"):
+                st.session_state.pop(f"{k}_confirm_delete", None)
+                st.rerun()
+
+def _save_changes(mnemo_client, original_cp: dict, entity: str, value: str,
+                  connects_to: str, reason: str, weight: float, category: str, key: str):
+    cp_id = original_cp.get("id", "")
+
+    if (entity == original_cp.get("entity", "") and
+        value == original_cp.get("value", "") and
+        connects_to == original_cp.get("connects_to", "") and
+        reason == original_cp.get("reason", "") and
+        abs(weight - float(original_cp.get("weight", 0.5))) < 0.01 and
+        category == original_cp.get("category", "fact").lower()):
+        st.info("No changes to save.")
+        return
+
+    try:
+        mnemo_client.delete_point(cp_id)
+        new_id = mnemo_client.add_point(
+            entity=entity,
+            point_type=original_cp.get("point_type", "fact"),
+            value=value,
+            connects_to=connects_to,
+            reason=reason,
+            weight=weight,
+            category=category.upper(),
+            source="manual_correction",
+            session_id=original_cp.get("session_id", ""),
+            thread_id=original_cp.get("thread_id", ""),
+            position=original_cp.get("position", -1)
+        )
+        if new_id:
+            st.success("Saved successfully!")
+            cat_upper = category.upper()
+            ent = entity.strip() or "Story"
+            val = value.strip()
+            if connects_to:
+                loop_content = f"[{cat_upper}] {ent} → {connects_to}: {val}"
+            elif ent and ent != "Story":
+                loop_content = f"[{cat_upper}] {ent}: {val}"
+            else:
+                loop_content = f"[{cat_upper}] {val}"
+                
+            st.session_state.loop_manager.add_to_loop(
+                content=loop_content, category=category.lower(),
+                session_id=original_cp.get("session_id", ""), memory_id=new_id)
+        else:
+            st.error("Failed to save changes.")
+    except Exception as e:
+        st.error(f"Save failed: {e}")
+
+def _render_add_new(mnemo_client, key_prefix: str):
+    k = f"{key_prefix}_new"
+    with st.expander("➕ Add new memory", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            entity = st.text_input("Entity", placeholder="e.g. Sebastian Carlisle", key=f"{k}_entity")
+            category = st.selectbox("Category", EDITOR_CATEGORIES, key=f"{k}_cat")
+        with col2:
+            connects_to = st.text_input("Connects to", placeholder="e.g. Alistair Fitzroy", key=f"{k}_conn")
+            weight = st.slider("Weight", 0.0, 1.0, 0.5, 0.05, key=f"{k}_weight")
+
+        value = st.text_area("Value", placeholder="What do you want to remember?", height=100, key=f"{k}_value")
+        reason = st.text_input("Reason (optional)", key=f"{k}_reason")
+
+        if st.button("Add Memory", key=f"{k}_add", type="primary"):
+            if not entity or not value:
+                st.warning("Entity and Value are required.")
+            else:
+                try:
+                    cp_id = mnemo_client.add_point(
+                        entity=entity, point_type="fact", value=value,
+                        connects_to=connects_to, reason=reason,
+                        weight=weight, category=category.upper(), source="manual",
+                    )
+                    if cp_id:
+                        st.success(f"Added: {cp_id}")
+                        
+                        cat_upper = category.upper()
+                        ent = entity.strip() or "Story"
+                        val = value.strip()
+                        if connects_to:
+                            loop_content = f"[{cat_upper}] {ent} → {connects_to}: {val}"
+                        elif ent and ent != "Story":
+                            loop_content = f"[{cat_upper}] {ent}: {val}"
+                        else:
+                            loop_content = f"[{cat_upper}] {val}"
+                            
+                        st.session_state.loop_manager.add_to_loop(
+                            content=loop_content, category=category.lower(),
+                            session_id=st.session_state.get("current_session_id", ""), memory_id=cp_id)
+                        st.rerun()
+                    else:
+                        st.error("Failed to add — may be a duplicate.")
+                except Exception as e:
+                    st.error(f"Add failed: {e}")
+
+# ============================================================================
+# UI RENDERERS
+# ============================================================================
 
 def render_sidebar(mnemo_client, openrouter_key, hf_key):
     with st.sidebar:
@@ -1414,7 +1529,6 @@ def render_sidebar(mnemo_client, openrouter_key, hf_key):
             st.caption(f"📊 {loop_stats['total_items']} memories | {loop_stats['total_metadata_tokens']} tokens")
 
         st.divider()
-        st.markdown("#### 📝 Add Memory")
         render_memory_management(mnemo_client)
         st.divider()
         render_consolidation_panel(openrouter_key)
@@ -1427,7 +1541,6 @@ def render_sidebar(mnemo_client, openrouter_key, hf_key):
         st.caption(f"{msg_count} messages · ${total_cost:.4f}")
         st.caption(f"✍️ {WRITING_MODEL_ID.split('/')[-1]} · 🧠 {MEMORY_MODEL_ID.split('/')[-1]}")
 
-        # v7.0: Show memory backend mode
         mnemo = st.session_state.get("mnemo_client")
         if mnemo and hasattr(mnemo, 'mode'):
             mode_icons = {"local": "⚡ Local (SQLite)", "remote": "🌐 Remote (Gradio)", "unavailable": "❌ Unavailable"}
@@ -1515,125 +1628,6 @@ def render_sessions_panel(mnemo_client, hf_key):
         else:
             st.caption("No previous sessions")
 
-def render_memory_management(mnemo_client):
-    with st.expander("Add manually", expanded=False):
-        memory_category = st.selectbox("Category",
-            ["CHARACTER", "MOTIVATION", "RELATIONSHIP", "PLOT", "TIMELINE",
-             "SETTING", "TONE", "FACT", "CLARIFICATION"])
-        memory_entity = st.text_input("Entity (character name, 'Story', etc.)",
-            placeholder="e.g., Alistair, Story, Red Rose Society", value="Story")
-        memory_content = st.text_area("Content",
-            placeholder="e.g., Alistair's scenes should feel clinical and cold, never melodramatic",
-            height=80)
-        if st.button("💾 Save", use_container_width=True):
-            if memory_content.strip():
-                current_session = st.session_state.get("current_session_id", "")
-                cp_id = store_as_cp(mnemo_client, entity=memory_entity.strip() or "Story",
-                                    category=memory_category, content=memory_content.strip(),
-                                    session_id=current_session, source="manual")
-                if cp_id:
-                    st.success(f"✅ Saved [{memory_category}] for {memory_entity}")
-                    
-                    cat = memory_category.upper()
-                    ent = memory_entity.strip() or "Story"
-                    val = memory_content.strip()
-                    if ent and ent != "Story":
-                        loop_content = f"[{cat}] {ent}: {val}"
-                    else:
-                        loop_content = f"[{cat}] {val}"
-                        
-                    st.session_state.loop_manager.add_to_loop(
-                        content=loop_content, category=memory_category.lower(),
-                        session_id=current_session, memory_id=cp_id)
-                else:
-                    st.error("Failed to save")
-
-    with st.expander("View memories", expanded=False):
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            if st.button("🔄 Refresh", use_container_width=True, key="refresh_mem"):
-                st.rerun()
-        with col2:
-            if st.button("📖 View All", use_container_width=True, key="view_all_mem"):
-                st.session_state.show_all_memories = True
-                st.rerun()
-        stats = mnemo_client.get_stats()
-        n_blobs = stats.get('total_memories', 0)
-        n_cps = stats.get('total_connection_points', 0)
-        st.caption(f"ConnectionPoints: {n_cps} | Legacy blobs: {n_blobs} | Links: {stats.get('total_links', 0)}")
-        points = mnemo_client.list_points(limit=15)
-        for cp in points:
-            col1, col2 = st.columns([5, 1])
-            with col1:
-                entity = cp.get("entity", "?")
-                value = cp.get("value", "")[:60]
-                cat = cp.get("category", "?")
-                conn = f" → {cp.get('connects_to')}" if cp.get("connects_to") else ""
-                st.caption(f"**{entity}{conn}** [{cat}] {value}...")
-            with col2:
-                if st.button("🗑️", key=f"del_cp_{cp.get('id', '')}"):
-                    if mnemo_client.delete_point(cp.get("id")):
-                        st.rerun()
-        if n_cps > 15:
-            st.caption(f"... showing first 15 of {n_cps}. Click 'View All' for complete list")
-        st.markdown("---")
-        if st.button("🧹 Clear ALL Memories", use_container_width=True):
-            st.session_state.confirm_clear = True
-        if st.session_state.get("confirm_clear"):
-            st.warning("⚠️ Delete ALL memories?")
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("Yes, delete all"):
-                    mnemo_client.clear()
-                    st.session_state.confirm_clear = False
-                    st.rerun()
-            with col2:
-                if st.button("Cancel"):
-                    st.session_state.confirm_clear = False
-                    st.rerun()
-
-    if st.session_state.get("show_all_memories"):
-        st.markdown("---")
-        st.subheader("📖 All ConnectionPoints")
-        col1, col2, col3 = st.columns([1, 1, 1])
-        with col1:
-            if st.button("❌ Close", use_container_width=True, key="close_all_mem"):
-                st.session_state.show_all_memories = False
-                st.rerun()
-        with col2:
-            search_query = st.text_input("🔍 Search", key="mem_search", placeholder="Filter by entity or value...")
-        with col3:
-            category_filter = st.selectbox("Category",
-                ["All", "character", "relationship", "plot", "tone", "setting", "style", "fact"],
-                key="cat_filter")
-        all_points = mnemo_client.list_points(limit=500)
-        if search_query:
-            q = search_query.lower()
-            all_points = [p for p in all_points if q in p.get("entity", "").lower()
-                          or q in p.get("value", "").lower()
-                          or q in p.get("connects_to", "").lower()]
-        if category_filter != "All":
-            all_points = [p for p in all_points if p.get("category") == category_filter]
-        st.caption(f"Showing {len(all_points)} ConnectionPoints")
-        for cp in all_points:
-            entity = cp.get("entity", "?")
-            value = cp.get("value", "")
-            cat = cp.get("category", "?")
-            conn = cp.get("connects_to", "")
-            cp_id = cp.get("id", "")
-            col1, col2, col3, col4 = st.columns([2, 1, 6, 1])
-            with col1:
-                conn_str = f" → {conn}" if conn else ""
-                st.caption(f"**{entity}{conn_str}**")
-            with col2:
-                st.caption(f"[{cat}]")
-            with col3:
-                st.text(value[:200])
-            with col4:
-                if st.button("🗑️", key=f"del_full_{cp_id}"):
-                    if mnemo_client.delete_point(cp_id):
-                        st.rerun()
-
 def render_file_upload(mnemo_client, openrouter_key):
     st.markdown("**📎 Upload File → Memory**")
     st.caption("Upload a file — extracts facts, deep context, style, tone via K2")
@@ -1644,7 +1638,6 @@ def render_file_upload(mnemo_client, openrouter_key):
             with st.spinner("Reading file..."):
                 content = extract_text_from_file(uploaded_file)
             if content and not content.startswith("["):
-                # v6.9.2: Show extraction plan to user
                 plan = calculate_extraction_plan(content)
                 chunk_info = f"{plan['n_chunks']} chunk{'s' if plan['n_chunks'] > 1 else ''}"
                 st.info(f"📄 {plan['words']:,} words → {chunk_info} "
@@ -1853,7 +1846,7 @@ def main():
 
     st.markdown("""
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap');
+    @import url('[https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap](https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap)');
     .stApp { font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif; }
     .stApp > header { background: transparent !important; }
     #MainMenu, footer, .stDeployButton { display: none !important; }
@@ -1892,7 +1885,7 @@ def main():
         <div class="brand-icon">🧠</div>
         <div class="brand-text">
             <h1>4o with Memory</h1>
-            <p>GPT-4o writer · K2 memory curator · Mnemo v7.0 (local)</p>
+            <p>GPT-4o writer · K2 memory curator · Mnemo v7.1.1 (local)</p>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1969,14 +1962,12 @@ def main():
 
     if mnemo_client.token != hf_key:
         mnemo_client.token = hf_key
-        # v6.9.1 FIX: MnemoClient v6.0 uses GradioTransport, not requests.Session.
-        # The token is only used for reference — Gradio transport doesn't need auth headers.
 
     render_chat(openrouter_key, mnemo_client)
 
     st.markdown(f"""
     <div class="status-bar">
-        4o with Memory v7.0 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Local SQLite + FAISS + NumPy &nbsp;·&nbsp; Threads & Knots
+        4o with Memory v7.1.1 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Local SQLite + FAISS + NumPy &nbsp;·&nbsp; Threads & Knots
     </div>
     """, unsafe_allow_html=True)
 
