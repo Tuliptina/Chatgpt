@@ -1,24 +1,17 @@
 """
-4o with Memory v6.9.2 — Dual-Processor Creative Writing Engine
+4o with Memory v6.9.3 — Dual-Processor Creative Writing Engine
 
-v6.9.2 changes:
-- NEW: Auto-scale extraction with per-category caps. Single prompt per chunk with
-  explicit limits (<=12 CHARACTER, <=8 RELATIONSHIP, <=8 PLOT, <=4 TONE, <=3 SETTING
-  = 35 max/chunk). Fits in 4096 output tokens every time. Chunks scale by input
-  quality (~8K words each). Replaces both the "EXHAUSTIVE ATOMIC" prompt (157 mems/1K)
-  and the 5-category split (too many API calls).
-- NEW: Thread/Knot extraction separated into lightweight structural pass after memories.
-- Conversation extraction (extract_memories_with_gpt) also uses capped approach.
-- Keeps: Truncation salvage, robust JSON parsing, error logging, no response_format.
-
-v6.9.1 changes:
-- FIX: Removed response_format from MEMORY_PARAMS — K2 on OpenRouter doesn't support it.
-- FIX: Added extract_json_from_response() — robust JSON extraction with 4 strategies.
-- FIX: Error logging replaces silent except-swallowing.
-- FIX: Removed dead mnemo_client.session.headers reference (crash bug).
-
-v6.9 changes:
-- Prior fixes: Slow-burn mandate, Context-aware continuations, Brute-force signal cleaning, Relational JSON.
+v6.9.3 changes:
+- NEW: Sequential W-method extraction. Prompt tells K2 to go step-by-step through 9
+  W-questions in order (WHO→WHY→WHOM→WHICH→WHEN→WHERE→HOW→WHAT→CLARIFICATION)
+  so it doesn't fixate on CHARACTER and starve later categories. Each step re-reads
+  the text for its specific question.
+- NEW: Output explicitly framed as ConnectionPoints (CPs) for graph database storage,
+  not generic "memories." JSON format matches store_as_cp() expectations.
+- NEW: MOTIVATION category added to CATEGORY_TO_CP mapping → ("character", "motivation").
+  Previously fell through to ("fact", "general").
+- CHANGED: INPUT_CHUNK_CHARS = 25K (~4K words). Smaller chunks = naturally bounded output.
+- Keeps: Auto-scaling, thread/knot structural pass, truncation salvage, robust JSON parsing.
 """
 
 import streamlit as st
@@ -88,8 +81,10 @@ MAX_SESSIONS_STORED = 20
 
 CATEGORY_TO_CP = {
     "CHARACTER": ("character", "character_profile"),
+    "MOTIVATION": ("character", "motivation"),
     "PLOT": ("plot", "plot_event"),
     "SETTING": ("setting", "setting_detail"),
+    "TIMELINE": ("plot", "timeline"),
     "THEME": ("fact", "theme"),
     "STYLE": ("style", "voice_note"),
     "TONE": ("tone", "tone_directive"),
@@ -102,7 +97,6 @@ CATEGORY_TO_CP = {
     "DIALOGUE_SAMPLE": ("style", "dialogue_sample"),
     "VOICE": ("style", "voice_note"),
     "VOCABULARY": ("style", "vocabulary"),
-    "TIMELINE": ("plot", "timeline"),
 }
 
 # ==========================================================================
@@ -572,64 +566,92 @@ def _salvage_truncated_memories(raw: str) -> dict:
 # =============================================================================
 # AUTO-SCALE EXTRACTION PIPELINE (v6.9.2)
 # =============================================================================
-# Single extraction prompt per chunk with EXPLICIT per-category caps.
-# The prompt controls WHAT and HOW MANY (<=35 memories/call -> fits 4096 tokens).
-# Auto-scaler controls HOW MANY CALLS (chunks by input quality, not output math).
+# SEQUENTIAL W-METHOD EXTRACTION PIPELINE (v6.9.3)
+# =============================================================================
+# Single prompt per chunk with STEP-BY-STEP W-question ordering.
+# K2 re-reads the text for each W-question in order so nothing gets missed.
+# Output framed as ConnectionPoints (CPs) for graph database storage.
+# Auto-scaler controls call count via input chunking (~4K words/chunk).
 # Thread/Knot structuring is a separate lightweight pass using the results.
 # =============================================================================
 
-# Per-chunk extraction caps — total <=35 so output always fits in 4096 tokens
-MEMORY_CAPS = {
-    "CHARACTER": 12,     # name, age, role, traits, fears, voice, backstory
-    "RELATIONSHIP": 8,   # key dynamics, connects_to required
-    "PLOT": 8,           # beats, sequences, conflicts
-    "TONE": 4,           # how to write, atmosphere, voice directives
-    "SETTING": 3,        # locations, time periods, world-building
-}
-MAX_MEMORIES_PER_CHUNK = sum(MEMORY_CAPS.values())  # 35
-
-# Input chunking — quality sweet spot, not context window limit
-INPUT_CHUNK_CHARS = 50000   # ~8K words per chunk — K2 reads well at this size
+# Input chunking — smaller chunks = naturally bounded output
+INPUT_CHUNK_CHARS = 25000   # ~4K words per chunk — produces ~30-40 memories each
 INPUT_CHUNK_OVERLAP = 2000  # overlap so entities aren't split mid-description
-MAX_INPUT_CHUNKS = 8
+MAX_INPUT_CHUNKS = 10
 
 
 def _build_extraction_prompt(content: str, filename: str, chunk_label: str = "") -> str:
-    """Build a single extraction prompt with explicit per-category caps."""
-    return f"""Extract structured memories from this document for a creative writing engine.
+    """Build sequential W-method extraction prompt — outputs CPs, not blobs."""
+    return f"""You are a memory extraction engine for a creative writing system. Your output will be stored as ConnectionPoints (CPs) in a graph database.
 
 DOCUMENT: {filename}{chunk_label}
 CONTENT:
 {content}
 
-EXTRACTION BUDGET — extract UP TO these limits per category:
-  CHARACTER (<={MEMORY_CAPS['CHARACTER']}): Name, age, role, appearance, personality, fears, secrets, motivations, speech patterns, backstory.
-  RELATIONSHIP (<={MEMORY_CAPS['RELATIONSHIP']}): Who connects to whom, power dynamics, emotional bonds, betrayals, alliances. MUST include "connects_to" field.
-  PLOT (<={MEMORY_CAPS['PLOT']}): Events, sequences, conflicts, twists, narrative beats. Focus on WHAT HAPPENS.
-  TONE (<={MEMORY_CAPS['TONE']}): Writing style, atmosphere, voice guidance, do-nots. Focus on HOW TO WRITE.
-  SETTING (<={MEMORY_CAPS['SETTING']}): Locations, time periods, factions, organizations, world-building facts.
+EXTRACTION METHOD — Go through the text step by step, one W-question at a time, IN THIS ORDER. Do not skip any step. After completing each step, move to the next.
 
-TOTAL: No more than {MAX_MEMORIES_PER_CHUNK} memories. Prioritize the most important facts for each category.
+STEP 1 — WHO (category: CHARACTER)
+Read through the text and extract every character mentioned. For each, capture: name, age, role, appearance, personality traits, speech patterns, backstory, reputation. One CP per distinct character facet.
 
-RULES:
-- One fact per entry. Combine related info into one clear sentence, don't split into micro-atoms.
-- Use plain names as entities: "Sebastian Carlisle" not "Dr. Sebastian Carlisle".
-- Keep each content field to 1-2 sentences max.
-- For RELATIONSHIP entries, ALWAYS include a "connects_to" field with the other person's name.
-- Do NOT repeat the same fact in different categories.
+STEP 2 — WHY (category: MOTIVATION)  
+Read through again. For each character or faction, extract: drives, fears, goals, secrets, philosophy, internal conflicts, desires, obsessions. One CP per distinct motivation.
+
+STEP 3 — WHOM/WHOSE (category: RELATIONSHIP)
+Read through again. Extract every connection between characters: power dynamics, emotional bonds, betrayals, alliances, family ties, romantic tension, mentorship, rivalries, loyalty. One CP per character pair per dynamic. MUST include "connects_to" field.
+
+STEP 4 — WHICH (category: PLOT)
+Read through again. Extract every narrative event: beats, conflicts, choices, turning points, twists, reveals, cause-and-effect chains, consequences. One CP per narrative beat.
+
+STEP 5 — WHEN (category: TIMELINE)
+Read through again. Extract chronological information: sequence of events, before/after relationships, time markers, pacing, deadlines, age references, era details. One CP per distinct temporal fact.
+
+STEP 6 — WHERE (category: SETTING)
+Read through again. Extract every location and environment: geography, atmosphere, sensory details, architecture, institutions, cultural spaces. One CP per distinct place.
+
+STEP 7 — HOW (category: TONE)
+Read through again. Extract writing directives: voice, prose style, atmosphere, recurring motifs, do-nots, dialogue rules, pacing notes, methods, rituals, techniques. One CP per broad directive.
+
+STEP 8 — WHAT (category: FACT)
+Read through once more. Extract any remaining world-building facts, faction structures, systems, lore, objects of significance, rules, or context that wasn't captured above. One CP per distinct fact.
+
+STEP 9 — CLARIFICATION
+Extract any author meta-instructions, corrections, or decisions about how to handle the material.
+
+W-WORD → CATEGORY MAPPING (use these exact category values in your output):
+  WHO → CHARACTER | WHY → MOTIVATION | WHOM/WHOSE → RELATIONSHIP
+  WHICH → PLOT | WHEN → TIMELINE | WHERE → SETTING
+  HOW → TONE | WHAT → FACT | meta → CLARIFICATION
+
+CP FORMAT RULES:
+- Each CP must have: local_id, entity, category, content
+- "entity" is a plain name used as a lookup key: "Sebastian Carlisle" not "Dr. Sebastian Carlisle"
+- "content" is 1-3 dense sentences. Combine related info — don't micro-atomize.
+- For RELATIONSHIP CPs: MUST include "connects_to" field with the other person's name.
+- Do NOT repeat the same fact across categories. If a fact was captured in CHARACTER, don't repeat it in MOTIVATION.
+- Extract what's ACTUALLY in the text. Don't invent beyond what's written.
 
 Respond with ONLY a valid JSON object — no preamble, no markdown fences:
 {{
   "memories": [
-    {{"local_id": "m1", "entity": "Alistair", "category": "CHARACTER", "content": "Late 30s professor of pharmacology at Cambridge, terrified of developing dementia like his father."}},
-    {{"local_id": "m2", "entity": "Alistair", "category": "RELATIONSHIP", "connects_to": "Sebastian", "content": "Oversees Sebastian's drug regimen at Blackwood Estate; views him as both experiment and failure."}},
-    {{"local_id": "m3", "entity": "Alistair", "category": "TONE", "content": "Scenes should feel clinical and cold. Power through precision, not theatrics. Dialogue always shortest in room."}}
+    {{"local_id": "m1", "entity": "Alistair Fitzroy", "category": "CHARACTER", "content": "Late 30s professor of pharmacology at Cambridge. Cold grey eyes, impeccably dressed, keeps hands deliberately still to project control. Wears his late mother's signet ring."}},
+    {{"local_id": "m2", "entity": "Alistair Fitzroy", "category": "MOTIVATION", "content": "Terrified of dementia after watching his father's decline. Would rather be remembered as a monster than not at all. Addicted to the feeling of discovery."}},
+    {{"local_id": "m3", "entity": "Alistair Fitzroy", "category": "RELATIONSHIP", "connects_to": "Sebastian Carlisle", "content": "Former friends at Edinburgh before a betrayal. Now oversees Sebastian's captivity drug regimen, viewing him as both greatest experiment and greatest failure."}},
+    {{"local_id": "m4", "entity": "Sebastian Carlisle", "category": "PLOT", "content": "Book 3: Blood samples tampered with opium causing mental deterioration, leading to surgical mistake and license revocation. Alistair offers Blackwood Estate as alternative to institutionalization."}},
+    {{"local_id": "m5", "entity": "Sebastian Carlisle", "category": "TIMELINE", "content": "Captivity arc occurs in Book 3, after the laudanum moral panic in Book 2. Sebastian's license revocation precedes the Blackwood Estate transfer."}},
+    {{"local_id": "m6", "entity": "Blackwood Estate", "category": "SETTING", "content": "Remote estate where Sebastian is held captive. Isabella's territory — Alistair's control unravels when she takes over. Isolation reinforces captivity themes."}},
+    {{"local_id": "m7", "entity": "Alistair Fitzroy", "category": "TONE", "content": "Scenes should feel clinical and cold, never melodramatic. Power through precision, not theatrics. Dialogue always the shortest in the room — he asks questions, never monologues."}},
+    {{"local_id": "m8", "entity": "Fitzroy Infant Protocol", "category": "FACT", "content": "Pharmacovigilance innovation created by Alistair, later weaponized by Red Rose front organizations to distribute laudanum-laced tonics through charity fronts."}},
+    {{"local_id": "m9", "entity": "Story", "category": "CLARIFICATION", "content": "Never use Dr. prefix in narration — just Alistair or Fitzroy. His hands are a recurring motif: stillness equals control, trembling equals losing it."}}
   ]
-}}"""
+}}
+
+The 9 examples above correspond 1:1 to the 9 steps:
+  m1=WHO, m2=WHY, m3=WHOM, m4=WHICH, m5=WHEN, m6=WHERE, m7=HOW, m8=WHAT, m9=CLARIFICATION"""
 
 
 async def _extract_chunk_async(http_client, chunk, filename, chunk_idx, total_chunks, openrouter_key):
-    """Extract capped memories from a single input chunk."""
+    """Extract W-method guided memories from a single input chunk."""
     chunk_label = f" (part {chunk_idx+1}/{total_chunks})" if total_chunks > 1 else ""
     prompt = _build_extraction_prompt(chunk, filename, chunk_label)
 
@@ -734,7 +756,7 @@ RULES:
 
 
 def calculate_extraction_plan(content: str) -> dict:
-    """Auto-scale: chunk by input quality (~8K words/chunk), not output token math."""
+    """Auto-scale: chunk by input quality (~4K words/chunk) for W-method extraction."""
     words = len(content.split())
     chars = len(content)
 
@@ -748,20 +770,20 @@ def calculate_extraction_plan(content: str) -> dict:
     plan = {
         "n_chunks": n_chunks,
         "total_calls": total_calls,
-        "max_memories_per_chunk": MAX_MEMORIES_PER_CHUNK,
         "words": words,
         "chars": chars,
     }
-    print(f"[EXTRACT PLAN] {words:,} words -> {n_chunks} chunk(s) x <={MAX_MEMORIES_PER_CHUNK}/chunk "
+    print(f"[EXTRACT PLAN] {words:,} words -> {n_chunks} chunk(s) (W-method guided) "
           f"+ 1 thread pass = {total_calls} calls")
     return plan
 
 
 def extract_memories_from_file(content, filename, openrouter_key):
-    """v6.9.2: Auto-scale extraction with per-category caps.
+    """v6.9.3: Sequential W-method extraction as ConnectionPoints.
 
-    Single prompt per chunk with explicit caps (<=35 memories -> fits 4096 tokens).
-    Chunks scale by input quality (~8K words each). Thread/knot pass runs after.
+    Single prompt per chunk with step-by-step W-questions (WHO→WHY→WHOM→WHICH→
+    WHEN→WHERE→HOW→WHAT→CLARIFICATION). Chunks scale by input quality (~4K words).
+    Thread/knot structural pass runs after all extraction.
     """
     plan = calculate_extraction_plan(content)
 
@@ -838,38 +860,54 @@ def extract_memories_from_file(content, filename, openrouter_key):
 
 
 def extract_memories_with_gpt(conversation, openrouter_key):
-    prompt = """Extract structured memories from this conversation for a creative writing engine.
+    prompt = """You are a memory extraction engine for a creative writing system. Your output will be stored as ConnectionPoints (CPs) in a graph database.
 
 CONVERSATION:
 {conversation}
 
-EXTRACTION BUDGET — extract UP TO these limits per category:
-  CHARACTER (<=12): Name, age, role, appearance, personality, fears, secrets, motivations, speech patterns, backstory.
-  RELATIONSHIP (<=8): Who connects to whom, power dynamics, emotional bonds. MUST include "connects_to" field.
-  PLOT (<=8): Events, sequences, conflicts, twists, narrative beats.
-  TONE (<=4): Writing style, atmosphere, voice guidance, do-nots.
-  SETTING (<=3): Locations, time periods, factions, world-building facts.
-  CLARIFICATION (<=5): Corrections, instructions, or meta-decisions from the user.
+EXTRACTION METHOD — Go through the conversation step by step, one W-question at a time, IN THIS ORDER:
 
-TOTAL: No more than 35 memories. Prioritize the most important facts.
+STEP 1 — WHO (CHARACTER): Extract every character mentioned — identity, traits, appearance, backstory.
+STEP 2 — WHY (MOTIVATION): For each character, extract drives, fears, goals, secrets, philosophy.
+STEP 3 — WHOM/WHOSE (RELATIONSHIP): Extract connections between characters. MUST include "connects_to" field.
+STEP 4 — WHICH (PLOT): Extract narrative events, beats, conflicts, twists, consequences.
+STEP 5 — WHEN (TIMELINE): Extract chronological info, sequence, before/after, time markers.
+STEP 6 — WHERE (SETTING): Extract locations, atmosphere, sensory details, institutions.
+STEP 7 — HOW (TONE): Extract writing directives, voice, style, motifs, do-nots.
+STEP 8 — WHAT (FACT): Extract remaining world-building, factions, systems, lore.
+STEP 9 — CLARIFICATION: Extract author corrections, instructions, meta-decisions.
 
-RULES:
-- One fact per entry. Combine related info into one clear sentence.
-- Use plain names as entities: "Sebastian Carlisle" not "Dr. Sebastian Carlisle".
-- Keep each content field to 1-2 sentences max.
-- For RELATIONSHIP entries, ALWAYS include a "connects_to" field.
+W-WORD → CATEGORY MAPPING (use these exact category values):
+  WHO → CHARACTER | WHY → MOTIVATION | WHOM/WHOSE → RELATIONSHIP
+  WHICH → PLOT | WHEN → TIMELINE | WHERE → SETTING
+  HOW → TONE | WHAT → FACT | meta → CLARIFICATION
+
+CP FORMAT RULES:
+- Each CP: local_id, entity, category, content (1-3 dense sentences)
+- Plain names as entities. Don't repeat facts across categories.
+- RELATIONSHIP CPs MUST include "connects_to" field.
 
 Respond with ONLY a valid JSON object — no preamble, no markdown fences:
 {{
   "memories": [
-    {{"local_id": "m1", "entity": "Alistair", "category": "CHARACTER", "content": "Late 30s professor of pharmacology, terrified of dementia."}},
-    {{"local_id": "m2", "entity": "Alistair", "category": "RELATIONSHIP", "connects_to": "Sebastian", "content": "Oversees Sebastian's drug regimen; views him as both experiment and failure."}}
+    {{"local_id": "m1", "entity": "Alistair Fitzroy", "category": "CHARACTER", "content": "Late 30s professor of pharmacology at Cambridge, impeccably dressed with cold grey eyes."}},
+    {{"local_id": "m2", "entity": "Alistair Fitzroy", "category": "MOTIVATION", "content": "Terrified of dementia. Would rather be remembered as a monster than forgotten. Addicted to the feeling of discovery."}},
+    {{"local_id": "m3", "entity": "Alistair Fitzroy", "category": "RELATIONSHIP", "connects_to": "Sebastian Carlisle", "content": "Oversees Sebastian's drug regimen; views him as both experiment and failure."}},
+    {{"local_id": "m4", "entity": "Sebastian Carlisle", "category": "PLOT", "content": "License revoked after surgical mistake caused by opium-tampered blood samples."}},
+    {{"local_id": "m5", "entity": "Sebastian Carlisle", "category": "TIMELINE", "content": "Captivity arc in Book 3 follows the laudanum moral panic in Book 2."}},
+    {{"local_id": "m6", "entity": "Blackwood Estate", "category": "SETTING", "content": "Remote estate where Sebastian is held. Isabella's territory."}},
+    {{"local_id": "m7", "entity": "Alistair Fitzroy", "category": "TONE", "content": "Scenes feel clinical and cold. Power through precision, not theatrics."}},
+    {{"local_id": "m8", "entity": "Red Rose Society", "category": "FACT", "content": "Elite decentralized medical order operating through legacy mentorship and institutional control."}},
+    {{"local_id": "m9", "entity": "Story", "category": "CLARIFICATION", "content": "Never use Dr. prefix in narration. Hands motif: stillness equals control."}}
   ],
   "threads": [
-    {{"name": "Captivity Arc", "entity": "Sebastian", "type": "plot_line", "memory_local_ids": ["m2"]}}
+    {{"name": "Captivity Arc", "entity": "Sebastian", "type": "plot_line", "memory_local_ids": ["m3", "m4"]}}
   ],
   "knots": []
-}}"""
+}}
+
+The 9 examples above correspond 1:1 to the 9 steps:
+  m1=WHO, m2=WHY, m3=WHOM, m4=WHICH, m5=WHEN, m6=WHERE, m7=HOW, m8=WHAT, m9=CLARIFICATION"""
 
     # v6.9.1 FIX: Proper error handling
     try:
@@ -1453,7 +1491,8 @@ def render_sessions_panel(mnemo_client, hf_key):
 def render_memory_management(mnemo_client):
     with st.expander("Add manually", expanded=False):
         memory_category = st.selectbox("Category",
-            ["CHARACTER", "PLOT", "SETTING", "THEME", "STYLE", "TONE", "FACT"])
+            ["CHARACTER", "MOTIVATION", "RELATIONSHIP", "PLOT", "TIMELINE",
+             "SETTING", "TONE", "FACT", "CLARIFICATION"])
         memory_entity = st.text_input("Entity (character name, 'Story', etc.)",
             placeholder="e.g., Alistair, Story, Red Rose Society", value="Story")
         memory_content = st.text_area("Content",
@@ -1582,8 +1621,8 @@ def render_file_upload(mnemo_client, openrouter_key):
                 plan = calculate_extraction_plan(content)
                 chunk_info = f"{plan['n_chunks']} chunk{'s' if plan['n_chunks'] > 1 else ''}"
                 st.info(f"📄 {plan['words']:,} words → {chunk_info} "
-                        f"(≤{plan['max_memories_per_chunk']}/chunk) + 1 thread pass "
-                        f"= {plan['total_calls']} calls @ 4096")
+                        f"(W-method guided) + 1 thread pass "
+                        f"= {plan['total_calls']} calls")
                 with st.spinner(f"K2 extracting ({plan['total_calls']} calls)..."):
                     extraction_data, cost, _ = extract_memories_from_file(content, uploaded_file.name, openrouter_key)
                 memories = extraction_data.get("memories", [])
@@ -1648,12 +1687,17 @@ def render_file_upload(mnemo_client, openrouter_key):
                             t_ids = [thread_name_to_id.get(tn, "thread_" + re.sub(r'[^a-z0-9]', '_', tn.lower())[:20]) for tn in kn.get("thread_names", [])]
                             mnemo_client.add_knot(knot_id=k_id, name=k_name, thread_ids=t_ids, pivot_type="collision", reason=kn.get("reason", ""), session_id=current_session)
 
-                    facts = [m for m in memories if m.get("category") in ("CHARACTER", "PLOT", "SETTING", "THEME", "FACT")]
-                    context = [m for m in memories if m.get("category") in ("CONTEXT", "CLARIFICATION", "RELATIONSHIP", "INSTRUCTION")]
-                    style = [m for m in memories if m.get("category") in ("PROSE_SAMPLE", "DIALOGUE_SAMPLE", "VOICE", "VOCABULARY")]
-                    tone = [m for m in memories if m.get("category") in ("TONE",)]
-                    st.success(f"✅ Stored {stored} memories, {len(threads_data)} threads, {len(knots_data)} knots")
-                    st.caption(f"📊 {len(facts)} facts · {len(context)} context · {len(style)} style · {len(tone)} tone | Cost: ${cost:.4f}")
+                    who = [m for m in memories if m.get("category") == "CHARACTER"]
+                    why = [m for m in memories if m.get("category") == "MOTIVATION"]
+                    whom = [m for m in memories if m.get("category") == "RELATIONSHIP"]
+                    which = [m for m in memories if m.get("category") == "PLOT"]
+                    when = [m for m in memories if m.get("category") == "TIMELINE"]
+                    where = [m for m in memories if m.get("category") == "SETTING"]
+                    how = [m for m in memories if m.get("category") == "TONE"]
+                    what = [m for m in memories if m.get("category") in ("FACT", "CLARIFICATION")]
+                    st.success(f"✅ Stored {stored} CPs, {len(threads_data)} threads, {len(knots_data)} knots")
+                    st.caption(f"📊 WHO:{len(who)} WHY:{len(why)} WHOM:{len(whom)} WHICH:{len(which)} "
+                               f"WHEN:{len(when)} WHERE:{len(where)} HOW:{len(how)} WHAT:{len(what)} | ${cost:.4f}")
                     with st.expander("View extracted memories", expanded=False):
                         for mem in memories:
                             st.caption(f"**[{mem.get('category', 'FACT')}]** {mem.get('content', '')[:150]}")
