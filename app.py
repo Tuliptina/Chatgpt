@@ -61,6 +61,7 @@ WRITING_PARAMS = {
     "temperature": 0.85,
     "frequency_penalty": 0.2,
     "presence_penalty": 0.3,
+    "max_tokens": 16384,
 }
 
 # v6.9.1 FIX: Removed response_format and repetition_penalty
@@ -158,7 +159,8 @@ def normalize_entity(raw_entity: str) -> str:
     return entity if entity else "Story"
 
 def store_as_cp(mnemo_client, entity, category, content, session_id="",
-                source="auto_extract", connects_to="", weight=0.5):
+                source="auto_extract", connects_to="", weight=0.5,
+                thread_id="", position=-1, namespace="default"):
     cat_key = category.upper()
     cp_category, point_type = CATEGORY_TO_CP.get(cat_key, ("fact", "general"))
     normalized_entity = normalize_entity(entity)
@@ -167,6 +169,7 @@ def store_as_cp(mnemo_client, entity, category, content, session_id="",
         entity=normalized_entity, point_type=point_type, value=content,
         connects_to=normalized_connects, reason="", weight=float(weight),
         category=cp_category, session_id=session_id, source=source,
+        thread_id=thread_id, position=int(position), namespace=namespace,
     )
 
 def auto_convert_blobs(mnemo_client):
@@ -258,9 +261,10 @@ def init_client(hf_key):
 
 def get_persistent_storage(hf_key=None, client=None):
     key = hf_key or DEFAULT_HF_KEY
+    cli = client or st.session_state.get("mnemo_client")
     if "persistent_storage" not in st.session_state or st.session_state.get("_ps_key") != key:
-        if key and client:
-            st.session_state.persistent_storage = SessionStore(hf_key=key, mnemo_client=client)
+        if key and cli:
+            st.session_state.persistent_storage = SessionStore(hf_key=key, mnemo_client=cli)
             st.session_state._ps_key = key
     return st.session_state.get("persistent_storage")
 
@@ -303,8 +307,8 @@ def save_current_session():
             msg_count = len([m for m in messages_copy if m.get("role") == "user"])
             if msg_count > 0 and msg_count % 25 == 0:
                 storage.cleanup_stale_sessions()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WARN] session save: {type(e).__name__}: {e}")
     if "session_history" not in st.session_state:
         st.session_state.session_history = []
     current_session = {
@@ -341,12 +345,22 @@ def delete_session(session_id):
     st.session_state.session_history = [
         s for s in st.session_state.get("session_history", []) if s["id"] != session_id
     ]
+    # Delete session record from SessionStore (HF Dataset persistence)
     try:
         storage = get_persistent_storage()
         if storage:
             storage.delete_session(session_id)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] session store delete: {type(e).__name__}: {e}")
+    # Cascade delete CPs, threads, knots from Mnemo backend
+    try:
+        mnemo_client = st.session_state.get("mnemo_client")
+        if mnemo_client:
+            result = mnemo_client.delete_session(session_id)
+            print(f"[INFO] Mnemo cascade delete for {session_id}: {result}")
+    except Exception as e:
+        print(f"[WARN] Mnemo cascade delete failed: {type(e).__name__}: {e}")
+    # Remove loop tokens
     if "loop_manager" in st.session_state:
         lm = st.session_state.loop_manager
         if hasattr(lm, 'remove_session_tokens'):
@@ -1169,6 +1183,7 @@ def handle_message(prompt, openrouter_key, mnemo_client):
     past_conversation_context = ""
     skip_loops_for_this_query = False
     sessions_found = 0
+    ctx_meta = {"sessions_found": 0, "threads_injected": 0, "knots_injected": 0, "cp_results": 0}
 
     if needs_memory and cross_session_enabled:
         try:
@@ -1182,8 +1197,7 @@ def handle_message(prompt, openrouter_key, mnemo_client):
             sessions_found = ctx_meta.get("sessions_found", 0)
         except Exception as e:
             past_conversation_context = ""
-            cp_error = f"build_context_failed: {str(e)[:80]}"
-            print(f"[WARN] build_memory_context failed: {e}")
+            print(f"[WARN] build_memory_context failed: {type(e).__name__}: {e}")
             traceback.print_exc()
 
     full_system_prompt = SYSTEM_PROMPT + past_conversation_context
@@ -1222,9 +1236,9 @@ def handle_message(prompt, openrouter_key, mnemo_client):
         "context_tokens": context_stats.get("total_tokens", 0),
         "mode": gate.mode, "memory_reason": gate.reason,
         "sessions_found": sessions_found, "gate_tier": gate.tier_used,
-        "threads_injected": ctx_meta.get("threads_injected", 0) if 'ctx_meta' in locals() else 0,
-        "knots_injected": ctx_meta.get("knots_injected", 0) if 'ctx_meta' in locals() else 0,
-        "cp_results": ctx_meta.get("cp_results", 0) if 'ctx_meta' in locals() else 0,
+        "threads_injected": ctx_meta.get("threads_injected", 0),
+        "knots_injected": ctx_meta.get("knots_injected", 0),
+        "cp_results": ctx_meta.get("cp_results", 0),
     }
 
     response, input_tokens, output_tokens, error = call_openrouter(messages, openrouter_key, mode="writing")
@@ -1262,8 +1276,8 @@ def handle_message(prompt, openrouter_key, mnemo_client):
             storage = get_persistent_storage(DEFAULT_HF_KEY, mnemo_client)
             if storage:
                 storage.save_conversation_turn(prompt, response, current_session_id)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WARN] conversation turn save: {type(e).__name__}: {e}")
 
     extracted = 0
     if (st.session_state.get("auto_extract", True)
@@ -1313,8 +1327,8 @@ def handle_message(prompt, openrouter_key, mnemo_client):
                                 loop_content = f"[{cat_upper}] {val}"
                                 
                             st.session_state.loop_manager.add_to_loop(content=loop_content, category=cat_upper.lower(), session_id=current_session_id, memory_id=cp_id)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"[WARN] extraction storage: {type(e).__name__}: {e}")
                         
             thread_name_to_id = {}
             for th in threads_data:
@@ -1668,8 +1682,8 @@ def render_file_upload(mnemo_client, openrouter_key):
                                             loop_content = f"[{cat_upper}] {val}"
                                             
                                         st.session_state.loop_manager.add_to_loop(content=loop_content, category=cat_upper.lower(), session_id=current_session, memory_id=cp_id)
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    print(f"[WARN] file upload CP storage: {type(e).__name__}: {e}")
                                     
                         thread_name_to_id = {}
                         for th in threads_data:
@@ -1865,7 +1879,7 @@ def main():
         <div class="brand-icon">🧠</div>
         <div class="brand-text">
             <h1>4o with Memory</h1>
-            <p>GPT-4o writer · K2 memory curator · Mnemo v6.9.1</p>
+            <p>GPT-4o writer · K2 memory curator · Mnemo v6.9.3</p>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1891,8 +1905,8 @@ def main():
             converted = auto_convert_blobs(mnemo_client)
             if converted > 0:
                 st.toast(f"🔄 Auto-migrated {converted} legacy memories → ConnectionPoints")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WARN] auto_convert_blobs: {type(e).__name__}: {e}")
 
     if "session_history_loaded" not in st.session_state:
         st.session_state.session_history_loaded = True
@@ -1905,8 +1919,8 @@ def main():
                     st.session_state.session_history = sessions
                 if hasattr(storage, 'load_folder_state'):
                     st.session_state.session_folders = storage.load_folder_state()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WARN] session history load: {type(e).__name__}: {e}")
 
     if "current_session_id" not in st.session_state:
         st.session_state.current_session_id = generate_session_id()
@@ -1932,8 +1946,8 @@ def main():
         st.session_state.signal_processor = SignalProcessor()
         try:
             st.session_state.signal_processor.update_threads_from_server(mnemo_client)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WARN] signal processor init: {type(e).__name__}: {e}")
             
     if "prefetch_engine" not in st.session_state:
         st.session_state.prefetch_engine = PrefetchEngine()
@@ -1949,7 +1963,7 @@ def main():
 
     st.markdown(f"""
     <div class="status-bar">
-        4o with Memory v6.9.1 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Threads & Knots &nbsp;·&nbsp; Graph Search
+        4o with Memory v6.9.3 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Threads & Knots &nbsp;·&nbsp; Graph Search
     </div>
     """, unsafe_allow_html=True)
 
