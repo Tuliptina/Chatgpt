@@ -366,7 +366,7 @@ class MnemoClient:
 
     def delete_thread(self, thread_id: str) -> bool:
         """Delete a thread by ID."""
-        result = self._call("delete_thread", thread_id)
+        result = self._call("delete_thread_api", thread_id)
         if result and isinstance(result, dict):
             return "deleted" in result
         return False
@@ -401,6 +401,13 @@ class MnemoClient:
         if result and isinstance(result, list):
             return result
         return []
+
+    def delete_knot(self, knot_id: str) -> bool:
+        """Delete a knot by ID."""
+        result = self._call("delete_knot_api", knot_id)
+        if result and isinstance(result, dict):
+            return result.get("deleted", False)
+        return False
 
     # =========================================================================
     # SESSION OPERATIONS (v6.0)
