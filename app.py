@@ -1,10 +1,10 @@
 """
-4o with Memory v6.8 — Dual-Processor Creative Writing Engine
+4o with Memory v6.9 — Dual-Processor Creative Writing Engine
 
-v6.8 changes:
-- FIX: Restored strict categorization mapping to K2 extraction prompts (stops "FACT" fallback).
-- FIX: Formatted LoopManager text as ConnectionPoints before caching (stops blob caching).
-- FIX: Fixed string matching for Threads & Knots so multi-word names match correctly (UI icons restored).
+v6.9 changes:
+- FIX: Increased file extraction chunk size to 40,000 characters to prevent API queuing.
+- FIX: Rewrote K2 prompts for "Exhaustive Atomic Extraction" to stop LLM laziness and force high-volume extractions.
+- Prior fixes: Slow-burn mandate, Context-aware continuations, Brute-force signal cleaning, Relational JSON.
 """
 
 import streamlit as st
@@ -393,7 +393,7 @@ def copy_response_dialog(content):
         st.rerun()
 
 # ============================================================================
-# FILE PROCESSING & K2 AUTO-EXTRACTION (v6.8 Relational JSON)
+# FILE PROCESSING & K2 AUTO-EXTRACTION (v6.9 Relational JSON)
 # ============================================================================
 
 def extract_text_from_file(uploaded_file):
@@ -433,16 +433,18 @@ def extract_text_from_file(uploaded_file):
 
 async def process_chunk_async(http_client, chunk, filename, i, total_chunks, openrouter_key):
     chunk_label = f" (part {i+1}/{total_chunks})" if total_chunks > 1 else ""
-    prompt = f"""Extract structured memories from this document by asking the W questions about everything mentioned.
+    # v6.9 FIX: Explicitly demand high-volume exhaustive extraction
+    prompt = f"""Extract structured memories from this document. Your PRIMARY goal is EXHAUSTIVE ATOMIC EXTRACTION. Do not summarize — break everything down into granular pieces. 
+Because this is a large text chunk, I expect a HIGH VOLUME of extracted memories (dozens of points). Read carefully to the very end of the document.
 
 DOCUMENT: {filename}{chunk_label}
 CONTENT:
 {chunk}
 
 METHOD:
-1. Extract individual facts as "memories". Classify the "category" strictly as one of: CHARACTER, PLOT, RELATIONSHIP (must have connects_to), SETTING, TONE, CLARIFICATION, FACT.
-2. If multiple memories form a narrative arc or sequence, group them into a "thread".
-3. If storylines collide or tone shifts drastically, create a "knot".
+1. EXHAUSTIVE EXTRACTION (PRIORITY 1): Extract ALL individual atomic facts as "memories". Split compound sentences into separate points. Classify the "category" strictly as: CHARACTER, PLOT, RELATIONSHIP, SETTING, TONE, CLARIFICATION, or FACT. For RELATIONSHIP, you MUST include a "connects_to" target.
+2. THREADING (PRIORITY 2): Only after extracting all atomic memories, if some form a narrative sequence, group their local_ids into a "thread". 
+3. KNOTTING: If storylines collide, create a "knot".
 
 CRITICAL ENTITY NAMING RULES:
   - Use plain names: "Sebastian Carlisle", NOT "Dr. Sebastian Carlisle"
@@ -451,14 +453,14 @@ CRITICAL ENTITY NAMING RULES:
 ENTRY FORMAT:
 {{
   "memories": [
-    {{"local_id": "m1", "entity": "Name", "category": "CHARACTER", "content": "1-3 sentence answer"}}
+    {{"local_id": "m1", "entity": "Alistair", "category": "CHARACTER", "content": "Alistair is terrified of developing dementia."}},
+    {{"local_id": "m2", "entity": "Alistair", "category": "RELATIONSHIP", "connects_to": "Sebastian", "content": "Alistair sees Sebastian's captivity as a medical necessity."}},
+    {{"local_id": "m3", "entity": "Sebastian", "category": "TONE", "content": "Sebastian's dialogue should be sparse and dissociated."}}
   ],
   "threads": [
-    {{"name": "Captivity Arc", "entity": "Sebastian", "type": "plot_line", "memory_local_ids": ["m1"]}}
+    {{"name": "Captivity Arc", "entity": "Sebastian", "type": "plot_line", "memory_local_ids": ["m2", "m3"]}}
   ],
-  "knots": [
-    {{"name": "The Confrontation", "reason": "Evelyn finds Sebastian", "thread_names": ["Captivity Arc"]}}
-  ]
+  "knots": []
 }}"""
 
     try:
@@ -466,7 +468,7 @@ ENTRY FORMAT:
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {openrouter_key}", "Content-Type": "application/json"},
             json={"model": MEMORY_MODEL_ID, "messages": [{"role": "user", "content": prompt}], **MEMORY_PARAMS},
-            timeout=90.0
+            timeout=120.0
         )
         if response.status_code != 200:
             return {}, 0
@@ -487,8 +489,9 @@ ENTRY FORMAT:
         return {"memories": [], "threads": [], "knots": []}, 0
 
 def extract_memories_from_file(content, filename, openrouter_key):
-    CHUNK_SIZE = 12000
-    CHUNK_OVERLAP = 1500
+    # v6.9 FIX: Huge chunk size for K2 long context (faster API turnaround)
+    CHUNK_SIZE = 40000
+    CHUNK_OVERLAP = 2000
     MAX_CHUNKS = 5
     chunks = []
     if len(content) <= CHUNK_SIZE:
@@ -540,32 +543,32 @@ def extract_memories_from_file(content, filename, openrouter_key):
     return {"memories": unique_memories, "threads": all_threads, "knots": all_knots}, total_cost
 
 def extract_memories_with_gpt(conversation, openrouter_key):
-    prompt = """Extract structured memories from this conversation by asking the W questions about everything mentioned.
+    prompt = """Extract structured memories from this conversation. Your PRIMARY goal is EXHAUSTIVE ATOMIC EXTRACTION. Do not summarize — break everything down into granular pieces.
 
 CONVERSATION:
 {conversation}
 
 METHOD:
-1. Extract individual facts as "memories". Classify the "category" strictly as one of: CHARACTER, PLOT, RELATIONSHIP (must have connects_to), SETTING, TONE, CLARIFICATION, FACT.
-2. If multiple memories form a narrative arc or sequence, group them into a "thread".
-3. If storylines collide or tone shifts drastically, create a "knot".
+1. EXHAUSTIVE EXTRACTION (PRIORITY 1): Extract ALL individual atomic facts as "memories" based on what was discussed. Classify the "category" strictly as: CHARACTER, PLOT, RELATIONSHIP, SETTING, TONE, CLARIFICATION, or FACT. For RELATIONSHIP, you MUST include a "connects_to" target.
+2. THREADING (PRIORITY 2): Only after extracting all atomic memories, if some form a sequence, group their local_ids into a "thread".
+3. KNOTTING: If storylines collide, create a "knot".
 
 CRITICAL ENTITY NAMING RULES:
   - Use plain names: "Sebastian Carlisle", NOT "Dr. Sebastian Carlisle"
   - Entity is a LOOKUP KEY for indexing. Keep it short and consistent.
 
 ENTRY FORMAT:
-{
+{{
   "memories": [
-    {"local_id": "m1", "entity": "Name", "category": "PLOT", "content": "1-3 sentence answer"}
+    {{"local_id": "m1", "entity": "Alistair", "category": "CHARACTER", "content": "Alistair is terrified of developing dementia."}},
+    {{"local_id": "m2", "entity": "Alistair", "category": "RELATIONSHIP", "connects_to": "Sebastian", "content": "Alistair sees Sebastian's captivity as a medical necessity."}},
+    {{"local_id": "m3", "entity": "Sebastian", "category": "TONE", "content": "Sebastian's dialogue should be sparse and dissociated."}}
   ],
   "threads": [
-    {"name": "Captivity Arc", "entity": "Sebastian", "type": "plot_line", "memory_local_ids": ["m1"]}
+    {{"name": "Captivity Arc", "entity": "Sebastian", "type": "plot_line", "memory_local_ids": ["m2", "m3"]}}
   ],
-  "knots": [
-    {"name": "The Confrontation", "reason": "Why they crossed", "thread_names": ["Captivity Arc"]}
-  ]
-}"""
+  "knots": []
+}}"""
 
     try:
         response = requests.post(
@@ -678,10 +681,7 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
             isolate = st.session_state.get("isolate_sessions", False)
             active_sessions = [current_session_id] if isolate and current_session_id else None
 
-            # =====================================================================
-            # FIX: ROBUST STRING MATCHING FOR THREADS & KNOTS
-            # Now matches exact names anywhere in the prompt string, fixing the UI.
-            # =====================================================================
+            # THREAD RETRIEVAL
             query_words = set(re.sub(r'[^\w\s]', '', prompt_lower).split())
             
             try:
@@ -693,7 +693,6 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
                         t_name_words = set(t_name.split())
                         t_entity = t.get("entity", "").lower()
                         
-                        # Match if the exact name or entity is in the prompt, or words heavily overlap
                         if (t_entity and t_entity in prompt_lower) or \
                            (t_name and t_name in prompt_lower) or \
                            any(w in query_words for w in t_name_words if len(w) > 3):
@@ -948,9 +947,6 @@ def handle_message(prompt, openrouter_key, mnemo_client):
                             extracted += 1
                             local_to_real_cp[mem["local_id"]] = cp_id
                             
-                            # ==============================================================
-                            # FIX: FORMAT LOOP MANAGER CACHE AS CONNECTION POINTS
-                            # ==============================================================
                             cat_upper = mem.get("category", "FACT").upper()
                             ent = mem.get("entity", "Story")
                             conn = mem.get("connects_to", "")
@@ -1157,7 +1153,6 @@ def render_memory_management(mnemo_client):
                 if cp_id:
                     st.success(f"✅ Saved [{memory_category}] for {memory_entity}")
                     
-                    # FIX: Format manual memories correctly before caching
                     cat = memory_category.upper()
                     ent = memory_entity.strip() or "Story"
                     val = memory_content.strip()
@@ -1268,9 +1263,9 @@ def render_file_upload(mnemo_client, openrouter_key):
             with st.spinner("Reading file..."):
                 content = extract_text_from_file(uploaded_file)
             if content and not content.startswith("["):
-                n_chunks = max(1, (len(content) - 1) // 12000 + 1)
+                n_chunks = max(1, (len(content) - 1) // 40000 + 1)
                 if n_chunks > 1:
-                    st.info(f"📄 {len(content):,} chars → splitting into {min(n_chunks, 5)} chunks")
+                    st.info(f"📄 {len(content):,} chars → splitting into {min(n_chunks, 5)} large chunks")
                 with st.spinner(f"K2 extracting ({min(n_chunks, 5)} call{'s' if n_chunks > 1 else ''})..."):
                     extraction_data, cost = extract_memories_from_file(content, uploaded_file.name, openrouter_key)
                 memories = extraction_data.get("memories", [])
@@ -1304,7 +1299,6 @@ def render_file_upload(mnemo_client, openrouter_key):
                                         stored += 1
                                         local_to_real_cp[mem["local_id"]] = cp_id
                                         
-                                        # FIX: Format before sending to fast cache
                                         cat_upper = mem.get("category", "FACT").upper()
                                         ent = mem.get("entity", "Story")
                                         conn = mem.get("connects_to", "")
@@ -1509,7 +1503,7 @@ def main():
         <div class="brand-icon">🧠</div>
         <div class="brand-text">
             <h1>4o with Memory</h1>
-            <p>GPT-4o writer · K2 memory curator · Mnemo v6.8</p>
+            <p>GPT-4o writer · K2 memory curator · Mnemo v6.9</p>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1592,7 +1586,7 @@ def main():
 
     st.markdown(f"""
     <div class="status-bar">
-        4o with Memory v6.8 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Threads & Knots &nbsp;·&nbsp; Graph Search
+        4o with Memory v6.9 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Threads & Knots &nbsp;·&nbsp; Graph Search
     </div>
     """, unsafe_allow_html=True)
 
