@@ -2272,124 +2272,57 @@ class MnemoEngine:
 
 
 # =============================================================================
-# PERSISTENT WRAPPER (downloads/uploads .db file to HuggingFace Datasets)
+# PERSISTENT WRAPPER (Uses SyncEngine for R2 / HF Datasets)
 # =============================================================================
 
 class PersistentMnemo:
-    """Wraps MnemoEngine with HuggingFace Datasets background persistence.
-
-    v7.0: Uploads/downloads the SQLite .db file directly.
-    No serialize/deserialize step. No JSON encoding of embeddings.
-    """
+    """Wraps MnemoEngine with SyncEngine (R2 / HuggingFace Datasets)."""
 
     def __init__(self, db_path: str = None, enable_hf_sync: bool = True):
-        self.hf_token = os.environ.get("HF_TOKEN")
-        self.dataset_repo_id = os.environ.get("DATASET_REPO_ID")
-
         config = MnemoConfig(db_path=db_path or "/app/data/mnemo.db")
         self._db_path = config.db_path
 
-        if self.hf_token:
-            from huggingface_hub import HfApi
-            self.api = HfApi(token=self.hf_token)
-        else:
-            self.api = None
+        # 1. Initialize the new SyncEngine
+        from sync_engine import SyncEngine
+        self.sync = SyncEngine(db_path=self._db_path)
 
-        # Download .db from HF if available
-        self._download_db()
+        # 2. Download .db from cloud on startup
+        if enable_hf_sync:
+            self.sync.download()
 
-        # Check for legacy JSON and migrate if needed
-        legacy_json = self._db_path.replace(".db", ".json").replace("mnemo.db", "mnemo_db.json")
+        # 3. Check for legacy JSON and migrate if needed
+        legacy_json = self.sync.get_legacy_json_path() or self._db_path.replace(".db", ".json").replace("mnemo.db", "mnemo_db.json")
         if not os.path.exists(self._db_path) or os.path.getsize(self._db_path) == 0:
-            # Also check the old hardcoded path
             for candidate in [legacy_json, "/app/data/mnemo_db.json"]:
                 if os.path.exists(candidate):
                     legacy_json = candidate
                     break
 
-        # Create engine (creates SQLite DB if not exists)
+        # 4. Create engine (creates SQLite DB if not exists)
         self.engine = MnemoEngine(config)
 
-        # Migrate legacy JSON if SQLite is empty
+        # 5. Migrate legacy JSON if SQLite is empty
         with self.engine.db.read() as conn:
             n_cp = conn.execute("SELECT COUNT(*) as c FROM connection_points").fetchone()["c"]
             n_mem = conn.execute("SELECT COUNT(*) as c FROM memories").fetchone()["c"]
         if n_cp == 0 and n_mem == 0 and os.path.exists(legacy_json):
             self.engine.migrate_from_json(legacy_json)
 
-        # Background sync
-        self._needs_sync = False
-        if enable_hf_sync and self.dataset_repo_id and self.hf_token:
+        # 6. Start background sync
+        if enable_hf_sync and self.sync.has_credentials:
             t = threading.Thread(target=self._background_sync, daemon=True)
             t.start()
         elif enable_hf_sync:
-            print("WARNING: No HF_TOKEN or DATASET_REPO_ID. Memory will be ephemeral.")
-
-    def _download_db(self):
-        """Download SQLite .db file from HuggingFace Datasets on startup."""
-        if not self.api or not self.dataset_repo_id:
-            return
-        try:
-            import concurrent.futures
-            from huggingface_hub import hf_hub_download
-            from huggingface_hub.utils import EntryNotFoundError
-
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(
-                    hf_hub_download, repo_id=self.dataset_repo_id,
-                    filename="mnemo.db", repo_type="dataset", token=self.hf_token)
-                try:
-                    downloaded = future.result(timeout=60)
-                except concurrent.futures.TimeoutError:
-                    print("WARNING: HF download timed out after 60s. Starting fresh.")
-                    return
-
-            os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
-            import shutil
-            shutil.copy(downloaded, self._db_path)
-            print(f"Downloaded database from HF Datasets: {self._db_path}")
-        except EntryNotFoundError:
-            # First run — try downloading legacy JSON format
-            try:
-                from huggingface_hub import hf_hub_download
-                from huggingface_hub.utils import EntryNotFoundError as ENF2
-                downloaded = hf_hub_download(
-                    repo_id=self.dataset_repo_id, filename="mnemo_db.json",
-                    repo_type="dataset", token=self.hf_token)
-                legacy_path = self._db_path.replace(".db", "_legacy.json")
-                import shutil
-                shutil.copy(downloaded, legacy_path)
-                print(f"Downloaded legacy JSON for migration: {legacy_path}")
-            except Exception:
-                pass  # No existing data at all — fresh start
-        except Exception as e:
-            print(f"CRITICAL: Failed to download database: {e}")
-
-    def _upload_db(self) -> bool:
-        """Upload SQLite .db file to HuggingFace Datasets."""
-        if not self.api or not self.dataset_repo_id:
-            return False
-        try:
-            self.engine.db.checkpoint()
-            self.api.upload_file(
-                path_or_fileobj=self._db_path,
-                path_in_repo="mnemo.db",
-                repo_id=self.dataset_repo_id,
-                repo_type="dataset",
-                commit_message="Auto-backup mnemo v7 database",
-            )
-            print("Background sync to HF Datasets succeeded (SQLite .db).")
-            return True
-        except Exception as e:
-            print(f"Background sync failed: {e}")
-            return False
+            print("WARNING: No sync credentials. Memory will be ephemeral.")
 
     def _background_sync(self):
+        """Monitors engine dirty state and triggers SyncEngine uploads."""
+        import time
         while True:
             time.sleep(30)
             if self.engine.is_dirty:
                 self.engine.mark_clean()
-                self._upload_db()
+                self.sync.upload()
 
     # Delegate all engine methods (same signatures as v6.5)
     def add(self, *a, **kw): return self.engine.add(*a, **kw)
@@ -2401,7 +2334,10 @@ class PersistentMnemo:
     def maintenance(self): return self.engine.maintenance()
     def list_all(self): return self.engine.list_all()
     def list_memories(self, *a, **kw): return self.engine.list_memories(*a, **kw)
-    def get_stats(self): return self.engine.get_stats()
+    def get_stats(self):
+        stats = self.engine.get_stats()
+        stats["sync_engine"] = self.sync.get_stats() # Expose new sync stats
+        return stats
     def clear(self): return self.engine.clear()
     def __len__(self): return len(self.engine)
     def __getattr__(self, name): return getattr(self.engine, name)
