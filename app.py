@@ -2,23 +2,24 @@
 4o with Memory v6.9.1 — Dual-Processor Creative Writing Engine
 
 v6.9.1 changes:
-- NEW: Auto-scaling extraction via calculate_extraction_plan() — chunk count and
-  max_tokens are now decided dynamically by file size instead of hardcoded.
-  Formula: ~12 memories/1K words × 100 tokens/memory JSON + overhead → auto max_tokens.
-  Small files (<2K words): 1 call @ 4096. Medium (<6.5K): 1 call @ 8192.
-  Large (<10K): 1 call @ 10-12K. Very large: splits into 2-5 parallel chunks.
-- FIX: Removed response_format from MEMORY_PARAMS — K2 on OpenRouter doesn't support it,
-  causing silent extraction failures ("No memories extracted").
-- FIX: Added extract_json_from_response() — robust JSON extraction that handles markdown
-  fences, text preamble, and brace-depth matching.
-- FIX: Replaced silent except-swallowing in process_chunk_async and extract_memories_with_gpt
-  with actual error logging so failures are visible in Streamlit Cloud logs.
-- FIX: Removed repetition_penalty from MEMORY_PARAMS — non-standard param that some
-  OpenRouter providers reject with 400 errors.
+- NEW: Category-focused extraction pipeline replaces the single "extract everything"
+  prompt. K2 was generating 157 memories/1K words (not 12 as estimated), instantly
+  hitting the 4096 token limit on any file >500 words. Now runs 5 focused parallel
+  passes (CHARACTER, RELATIONSHIP, PLOT, TONE/STYLE, SETTING/FACT) + 1 thread/knot
+  structural pass. Each pass has ONE clear job, fits in 4096 tokens, and K2 doesn't
+  get confused by competing instructions.
+- NEW: Thread/Knot extraction separated into its own lightweight structural pass
+  that runs after memory extraction, using the extracted memory IDs as input.
+- NEW: Truncation salvage via _salvage_truncated_memories() — safety net if a
+  category pass still hits the limit. Regex-extracts complete memory objects.
+- FIX: Removed response_format from MEMORY_PARAMS — K2 on OpenRouter doesn't support it.
+- FIX: Added extract_json_from_response() — robust JSON extraction with 4 strategies.
+- FIX: Error logging replaces silent except-swallowing in extraction functions.
+- FIX: Removed dead mnemo_client.session.headers reference (crash bug).
 
 v6.9 changes:
 - FIX: Increased file extraction chunk size to 40,000 characters to prevent API queuing.
-- FIX: Rewrote K2 prompts for "Exhaustive Atomic Extraction" to stop LLM laziness and force high-volume extractions.
+- FIX: Rewrote K2 prompts for "Exhaustive Atomic Extraction" to stop LLM laziness.
 - Prior fixes: Slow-burn mandate, Context-aware continuations, Brute-force signal cleaning, Relational JSON.
 """
 
@@ -74,14 +75,14 @@ WRITING_PARAMS = {
 # v6.9.1 FIX: Removed response_format and repetition_penalty
 # K2 on OpenRouter doesn't support response_format: json_object — it either
 # returns a 400 error or ignores it, causing extraction to silently fail.
-# repetition_penalty is non-standard and some providers reject it.
-# max_tokens=4096 is the DEFAULT for conversation extraction (short output).
-# For file extraction, calculate_extraction_plan() overrides this dynamically.
+# max_tokens=4096 is the practical ceiling for K2 on OpenRouter — providers
+# silently cap output regardless of what you request. We scale by adding
+# more parallel chunks instead of trying higher output budgets.
 MEMORY_PARAMS = {
     "temperature": 0.2,
     "frequency_penalty": 0.0,
     "presence_penalty": 0.0,
-    "max_tokens": 4096,  # Default — overridden by calculate_extraction_plan() for files
+    "max_tokens": 4096,
 }
 
 MAX_CONVERSATION_MESSAGES = 8
@@ -460,6 +461,7 @@ def extract_json_from_response(raw: str) -> dict:
     - Wrapped in ```json ... ``` markdown fences  
     - With preamble text before the JSON
     - With trailing text after the JSON
+    - TRUNCATED mid-object when max_tokens is hit (Strategy 4 salvages these)
     """
     clean = raw.strip()
     
@@ -505,197 +507,352 @@ def extract_json_from_response(raw: str) -> dict:
                         pass
                     break
     
+    # Strategy 4: SALVAGE — JSON was truncated (max_tokens hit mid-output).
+    # json.loads() is all-or-nothing, so even 34 valid memories get thrown away
+    # because the 35th was cut mid-word. Instead, regex-extract every complete
+    # memory object and reconstruct the wrapper.
+    if '"memories"' in clean or '"local_id"' in clean:
+        salvaged = _salvage_truncated_memories(clean)
+        if salvaged:
+            n = len(salvaged.get("memories", []))
+            print(f"[K2 EXTRACT] JSON truncated — salvaged {n} complete memories from partial response")
+            return salvaged
+    
     return {}
 
 
-# v6.9.1: Auto-scaling extraction — calculates optimal chunks & max_tokens per file
-def calculate_extraction_plan(content: str) -> dict:
-    """Auto-scale extraction API calls based on file size.
+def _salvage_truncated_memories(raw: str) -> dict:
+    """Extract individual complete memory objects from truncated JSON.
     
-    Returns dict with: n_chunks, chunk_size, chunk_overlap, max_tokens_per_call,
-    estimated_memories, estimated_output_tokens, words, chars
+    When K2 hits max_tokens, the JSON is cut mid-object:
+      {"memories": [{"local_id":"m1",...}, {"local_id":"m2",...}, {"local_id":"m35","content":"trunc
+    
+    json.loads() rejects the entire thing. This function regex-extracts every
+    COMPLETE {...} object that has the required fields, discards the broken
+    last one, and reconstructs the wrapper.
     """
-    words = len(content.split())
-    chars = len(content)
+    # Find all complete JSON objects that look like memories
+    # Each memory has at minimum: local_id OR entity + content
+    memory_pattern = re.compile(
+        r'\{[^{}]*?"(?:local_id|entity)"[^{}]*?"content"\s*:\s*"[^"]*"[^{}]*?\}',
+        re.DOTALL
+    )
     
-    MEMORIES_PER_1K_WORDS = 12
-    TOKENS_PER_MEMORY_JSON = 100
-    THREAD_KNOT_OVERHEAD = 500
-    SAFETY_MARGIN = 1.25
-    MAX_RELIABLE_OUTPUT = 12000  # K2's reliable output ceiling per call
-    TARGET_OUTPUT_PER_CHUNK = 10000
+    matches = memory_pattern.findall(raw)
+    if not matches:
+        return {}
     
-    expected_memories = max(5, int(words / 1000 * MEMORIES_PER_1K_WORDS))
-    raw_output = expected_memories * TOKENS_PER_MEMORY_JSON + THREAD_KNOT_OVERHEAD
-    estimated_output = int(raw_output * SAFETY_MARGIN)
+    memories = []
+    for match in matches:
+        try:
+            obj = json.loads(match)
+            if isinstance(obj, dict) and obj.get("content"):
+                memories.append(obj)
+        except json.JSONDecodeError:
+            continue
     
-    if estimated_output <= 4096:
-        n_chunks, max_tokens = 1, 4096
-    elif estimated_output <= 8192:
-        n_chunks, max_tokens = 1, 8192
-    elif estimated_output <= MAX_RELIABLE_OUTPUT:
-        n_chunks, max_tokens = 1, estimated_output
-    else:
-        memories_per_chunk = (TARGET_OUTPUT_PER_CHUNK - THREAD_KNOT_OVERHEAD) // TOKENS_PER_MEMORY_JSON
-        words_per_chunk = int(memories_per_chunk / MEMORIES_PER_1K_WORDS * 1000)
-        chars_per_chunk = words_per_chunk * 7
-        n_chunks = min(max(1, -(-chars // chars_per_chunk)), 5)
-        max_tokens = TARGET_OUTPUT_PER_CHUNK
+    if not memories:
+        return {}
     
-    if n_chunks == 1:
-        chunk_size = chars + 1
-        chunk_overlap = 0
-    else:
-        chunk_size = chars // n_chunks + 2000
-        chunk_overlap = 2000
+    # Also try to salvage any complete thread objects
+    threads = []
+    thread_pattern = re.compile(
+        r'\{[^{}]*?"name"\s*:\s*"[^"]*"[^{}]*?"memory_local_ids"\s*:\s*\[[^\]]*\][^{}]*?\}',
+        re.DOTALL
+    )
+    for match in thread_pattern.findall(raw):
+        try:
+            obj = json.loads(match)
+            if isinstance(obj, dict) and obj.get("name"):
+                threads.append(obj)
+        except json.JSONDecodeError:
+            continue
     
-    plan = {
-        "n_chunks": n_chunks, "chunk_size": chunk_size,
-        "chunk_overlap": chunk_overlap, "max_tokens_per_call": max_tokens,
-        "estimated_memories": expected_memories,
-        "estimated_output_tokens": estimated_output,
-        "words": words, "chars": chars,
-    }
-    print(f"[EXTRACT PLAN] {words:,} words → ~{expected_memories} memories → "
-          f"~{estimated_output:,} output tokens → {n_chunks} call(s) @ max_tokens={max_tokens}")
-    return plan
+    return {"memories": memories, "threads": threads, "knots": []}
 
 
-async def process_chunk_async(http_client, chunk, filename, i, total_chunks, openrouter_key, params_override=None):
-    chunk_label = f" (part {i+1}/{total_chunks})" if total_chunks > 1 else ""
-    # v6.9 FIX: Explicitly demand high-volume exhaustive extraction
-    prompt = f"""Extract structured memories from this document. Your PRIMARY goal is EXHAUSTIVE ATOMIC EXTRACTION. Do not summarize — break everything down into granular pieces. 
-Because this is a large text chunk, I expect a HIGH VOLUME of extracted memories (dozens of points). Read carefully to the very end of the document.
+# =============================================================================
+# CATEGORY-FOCUSED EXTRACTION PIPELINE (v6.9.1)
+# =============================================================================
+# Instead of one monster "extract everything" prompt that generates 157 memories
+# per 1K words (hitting token limits), we split into focused category passes.
+# Each pass has ONE job, fits in 4096 tokens, and runs in parallel.
+# Thread/Knot structuring is a separate lightweight pass using the results.
+# =============================================================================
+
+EXTRACTION_CATEGORIES = {
+    "CHARACTER": {
+        "instruction": "Extract ONLY character information: names, ages, roles, physical descriptions, personality traits, fears, secrets, motivations, speech patterns, and backstory facts.",
+        "example": '{"local_id": "m1", "entity": "Alistair", "category": "CHARACTER", "content": "Terrified of developing dementia like his father."}',
+    },
+    "RELATIONSHIP": {
+        "instruction": "Extract ONLY relationships between characters: who is connected to whom, power dynamics, emotional bonds, betrayals, alliances, family ties. EVERY entry MUST have a connects_to field naming the other person.",
+        "example": '{"local_id": "m1", "entity": "Alistair", "category": "RELATIONSHIP", "connects_to": "Sebastian", "content": "Oversees Sebastian\'s drug regimen, views him as both experiment and failure."}',
+    },
+    "PLOT": {
+        "instruction": "Extract ONLY plot events, story sequences, conflicts, twists, and narrative beats. Focus on WHAT HAPPENS, not who people are.",
+        "example": '{"local_id": "m1", "entity": "Sebastian", "category": "PLOT", "content": "Captivity at Blackwood Estate: drug protocols begin, Isabella takes control from Alistair."}',
+    },
+    "TONE_STYLE": {
+        "instruction": "Extract ONLY tone directives, writing style notes, atmosphere descriptions, voice guidance, prose samples, and do-nots. Focus on HOW to write, not what happens.",
+        "example": '{"local_id": "m1", "entity": "Alistair", "category": "TONE", "content": "Scenes should feel clinical and cold, never melodramatic. Power through precision, not theatrics."}',
+    },
+    "SETTING_FACT": {
+        "instruction": "Extract ONLY settings (locations, time periods, sensory details), world-building facts, faction descriptions, organizational structures, and general information that doesn't fit other categories.",
+        "example": '{"local_id": "m1", "entity": "Red Rose Society", "category": "FACT", "content": "Elite decentralized medical order operating through legacy mentorship and institutional control."}',
+    },
+}
+
+
+def _build_category_prompt(content: str, filename: str, category_key: str, chunk_label: str = "") -> str:
+    """Build a focused extraction prompt for a single category."""
+    cat = EXTRACTION_CATEGORIES[category_key]
+    return f"""{cat["instruction"]}
 
 DOCUMENT: {filename}{chunk_label}
 CONTENT:
-{chunk}
+{content}
 
-METHOD:
-1. EXHAUSTIVE EXTRACTION (PRIORITY 1): Extract ALL individual atomic facts as "memories". Split compound sentences into separate points. Classify the "category" strictly as: CHARACTER, PLOT, RELATIONSHIP, SETTING, TONE, CLARIFICATION, or FACT. For RELATIONSHIP, you MUST include a "connects_to" target.
-2. THREADING (PRIORITY 2): Only after extracting all atomic memories, if some form a narrative sequence, group their local_ids into a "thread". 
-3. KNOTTING: If storylines collide, create a "knot".
+RULES:
+- Extract ONLY what's described above. Ignore information that belongs to other categories.
+- One fact per entry. Split compound sentences.
+- Use plain names as entities: "Sebastian Carlisle" not "Dr. Sebastian Carlisle"
+- Keep each content field to 1-2 sentences max.
+- Aim for 10-30 entries. Be thorough but don't duplicate.
 
-CRITICAL ENTITY NAMING RULES:
-  - Use plain names: "Sebastian Carlisle", NOT "Dr. Sebastian Carlisle"
-  - Entity is a LOOKUP KEY for indexing. Keep it short and consistent.
-
-You MUST respond with ONLY a valid JSON object. No preamble, no explanation — pure JSON:
+Respond with ONLY a valid JSON object:
 {{
   "memories": [
-    {{"local_id": "m1", "entity": "Alistair", "category": "CHARACTER", "content": "Alistair is terrified of developing dementia."}},
-    {{"local_id": "m2", "entity": "Alistair", "category": "RELATIONSHIP", "connects_to": "Sebastian", "content": "Alistair sees Sebastian's captivity as a medical necessity."}},
-    {{"local_id": "m3", "entity": "Sebastian", "category": "TONE", "content": "Sebastian's dialogue should be sparse and dissociated."}}
-  ],
-  "threads": [
-    {{"name": "Captivity Arc", "entity": "Sebastian", "type": "plot_line", "memory_local_ids": ["m2", "m3"]}}
-  ],
-  "knots": []
+    {cat["example"]}
+  ]
 }}"""
 
-    # v6.9.1 FIX: Proper error handling instead of silent swallowing
-    call_params = params_override or MEMORY_PARAMS
+
+async def _extract_category_async(http_client, content, filename, category_key, chunk_label, openrouter_key):
+    """Extract memories for a single category from a single chunk."""
+    prompt = _build_category_prompt(content, filename, category_key, chunk_label)
+    
     try:
         response = await http_client.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {openrouter_key}", "Content-Type": "application/json"},
-            json={"model": MEMORY_MODEL_ID, "messages": [{"role": "user", "content": prompt}], **call_params},
+            json={"model": MEMORY_MODEL_ID, "messages": [{"role": "user", "content": prompt}], **MEMORY_PARAMS},
             timeout=120.0
         )
         if response.status_code != 200:
-            print(f"[K2 EXTRACT] API error {response.status_code} for chunk {i+1}: {response.text[:300]}")
-            return {"memories": [], "threads": [], "knots": []}, 0
+            print(f"[K2 {category_key}] API error {response.status_code}: {response.text[:200]}")
+            return [], 0
             
         data = response.json()
         raw = data["choices"][0]["message"]["content"]
         usage = data.get("usage", {})
         cost = (usage.get("prompt_tokens", 0) * 0.55 + usage.get("completion_tokens", 0) * 2.20) / 1_000_000
         
-        # v6.9.1: Use robust JSON extraction
         parsed = extract_json_from_response(raw)
-        
         if not parsed:
-            print(f"[K2 EXTRACT] JSON parse failed for chunk {i+1}. Raw preview: {raw[:500]}")
-            return {"memories": [], "threads": [], "knots": []}, cost
+            print(f"[K2 {category_key}] JSON parse failed. Preview: {raw[:300]}")
+            return [], cost
         
-        if "memories" in parsed:
-            return parsed, cost
+        memories = parsed.get("memories", [])
+        # Try alternate keys
+        if not memories:
+            for alt in ("results", "items", "data", "points"):
+                memories = parsed.get(alt, [])
+                if memories: break
         
-        # K2 sometimes uses different key names
-        for alt_key in ("results", "items", "data", "points", "extractions"):
-            if alt_key in parsed:
-                print(f"[K2 EXTRACT] Found memories under alternate key '{alt_key}'")
-                return {"memories": parsed[alt_key], "threads": parsed.get("threads", []), "knots": parsed.get("knots", [])}, cost
+        # Tag memories with their category if K2 forgot
+        default_cat = category_key.split("_")[0]  # TONE_STYLE → TONE
+        for mem in memories:
+            if not mem.get("category"):
+                mem["category"] = default_cat
+            if not mem.get("local_id"):
+                mem["local_id"] = f"{default_cat.lower()[:3]}_{uuid.uuid4().hex[:6]}"
         
-        print(f"[K2 EXTRACT] Parsed JSON but no 'memories' key. Keys: {list(parsed.keys())}. Preview: {raw[:300]}")
-        return {"memories": [], "threads": [], "knots": []}, cost
+        print(f"[K2 {category_key}] Extracted {len(memories)} memories")
+        return memories, cost
         
     except Exception as e:
-        print(f"[K2 EXTRACT] Exception in chunk {i+1}: {type(e).__name__}: {e}")
-        traceback.print_exc()
-        return {"memories": [], "threads": [], "knots": []}, 0
+        print(f"[K2 {category_key}] Exception: {type(e).__name__}: {e}")
+        return [], 0
+
+
+async def _extract_threads_async(http_client, memories_summary, openrouter_key):
+    """Structural pass: group extracted memories into threads and knots."""
+    prompt = f"""You are given a list of extracted story memories. Your job is to identify:
+1. THREADS: Narrative sequences where memories form a chronological or causal chain.
+2. KNOTS: Points where two or more threads collide or intersect.
+
+EXTRACTED MEMORIES:
+{memories_summary}
+
+Respond with ONLY a valid JSON object:
+{{
+  "threads": [
+    {{"name": "Captivity Arc", "entity": "Sebastian", "type": "plot_line", "memory_local_ids": ["m1", "m2", "m5"]}}
+  ],
+  "knots": [
+    {{"name": "Blackwood Arrival", "thread_names": ["Captivity Arc", "Isabella's Obsession"], "reason": "Sebastian enters Isabella's territory"}}
+  ]
+}}
+
+RULES:
+- Only create threads from 3+ memories that form a clear sequence.
+- Only create knots where threads genuinely intersect.
+- If no clear threads or knots exist, return empty arrays.
+- Use the exact local_id values from the memories above."""
+
+    try:
+        response = await http_client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {openrouter_key}", "Content-Type": "application/json"},
+            json={"model": MEMORY_MODEL_ID, "messages": [{"role": "user", "content": prompt}], **MEMORY_PARAMS},
+            timeout=120.0
+        )
+        if response.status_code != 200:
+            print(f"[K2 THREADS] API error {response.status_code}: {response.text[:200]}")
+            return [], [], 0
+
+        data = response.json()
+        raw = data["choices"][0]["message"]["content"]
+        usage = data.get("usage", {})
+        cost = (usage.get("prompt_tokens", 0) * 0.55 + usage.get("completion_tokens", 0) * 2.20) / 1_000_000
+        
+        parsed = extract_json_from_response(raw)
+        if not parsed:
+            print(f"[K2 THREADS] JSON parse failed. Preview: {raw[:300]}")
+            return [], [], cost
+        
+        threads = parsed.get("threads", [])
+        knots = parsed.get("knots", [])
+        print(f"[K2 THREADS] Found {len(threads)} threads, {len(knots)} knots")
+        return threads, knots, cost
+        
+    except Exception as e:
+        print(f"[K2 THREADS] Exception: {type(e).__name__}: {e}")
+        return [], [], 0
+
+
+def calculate_extraction_plan(content: str) -> dict:
+    """Calculate input chunking (only needed for very large files).
+    
+    Category splitting handles output volume. Input chunking is only needed
+    when the file itself exceeds ~30K chars (the prompt + content must fit
+    in K2's 131K context window, but we stay conservative).
+    """
+    words = len(content.split())
+    chars = len(content)
+    
+    INPUT_CHUNK_SIZE = 30000  # chars per input chunk
+    MAX_INPUT_CHUNKS = 5
+    
+    if chars <= INPUT_CHUNK_SIZE:
+        n_input_chunks = 1
+    else:
+        n_input_chunks = min(max(1, -(-chars // INPUT_CHUNK_SIZE)), MAX_INPUT_CHUNKS)
+    
+    n_categories = len(EXTRACTION_CATEGORIES)
+    total_extraction_calls = n_input_chunks * n_categories
+    total_calls = total_extraction_calls + 1  # +1 for thread/knot pass
+    
+    plan = {
+        "n_input_chunks": n_input_chunks,
+        "n_categories": n_categories,
+        "total_calls": total_calls,
+        "words": words,
+        "chars": chars,
+    }
+    print(f"[EXTRACT PLAN] {words:,} words → {n_input_chunks} chunk(s) × {n_categories} categories "
+          f"+ 1 thread pass = {total_calls} calls")
+    return plan
+
 
 def extract_memories_from_file(content, filename, openrouter_key):
-    """v6.9.1: Auto-scaling extraction — chunk count and max_tokens decided by file size."""
+    """v6.9.1: Category-focused extraction with per-category 4096 cap.
+    
+    Each category gets its own focused prompt and API call.
+    All category calls run in parallel. Thread/knot pass runs after.
+    """
     plan = calculate_extraction_plan(content)
     
-    CHUNK_SIZE = plan["chunk_size"]
-    CHUNK_OVERLAP = plan["chunk_overlap"]
-    MAX_CHUNKS = plan["n_chunks"]
-    max_tokens_override = plan["max_tokens_per_call"]
+    # Split input into chunks if file is very large
+    INPUT_CHUNK_SIZE = 30000
+    CHUNK_OVERLAP = 2000
     
-    # Build extraction params with auto-scaled max_tokens
-    extract_params = {**MEMORY_PARAMS, "max_tokens": max_tokens_override}
-    
-    chunks = []
-    if len(content) <= CHUNK_SIZE:
+    if len(content) <= INPUT_CHUNK_SIZE:
         chunks = [content]
     else:
+        chunks = []
         start = 0
-        while start < len(content) and len(chunks) < MAX_CHUNKS:
-            end = start + CHUNK_SIZE
+        while start < len(content) and len(chunks) < plan["n_input_chunks"]:
+            end = start + INPUT_CHUNK_SIZE
             if end < len(content):
                 boundary = content.rfind('\n', start, end)
                 if boundary == -1 or boundary < end - 1000:
                     boundary = content.rfind('. ', start, end)
-                if boundary != -1 and boundary > start + (CHUNK_SIZE // 2):
+                if boundary != -1 and boundary > start + (INPUT_CHUNK_SIZE // 2):
                     end = boundary + 1
             chunks.append(content[start:end])
             start = end - CHUNK_OVERLAP
 
-    async def run_all_chunks():
+    async def run_extraction():
         async with httpx.AsyncClient() as http_client:
-            tasks = [process_chunk_async(http_client, chunk, filename, i, len(chunks),
-                                         openrouter_key, extract_params)
-                     for i, chunk in enumerate(chunks)]
-            return await asyncio.gather(*tasks)
+            # Pass 1: Run all category extractions in parallel
+            tasks = []
+            for ci, chunk in enumerate(chunks):
+                chunk_label = f" (part {ci+1}/{len(chunks)})" if len(chunks) > 1 else ""
+                for cat_key in EXTRACTION_CATEGORIES:
+                    tasks.append(_extract_category_async(
+                        http_client, chunk, filename, cat_key, chunk_label, openrouter_key
+                    ))
+            
+            category_results = await asyncio.gather(*tasks)
+            
+            # Collect all memories from category passes
+            all_memories = []
+            total_cost = 0
+            for memories, cost in category_results:
+                all_memories.extend(memories)
+                total_cost += cost
+            
+            # Deduplicate
+            seen = set()
+            unique_memories = []
+            for mem in all_memories:
+                key = mem.get("content", "")[:80].lower().strip()
+                if key not in seen:
+                    seen.add(key)
+                    unique_memories.append(mem)
+            
+            # Pass 2: Thread/Knot structural pass (uses extracted memories)
+            threads, knots = [], []
+            if len(unique_memories) >= 5:
+                # Build compact summary for thread pass (just id + entity + category + short content)
+                summary_lines = []
+                for mem in unique_memories:
+                    lid = mem.get("local_id", "?")
+                    ent = mem.get("entity", "?")
+                    cat = mem.get("category", "?")
+                    txt = mem.get("content", "")[:80]
+                    conn = f" → {mem['connects_to']}" if mem.get("connects_to") else ""
+                    summary_lines.append(f"[{lid}] {ent}{conn} ({cat}): {txt}")
+                
+                summary_text = "\n".join(summary_lines)
+                threads, knots, thread_cost = await _extract_threads_async(
+                    http_client, summary_text, openrouter_key
+                )
+                total_cost += thread_cost
+            
+            return unique_memories, threads, knots, total_cost
 
     try:
         loop = asyncio.get_running_loop()
         import nest_asyncio
         nest_asyncio.apply()
-        results = loop.run_until_complete(run_all_chunks())
+        memories, threads, knots, cost = loop.run_until_complete(run_extraction())
     except RuntimeError:
-        results = asyncio.run(run_all_chunks())
+        memories, threads, knots, cost = asyncio.run(run_extraction())
 
-    all_memories, all_threads, all_knots = [], [], []
-    total_cost = 0
-    for data, cost in results:
-        if isinstance(data, dict):
-            all_memories.extend(data.get("memories", []))
-            all_threads.extend(data.get("threads", []))
-            all_knots.extend(data.get("knots", []))
-        total_cost += cost
-        
-    seen = set()
-    unique_memories = []
-    for mem in all_memories:
-        key = mem.get("content", "")[:80].lower().strip()
-        if key not in seen:
-            seen.add(key)
-            unique_memories.append(mem)
-            
-    return {"memories": unique_memories, "threads": all_threads, "knots": all_knots}, total_cost, plan
+    return {"memories": memories, "threads": threads, "knots": knots}, cost, plan
 
 def extract_memories_with_gpt(conversation, openrouter_key):
     prompt = """Extract structured memories from this conversation. Your PRIMARY goal is EXHAUSTIVE ATOMIC EXTRACTION. Do not summarize — break everything down into granular pieces.
@@ -1432,12 +1589,14 @@ def render_file_upload(mnemo_client, openrouter_key):
             with st.spinner("Reading file..."):
                 content = extract_text_from_file(uploaded_file)
             if content and not content.startswith("["):
-                # v6.9.1: Auto-scaling — let calculate_extraction_plan decide
+                # v6.9.1: Show extraction plan to user
                 plan = calculate_extraction_plan(content)
-                n_chunks = plan["n_chunks"]
-                st.info(f"📄 {plan['words']:,} words → ~{plan['estimated_memories']} memories → "
-                        f"{n_chunks} call{'s' if n_chunks > 1 else ''} @ max_tokens={plan['max_tokens_per_call']:,}")
-                with st.spinner(f"K2 extracting ({n_chunks} call{'s' if n_chunks > 1 else ''})..."):
+                cats = list(EXTRACTION_CATEGORIES.keys())
+                st.info(f"📄 {plan['words']:,} words → {plan['n_categories']} category passes "
+                        f"+ 1 thread pass = {plan['total_calls']} calls "
+                        f"({'×' + str(plan['n_input_chunks']) + ' chunks ' if plan['n_input_chunks'] > 1 else ''}"
+                        f"all parallel @ 4096)")
+                with st.spinner(f"K2 extracting ({plan['total_calls']} parallel calls)..."):
                     extraction_data, cost, _ = extract_memories_from_file(content, uploaded_file.name, openrouter_key)
                 memories = extraction_data.get("memories", [])
                 threads_data = extraction_data.get("threads", [])
@@ -1751,7 +1910,8 @@ def main():
 
     if mnemo_client.token != hf_key:
         mnemo_client.token = hf_key
-        mnemo_client.session.headers.update({"Authorization": f"Bearer {hf_key}"})
+        # v6.9.1 FIX: MnemoClient v6.0 uses GradioTransport, not requests.Session.
+        # The token is only used for reference — Gradio transport doesn't need auth headers.
 
     render_chat(openrouter_key, mnemo_client)
 
