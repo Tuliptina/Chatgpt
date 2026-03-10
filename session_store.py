@@ -1,15 +1,23 @@
 """
-Session Store - Persistent Session & Conversation Storage (v6.0)
+Session Store - Persistent Session & Conversation Storage (v7.1)
 
 Sessions (full message history) -> HuggingFace Dataset repo (AthelaPerk/Private)
-Conversation summaries (for search) -> Mnemo v6.0 via MnemoClient
+Conversation summaries (for search) -> Mnemo v7 ConnectionPoints (structured)
+
+v7.1 changes:
+- FIX: save_conversation_turn() now stores as ConnectionPoint via add_point(),
+  not as a blob memory via add(). Conversation summaries are now searchable
+  through graph_search, FTS5, and entity lookup — same as all other memories.
+  No more [CONVERSATION] tag hack or separate blob search path.
+- FIX: search_conversations() uses graph_search() instead of blob search.
+- FIX: _delete_session_memories() reads session_id/source from top-level keys
+  (v7.1 schema) with fallback to metadata dict for old blobs.
 
 v6.0 changes:
 - FIX: _delete_session_memories() replaces _delete_mnemo_conversations().
   Now deletes ALL memory types for a session (CHARACTER, PLOT, THEME, etc.),
   not just CONVERSATION-type. Also calls server-side /delete_session endpoint
   which cleans ConnectionPoints, Threads, and Knots atomically.
-- Previously deleted sessions left behind 90%+ of their extracted memories.
 
 v5.1.1: Per-session files, folder state, auto-migration from sessions.json.
 """
@@ -246,25 +254,61 @@ class SessionStore:
     def save_conversation_turn(self, user_message: str,
                                assistant_response: str,
                                session_id: str = None) -> bool:
-        content = (
-            f"[CONVERSATION] User asked: {user_message[:200]} "
-            f"| Assistant discussed: {assistant_response[:300]}"
-        )
-        meta = {
-            "type": "conversation",
-            "session_id": session_id,
-            "timestamp": datetime.now().isoformat(),
-        }
-        return bool(self.mnemo.add(content, metadata=meta))
+        """Store conversation turn as a structured ConnectionPoint (not blob).
+
+        v7.1: Changed from self.mnemo.add() (blob memory) to self.mnemo.add_point()
+        (ConnectionPoint). This stores conversation summaries in the same structured
+        format as all other extracted memories — searchable via graph_search,
+        FTS5, and entity lookup instead of a separate blob search path.
+        """
+        # Build a concise summary as the CP value
+        user_snippet = user_message[:200].strip()
+        assistant_snippet = assistant_response[:300].strip()
+        value = f"User asked: {user_snippet} | Assistant discussed: {assistant_snippet}"
+
+        try:
+            result = self.mnemo.add_point(
+                entity="Conversation",
+                point_type="conversation_summary",
+                value=value,
+                connects_to="",
+                reason=f"Auto-saved conversation turn",
+                weight=0.4,
+                category="fact",
+                source="conversation",
+                session_id=session_id or "",
+            )
+            return bool(result)
+        except Exception:
+            return False
 
     def search_conversations(self, query: str, limit: int = 5) -> List[str]:
-        results = self.mnemo.search(query, limit=limit * 2)
-        conversations = [
-            r.get("content", "").replace("[CONVERSATION]", "").strip()
-            for r in results
-            if "[CONVERSATION]" in r.get("content", "")
-        ]
-        return conversations[:limit]
+        """Search past conversation summaries via graph_search (structured CPs).
+
+        v7.1: Changed from blob search with [CONVERSATION] tag filtering
+        to graph_search which covers all CPs including conversation_summary type.
+        """
+        try:
+            results = self.mnemo.graph_search(query, top_k=limit * 2)
+            conversations = []
+            for r in results:
+                # Filter to conversation-type CPs
+                if r.get("point_type") == "conversation_summary":
+                    conversations.append(r.get("value", ""))
+                    if len(conversations) >= limit:
+                        break
+            # If not enough conversation CPs, include other relevant CPs
+            if len(conversations) < limit:
+                for r in results:
+                    if r.get("point_type") != "conversation_summary":
+                        val = r.get("value", "")
+                        if val and val not in conversations:
+                            conversations.append(val)
+                            if len(conversations) >= limit:
+                                break
+            return conversations
+        except Exception:
+            return []
 
     # =========================================================================
     # CROSS-SESSION RECALL
@@ -516,16 +560,12 @@ class SessionStore:
         return ""
 
     def _delete_session_memories(self, session_id: str):
-        """v6.0.1 FIX: Remove only AUTO-EXTRACTED Mnemo memories tied to a session.
+        """v7.1: Remove Mnemo memories tied to a session.
 
-        Previous bug: deleted ALL memories with matching session_id, including
-        file uploads, manual corrections, and consolidation entries. This wiped
-        the entire knowledge base when deleting a single chat session.
-
-        New behavior:
-        1. Server-side: delete CPs, threads, knots for the session.
-        2. Client-side: delete only blob memories where source is auto_extract
-           or conversation. PROTECT file_upload, manual_correction, consolidation.
+        Step 1: Server-side delete_session() handles CPs, threads, knots atomically.
+        Step 2: Clean any remaining legacy blob memories for this session.
+                In v7.1+, session_id and source are top-level columns on memories,
+                not buried in the metadata JSON.
         """
         # Step 1: Server-side cleanup (CPs, threads, knots)
         try:
@@ -534,20 +574,28 @@ class SessionStore:
         except Exception:
             pass
 
-        # Step 2: Client-side cleanup — ONLY auto-extracted blobs
+        # Step 2: Client-side cleanup — legacy blobs only
         # Protected sources that should NEVER be deleted with a session:
         PROTECTED_SOURCES = {"file_upload", "manual_correction", "consolidation", "manual"}
         try:
             memories = self.mnemo.list_memories()
             deleted = 0
             for mem in memories:
-                meta = mem.get("metadata", {})
-                if meta.get("session_id") != session_id:
+                # v7.1: session_id is a top-level key (also check metadata for old blobs)
+                mem_session = mem.get("session_id", "")
+                if not mem_session:
+                    meta = mem.get("metadata", {})
+                    mem_session = meta.get("session_id", "")
+                if mem_session != session_id:
                     continue
-                # Only delete auto-extracted or conversation memories
-                source = meta.get("source", "")
+
+                # v7.1: source is a top-level key (also check metadata for old blobs)
+                source = mem.get("source", "")
+                if not source:
+                    source = mem.get("metadata", {}).get("source", "")
                 if source in PROTECTED_SOURCES:
                     continue  # PROTECT permanent knowledge
+
                 self.mnemo.delete(mem.get("id"))
                 deleted += 1
         except Exception:
