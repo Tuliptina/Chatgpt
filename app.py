@@ -1,5 +1,15 @@
 """
-4o with Memory v6.9 — Dual-Processor Creative Writing Engine
+4o with Memory v6.9.1 — Dual-Processor Creative Writing Engine
+
+v6.9.1 changes:
+- FIX: Removed response_format from MEMORY_PARAMS — K2 on OpenRouter doesn't support it,
+  causing silent extraction failures ("No memories extracted").
+- FIX: Added extract_json_from_response() — robust JSON extraction that handles markdown
+  fences, text preamble, and brace-depth matching.
+- FIX: Replaced silent except-swallowing in process_chunk_async and extract_memories_with_gpt
+  with actual error logging so failures are visible in Streamlit Cloud logs.
+- FIX: Removed repetition_penalty from MEMORY_PARAMS — non-standard param that some
+  OpenRouter providers reject with 400 errors.
 
 v6.9 changes:
 - FIX: Increased file extraction chunk size to 40,000 characters to prevent API queuing.
@@ -56,13 +66,16 @@ WRITING_PARAMS = {
     "presence_penalty": 0.3,
 }
 
+# v6.9.1 FIX: Removed response_format and repetition_penalty
+# K2 on OpenRouter doesn't support response_format: json_object — it either
+# returns a 400 error or ignores it, causing extraction to silently fail.
+# repetition_penalty is non-standard and some providers reject it.
+# The extraction prompts already ask for JSON, which K2 reliably produces.
 MEMORY_PARAMS = {
     "temperature": 0.2,
-    "repetition_penalty": 1.0,
     "frequency_penalty": 0.0,
     "presence_penalty": 0.0,
     "max_tokens": 4096,
-    "response_format": {"type": "json_object"},
 }
 
 MAX_CONVERSATION_MESSAGES = 8
@@ -393,7 +406,7 @@ def copy_response_dialog(content):
         st.rerun()
 
 # ============================================================================
-# FILE PROCESSING & K2 AUTO-EXTRACTION (v6.9 Relational JSON)
+# FILE PROCESSING & K2 AUTO-EXTRACTION (v6.9.1 — Fixed JSON extraction)
 # ============================================================================
 
 def extract_text_from_file(uploaded_file):
@@ -431,6 +444,64 @@ def extract_text_from_file(uploaded_file):
         content = f"[Error reading file: {str(e)}]"
     return content
 
+
+# v6.9.1 FIX: Robust JSON extraction from K2 responses
+def extract_json_from_response(raw: str) -> dict:
+    """Robustly extract JSON from K2 response text.
+    
+    K2 on OpenRouter doesn't support response_format, so it may return JSON:
+    - Directly as a JSON object
+    - Wrapped in ```json ... ``` markdown fences  
+    - With preamble text before the JSON
+    - With trailing text after the JSON
+    """
+    clean = raw.strip()
+    
+    # Strategy 1: Direct JSON parse (best case)
+    try:
+        parsed = json.loads(clean)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    
+    # Strategy 2: Strip markdown fences
+    if "```" in clean:
+        fence_patterns = [
+            r'```json\s*\n?(.*?)\n?```',
+            r'```\s*\n?(.*?)\n?```',
+        ]
+        for pattern in fence_patterns:
+            match = re.search(pattern, clean, re.DOTALL)
+            if match:
+                try:
+                    parsed = json.loads(match.group(1).strip())
+                    if isinstance(parsed, dict):
+                        return parsed
+                except json.JSONDecodeError:
+                    continue
+    
+    # Strategy 3: Brace-depth matching — find outermost { ... }
+    first_brace = clean.find('{')
+    if first_brace >= 0:
+        depth = 0
+        for i in range(first_brace, len(clean)):
+            if clean[i] == '{':
+                depth += 1
+            elif clean[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        parsed = json.loads(clean[first_brace:i+1])
+                        if isinstance(parsed, dict):
+                            return parsed
+                    except json.JSONDecodeError:
+                        pass
+                    break
+    
+    return {}
+
+
 async def process_chunk_async(http_client, chunk, filename, i, total_chunks, openrouter_key):
     chunk_label = f" (part {i+1}/{total_chunks})" if total_chunks > 1 else ""
     # v6.9 FIX: Explicitly demand high-volume exhaustive extraction
@@ -450,7 +521,7 @@ CRITICAL ENTITY NAMING RULES:
   - Use plain names: "Sebastian Carlisle", NOT "Dr. Sebastian Carlisle"
   - Entity is a LOOKUP KEY for indexing. Keep it short and consistent.
 
-ENTRY FORMAT:
+You MUST respond with ONLY a valid JSON object. No preamble, no explanation — pure JSON:
 {{
   "memories": [
     {{"local_id": "m1", "entity": "Alistair", "category": "CHARACTER", "content": "Alistair is terrified of developing dementia."}},
@@ -463,6 +534,7 @@ ENTRY FORMAT:
   "knots": []
 }}"""
 
+    # v6.9.1 FIX: Proper error handling instead of silent swallowing
     try:
         response = await http_client.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -471,21 +543,36 @@ ENTRY FORMAT:
             timeout=120.0
         )
         if response.status_code != 200:
-            return {}, 0
+            print(f"[K2 EXTRACT] API error {response.status_code} for chunk {i+1}: {response.text[:300]}")
+            return {"memories": [], "threads": [], "knots": []}, 0
+            
         data = response.json()
         raw = data["choices"][0]["message"]["content"]
         usage = data.get("usage", {})
-        cost = (usage.get("prompt_tokens", 0) * 0.47 + usage.get("completion_tokens", 0) * 2.00) / 1_000_000
-        clean = raw.strip()
-        if clean.startswith("```"):
-            clean = clean.split("\n", 1)[-1]
-            if clean.endswith("```"):
-                clean = clean[:-3]
-        parsed = json.loads(clean.strip())
-        if isinstance(parsed, dict) and "memories" in parsed:
+        cost = (usage.get("prompt_tokens", 0) * 0.55 + usage.get("completion_tokens", 0) * 2.20) / 1_000_000
+        
+        # v6.9.1: Use robust JSON extraction
+        parsed = extract_json_from_response(raw)
+        
+        if not parsed:
+            print(f"[K2 EXTRACT] JSON parse failed for chunk {i+1}. Raw preview: {raw[:500]}")
+            return {"memories": [], "threads": [], "knots": []}, cost
+        
+        if "memories" in parsed:
             return parsed, cost
+        
+        # K2 sometimes uses different key names
+        for alt_key in ("results", "items", "data", "points", "extractions"):
+            if alt_key in parsed:
+                print(f"[K2 EXTRACT] Found memories under alternate key '{alt_key}'")
+                return {"memories": parsed[alt_key], "threads": parsed.get("threads", []), "knots": parsed.get("knots", [])}, cost
+        
+        print(f"[K2 EXTRACT] Parsed JSON but no 'memories' key. Keys: {list(parsed.keys())}. Preview: {raw[:300]}")
         return {"memories": [], "threads": [], "knots": []}, cost
-    except Exception:
+        
+    except Exception as e:
+        print(f"[K2 EXTRACT] Exception in chunk {i+1}: {type(e).__name__}: {e}")
+        traceback.print_exc()
         return {"memories": [], "threads": [], "knots": []}, 0
 
 def extract_memories_from_file(content, filename, openrouter_key):
@@ -557,7 +644,7 @@ CRITICAL ENTITY NAMING RULES:
   - Use plain names: "Sebastian Carlisle", NOT "Dr. Sebastian Carlisle"
   - Entity is a LOOKUP KEY for indexing. Keep it short and consistent.
 
-ENTRY FORMAT:
+You MUST respond with ONLY a valid JSON object. No preamble, no explanation — pure JSON:
 {{
   "memories": [
     {{"local_id": "m1", "entity": "Alistair", "category": "CHARACTER", "content": "Alistair is terrified of developing dementia."}},
@@ -570,6 +657,7 @@ ENTRY FORMAT:
   "knots": []
 }}"""
 
+    # v6.9.1 FIX: Proper error handling
     try:
         response = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -578,21 +666,34 @@ ENTRY FORMAT:
             timeout=60
         )
         if response.status_code != 200:
-            return {}, 0
+            print(f"[K2 CONV EXTRACT] API error {response.status_code}: {response.text[:300]}")
+            return {"memories": [], "threads": [], "knots": []}, 0
+            
         data = response.json()
         raw = data["choices"][0]["message"]["content"]
         usage = data.get("usage", {})
-        cost = (usage.get("prompt_tokens", 0) * 0.47 + usage.get("completion_tokens", 0) * 2.00) / 1_000_000
-        clean = raw.strip()
-        if clean.startswith("```"):
-            clean = clean.split("\n", 1)[-1]
-            if clean.endswith("```"):
-                clean = clean[:-3]
-        parsed = json.loads(clean.strip())
-        if isinstance(parsed, dict) and "memories" in parsed:
+        cost = (usage.get("prompt_tokens", 0) * 0.55 + usage.get("completion_tokens", 0) * 2.20) / 1_000_000
+        
+        # v6.9.1: Use robust JSON extraction
+        parsed = extract_json_from_response(raw)
+        
+        if not parsed:
+            print(f"[K2 CONV EXTRACT] JSON parse failed. Raw preview: {raw[:500]}")
+            return {"memories": [], "threads": [], "knots": []}, cost
+        
+        if "memories" in parsed:
             return parsed, cost
+        
+        for alt_key in ("results", "items", "data", "points", "extractions"):
+            if alt_key in parsed:
+                return {"memories": parsed[alt_key], "threads": parsed.get("threads", []), "knots": parsed.get("knots", [])}, cost
+        
+        print(f"[K2 CONV EXTRACT] No 'memories' key. Keys: {list(parsed.keys())}")
         return {"memories": [], "threads": [], "knots": []}, cost
-    except Exception:
+        
+    except Exception as e:
+        print(f"[K2 CONV EXTRACT] Exception: {type(e).__name__}: {e}")
+        traceback.print_exc()
         return {"memories": [], "threads": [], "knots": []}, 0
 
 def call_openrouter(messages, api_key, mode="writing"):
@@ -617,8 +718,8 @@ def call_openrouter(messages, api_key, mode="writing"):
 class CostTracker:
     WRITING_INPUT = 2.50 / 1_000_000
     WRITING_OUTPUT = 15.00 / 1_000_000
-    MEMORY_INPUT = 0.47 / 1_000_000
-    MEMORY_OUTPUT = 2.00 / 1_000_000
+    MEMORY_INPUT = 0.55 / 1_000_000
+    MEMORY_OUTPUT = 2.20 / 1_000_000
 
     def __init__(self):
         if "total_cost" not in st.session_state:
@@ -1503,7 +1604,7 @@ def main():
         <div class="brand-icon">🧠</div>
         <div class="brand-text">
             <h1>4o with Memory</h1>
-            <p>GPT-4o writer · K2 memory curator · Mnemo v6.9</p>
+            <p>GPT-4o writer · K2 memory curator · Mnemo v6.9.1</p>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1586,7 +1687,7 @@ def main():
 
     st.markdown(f"""
     <div class="status-bar">
-        4o with Memory v6.9 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Threads & Knots &nbsp;·&nbsp; Graph Search
+        4o with Memory v6.9.1 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Threads & Knots &nbsp;·&nbsp; Graph Search
     </div>
     """, unsafe_allow_html=True)
 
