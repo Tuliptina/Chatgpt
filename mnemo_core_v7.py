@@ -60,7 +60,16 @@ from dataclasses import dataclass, field
 from collections import defaultdict, OrderedDict
 from contextlib import contextmanager
 from enum import Enum
-from sentence_transformers import SentenceTransformer
+
+import requests as http_requests  # renamed to avoid clash with other 'requests'
+
+# SentenceTransformer is optional — Cloudflare Workers AI is the primary encoder
+# on Streamlit Cloud (saves ~310MB RAM). SentenceTransformer is used on HF Space.
+try:
+    from sentence_transformers import SentenceTransformer
+    HAS_SENTENCE_TRANSFORMERS = True
+except ImportError:
+    HAS_SENTENCE_TRANSFORMERS = False
 
 try:
     import faiss
@@ -69,6 +78,167 @@ except ImportError:
     HAS_FAISS = False
 
 log = logging.getLogger("mnemo")
+
+
+# =============================================================================
+# EMBEDDING ENCODERS (Cloudflare Workers AI primary, SentenceTransformer fallback)
+# =============================================================================
+
+class CloudflareEncoder:
+    """Embedding encoder via Cloudflare Workers AI REST API.
+
+    Free tier: 10,000 neurons/day (~10,000 embedding calls/day).
+    Model: bge-small-en-v1.5 → 384-dim (same as all-MiniLM-L6-v2).
+    Latency: ~200ms per call (edge GPU), cached locally after first call.
+    RAM: 0MB (no PyTorch, no model weights).
+
+    Provides same .encode() interface as SentenceTransformer.
+    """
+
+    # Available Cloudflare embedding models and their dimensions
+    MODELS = {
+        "@cf/baai/bge-small-en-v1.5": 384,
+        "@cf/baai/bge-base-en-v1.5": 768,
+        "@cf/baai/bge-large-en-v1.5": 1024,
+    }
+
+    def __init__(self, account_id: str = None, api_token: str = None,
+                 model: str = "@cf/baai/bge-small-en-v1.5",
+                 timeout: int = 15):
+        self.account_id = account_id or os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+        self.api_token = api_token or os.environ.get("CLOUDFLARE_API_TOKEN", "")
+        self.model = model
+        self.timeout = timeout
+        self._dim = self.MODELS.get(model, 384)
+        self._url = (
+            f"https://api.cloudflare.com/client/v4/accounts/"
+            f"{self.account_id}/ai/run/{self.model}"
+        )
+        self._available = bool(self.account_id and self.api_token)
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    def get_sentence_embedding_dimension(self) -> int:
+        return self._dim
+
+    def encode(self, text, **kwargs) -> np.ndarray:
+        """Encode text(s) to embeddings. Accepts str or list of str.
+
+        Returns:
+            np.ndarray: (dim,) for single text, (N, dim) for list
+        """
+        if isinstance(text, str):
+            return self._encode_single(text)
+        elif isinstance(text, (list, tuple)):
+            return self._encode_batch(list(text))
+        else:
+            return self._encode_single(str(text))
+
+    def _encode_single(self, text: str) -> np.ndarray:
+        """Encode a single text string."""
+        try:
+            resp = http_requests.post(
+                self._url,
+                headers={
+                    "Authorization": f"Bearer {self.api_token}",
+                    "Content-Type": "application/json",
+                },
+                json={"text": [text]},
+                timeout=self.timeout,
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(f"Cloudflare API error {resp.status_code}: {resp.text[:200]}")
+
+            data = resp.json()
+            vectors = data.get("result", {}).get("data", [])
+            if not vectors:
+                raise RuntimeError(f"No embeddings in response: {data}")
+
+            return np.array(vectors[0], dtype=np.float32)
+
+        except Exception as e:
+            log.error(f"CloudflareEncoder error: {e}")
+            raise
+
+    def _encode_batch(self, texts: List[str]) -> np.ndarray:
+        """Encode a batch of texts. Cloudflare supports up to 100 per call."""
+        all_embeddings = []
+        # Cloudflare batch limit is 100
+        for i in range(0, len(texts), 100):
+            batch = texts[i:i + 100]
+            try:
+                resp = http_requests.post(
+                    self._url,
+                    headers={
+                        "Authorization": f"Bearer {self.api_token}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"text": batch},
+                    timeout=self.timeout * 2,  # Longer timeout for batches
+                )
+                if resp.status_code != 200:
+                    raise RuntimeError(f"Cloudflare API error {resp.status_code}")
+
+                data = resp.json()
+                vectors = data.get("result", {}).get("data", [])
+                if len(vectors) != len(batch):
+                    raise RuntimeError(
+                        f"Expected {len(batch)} embeddings, got {len(vectors)}")
+
+                all_embeddings.extend(vectors)
+
+            except Exception as e:
+                log.error(f"CloudflareEncoder batch error: {e}")
+                raise
+
+        return np.array(all_embeddings, dtype=np.float32)
+
+
+def create_encoder(config: 'MnemoConfig'):
+    """Create the best available encoder. Priority:
+    1. Cloudflare Workers AI (free, 0MB RAM, ~200ms, needs API key)
+    2. SentenceTransformer (local, ~310MB RAM, ~50ms, needs torch)
+    3. Raises error if neither available
+
+    Returns (encoder, embedding_dim, encoder_name)
+    """
+    # Try Cloudflare first (if credentials exist)
+    cf_account = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+    cf_token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+
+    if cf_account and cf_token:
+        try:
+            encoder = CloudflareEncoder(
+                account_id=cf_account, api_token=cf_token,
+                model=config.cloudflare_model,
+            )
+            # Quick validation — encode a test string
+            test_emb = encoder.encode("test")
+            if test_emb is not None and len(test_emb) > 0:
+                dim = encoder.get_sentence_embedding_dimension()
+                print(f"[ENCODER] ✅ Cloudflare Workers AI ({config.cloudflare_model}, dim={dim})")
+                return encoder, dim, f"cloudflare:{config.cloudflare_model}"
+        except Exception as e:
+            print(f"[ENCODER] ⚠️  Cloudflare failed: {e}")
+
+    # Fall back to SentenceTransformer
+    if HAS_SENTENCE_TRANSFORMERS:
+        try:
+            print(f"[ENCODER] Loading SentenceTransformer: {config.model_name}")
+            encoder = SentenceTransformer(config.model_name)
+            dim = encoder.get_sentence_embedding_dimension()
+            print(f"[ENCODER] ✅ SentenceTransformer ({config.model_name}, dim={dim})")
+            return encoder, dim, f"local:{config.model_name}"
+        except Exception as e:
+            print(f"[ENCODER] ⚠️  SentenceTransformer failed: {e}")
+
+    raise RuntimeError(
+        "No embedding encoder available. Either:\n"
+        "  1. Set CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN env vars, or\n"
+        "  2. pip install sentence-transformers torch"
+    )
 
 
 # =============================================================================
@@ -637,6 +807,7 @@ class MnemoConfig:
     promote_to_working_accesses: int = 10
     demote_to_archive_days: float = 14.0
     model_name: str = "all-MiniLM-L6-v2"
+    cloudflare_model: str = "@cf/baai/bge-small-en-v1.5"
     use_faiss: bool = True
     db_path: str = "/app/data/mnemo.db"
 
@@ -654,12 +825,8 @@ class MnemoEngine:
         # SQLite
         self.db = MnemoDB(self.config.db_path)
 
-        # Encoder
-        log.info(f"Loading SentenceTransformer: {self.config.model_name}")
-        print(f"Loading SentenceTransformer: {self.config.model_name}")
-        self.encoder = SentenceTransformer(self.config.model_name)
-        self._embedding_dim = self.encoder.get_sentence_embedding_dimension()
-        print(f"Model loaded (dim={self._embedding_dim}).")
+        # Encoder (Cloudflare → SentenceTransformer → error)
+        self.encoder, self._embedding_dim, self._encoder_name = create_encoder(self.config)
         self._emb_cache = EmbeddingCache(self.encoder, max_size=500)
 
         # FAISS indices (disposable, rebuilt from DB)
