@@ -1068,6 +1068,77 @@ class MnemoEngine:
         self._dirty = True
         return True
 
+    def update_point(self, cp_id: str, entity: str = None, value: str = None,
+                     connects_to: str = None, reason: str = None,
+                     weight: float = None, category: str = None,
+                     point_type: str = None) -> Optional[dict]:
+        """Update fields on an existing ConnectionPoint. Returns updated CP dict.
+
+        Only non-None fields are updated. Re-embeds if any text field changes.
+        """
+        with self.db.read() as conn:
+            row = conn.execute("SELECT * FROM connection_points WHERE id = ?", (cp_id,)).fetchone()
+        if not row:
+            return None
+
+        # Determine which fields changed
+        updates = {}
+        if entity is not None and entity != row["entity"]:
+            updates["entity"] = entity
+        if value is not None and value != row["value"]:
+            updates["value"] = value
+        if connects_to is not None and connects_to != row["connects_to"]:
+            updates["connects_to"] = connects_to
+        if reason is not None and reason != row["reason"]:
+            updates["reason"] = reason
+        if weight is not None and abs(weight - row["weight"]) > 0.001:
+            updates["weight"] = weight
+        if category is not None and category != row["category"]:
+            updates["category"] = category
+        if point_type is not None and point_type != row["point_type"]:
+            updates["point_type"] = point_type
+
+        if not updates:
+            return self._row_to_cp_dict(row)  # Nothing changed
+
+        # Build SET clause
+        set_parts = []
+        params = []
+        for col, val in updates.items():
+            set_parts.append(f"{col} = ?")
+            params.append(val)
+
+        # Re-embed if any text field changed
+        text_fields = {"entity", "value", "connects_to", "reason", "category", "point_type"}
+        if updates.keys() & text_fields:
+            new_entity = updates.get("entity", row["entity"])
+            new_pt = updates.get("point_type", row["point_type"])
+            new_val = updates.get("value", row["value"])
+            new_conn = updates.get("connects_to", row["connects_to"])
+            new_reason = updates.get("reason", row["reason"])
+            new_cat = updates.get("category", row["category"])
+
+            searchable = self._cp_to_searchable(new_entity, new_pt, new_val, new_conn, new_reason, new_cat)
+            embedding = self._get_embedding(searchable)
+            emb_blob = embedding.astype(np.float32).tobytes()
+            set_parts.append("embedding = ?")
+            params.append(emb_blob)
+            re_embedded = True
+        else:
+            re_embedded = False
+
+        params.append(cp_id)
+        with self.db.write() as conn:
+            conn.execute(
+                f"UPDATE connection_points SET {', '.join(set_parts)} WHERE id = ?",
+                params)
+
+        if re_embedded:
+            self._cp_faiss.mark_dirty()  # Will rebuild with new embedding
+
+        self._dirty = True
+        return self.get_point(cp_id)
+
     def delete_session_points(self, session_id: str) -> int:
         """Delete all non-protected CPs and blobs for a session."""
         PROTECTED = ("file_upload", "manual_correction", "consolidation", "manual")
@@ -2338,6 +2409,7 @@ class PersistentMnemo:
     def add_points_batch(self, *a, **kw): return self.engine.add_points_batch(*a, **kw)
     def get_point(self, *a, **kw): return self.engine.get_point(*a, **kw)
     def delete_point(self, *a, **kw): return self.engine.delete_point(*a, **kw)
+    def update_point(self, *a, **kw): return self.engine.update_point(*a, **kw)
     def delete_session_points(self, *a, **kw): return self.engine.delete_session_points(*a, **kw)
     def graph_search(self, *a, **kw): return self.engine.graph_search(*a, **kw)
     def add_thread(self, *a, **kw): return self.engine.add_thread(*a, **kw)
