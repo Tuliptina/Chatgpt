@@ -835,7 +835,7 @@ Respond with ONLY a valid JSON object — no preamble, no markdown fences:
 
     try:
         response = requests.post(
-            ""https://openrouter.ai/api/v1/chat/completions",
+            "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {openrouter_key}", "Content-Type": "application/json"},
             json={"model": MEMORY_MODEL_ID, "messages": [{"role": "user", "content": prompt.format(conversation=conversation)}], **MEMORY_PARAMS},
             timeout=60
@@ -876,7 +876,7 @@ def call_openrouter(messages, api_key, mode="writing"):
     try:
         body = {"model": model, "messages": messages, **params}
         response = requests.post(
-            ""https://openrouter.ai/api/v1/chat/completions",
+            "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json=body, timeout=120
         )
