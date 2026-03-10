@@ -606,7 +606,7 @@ async def _extract_chunk_async(http_client, chunk, filename, chunk_idx, total_ch
 
     try:
         response = await http_client.post(
-            ""https://openrouter.ai/api/v1/chat/completions",
+            "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {openrouter_key}", "Content-Type": "application/json"},
             json={"model": MEMORY_MODEL_ID, "messages": [{"role": "user", "content": prompt}], **MEMORY_PARAMS},
             timeout=120.0
