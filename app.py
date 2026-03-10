@@ -2,6 +2,11 @@
 4o with Memory v6.9.1 — Dual-Processor Creative Writing Engine
 
 v6.9.1 changes:
+- NEW: Auto-scaling extraction via calculate_extraction_plan() — chunk count and
+  max_tokens are now decided dynamically by file size instead of hardcoded.
+  Formula: ~12 memories/1K words × 100 tokens/memory JSON + overhead → auto max_tokens.
+  Small files (<2K words): 1 call @ 4096. Medium (<6.5K): 1 call @ 8192.
+  Large (<10K): 1 call @ 10-12K. Very large: splits into 2-5 parallel chunks.
 - FIX: Removed response_format from MEMORY_PARAMS — K2 on OpenRouter doesn't support it,
   causing silent extraction failures ("No memories extracted").
 - FIX: Added extract_json_from_response() — robust JSON extraction that handles markdown
@@ -70,12 +75,13 @@ WRITING_PARAMS = {
 # K2 on OpenRouter doesn't support response_format: json_object — it either
 # returns a 400 error or ignores it, causing extraction to silently fail.
 # repetition_penalty is non-standard and some providers reject it.
-# The extraction prompts already ask for JSON, which K2 reliably produces.
+# max_tokens=4096 is the DEFAULT for conversation extraction (short output).
+# For file extraction, calculate_extraction_plan() overrides this dynamically.
 MEMORY_PARAMS = {
     "temperature": 0.2,
     "frequency_penalty": 0.0,
     "presence_penalty": 0.0,
-    "max_tokens": 4096,
+    "max_tokens": 4096,  # Default — overridden by calculate_extraction_plan() for files
 }
 
 MAX_CONVERSATION_MESSAGES = 8
@@ -502,7 +508,60 @@ def extract_json_from_response(raw: str) -> dict:
     return {}
 
 
-async def process_chunk_async(http_client, chunk, filename, i, total_chunks, openrouter_key):
+# v6.9.1: Auto-scaling extraction — calculates optimal chunks & max_tokens per file
+def calculate_extraction_plan(content: str) -> dict:
+    """Auto-scale extraction API calls based on file size.
+    
+    Returns dict with: n_chunks, chunk_size, chunk_overlap, max_tokens_per_call,
+    estimated_memories, estimated_output_tokens, words, chars
+    """
+    words = len(content.split())
+    chars = len(content)
+    
+    MEMORIES_PER_1K_WORDS = 12
+    TOKENS_PER_MEMORY_JSON = 100
+    THREAD_KNOT_OVERHEAD = 500
+    SAFETY_MARGIN = 1.25
+    MAX_RELIABLE_OUTPUT = 12000  # K2's reliable output ceiling per call
+    TARGET_OUTPUT_PER_CHUNK = 10000
+    
+    expected_memories = max(5, int(words / 1000 * MEMORIES_PER_1K_WORDS))
+    raw_output = expected_memories * TOKENS_PER_MEMORY_JSON + THREAD_KNOT_OVERHEAD
+    estimated_output = int(raw_output * SAFETY_MARGIN)
+    
+    if estimated_output <= 4096:
+        n_chunks, max_tokens = 1, 4096
+    elif estimated_output <= 8192:
+        n_chunks, max_tokens = 1, 8192
+    elif estimated_output <= MAX_RELIABLE_OUTPUT:
+        n_chunks, max_tokens = 1, estimated_output
+    else:
+        memories_per_chunk = (TARGET_OUTPUT_PER_CHUNK - THREAD_KNOT_OVERHEAD) // TOKENS_PER_MEMORY_JSON
+        words_per_chunk = int(memories_per_chunk / MEMORIES_PER_1K_WORDS * 1000)
+        chars_per_chunk = words_per_chunk * 7
+        n_chunks = min(max(1, -(-chars // chars_per_chunk)), 5)
+        max_tokens = TARGET_OUTPUT_PER_CHUNK
+    
+    if n_chunks == 1:
+        chunk_size = chars + 1
+        chunk_overlap = 0
+    else:
+        chunk_size = chars // n_chunks + 2000
+        chunk_overlap = 2000
+    
+    plan = {
+        "n_chunks": n_chunks, "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap, "max_tokens_per_call": max_tokens,
+        "estimated_memories": expected_memories,
+        "estimated_output_tokens": estimated_output,
+        "words": words, "chars": chars,
+    }
+    print(f"[EXTRACT PLAN] {words:,} words → ~{expected_memories} memories → "
+          f"~{estimated_output:,} output tokens → {n_chunks} call(s) @ max_tokens={max_tokens}")
+    return plan
+
+
+async def process_chunk_async(http_client, chunk, filename, i, total_chunks, openrouter_key, params_override=None):
     chunk_label = f" (part {i+1}/{total_chunks})" if total_chunks > 1 else ""
     # v6.9 FIX: Explicitly demand high-volume exhaustive extraction
     prompt = f"""Extract structured memories from this document. Your PRIMARY goal is EXHAUSTIVE ATOMIC EXTRACTION. Do not summarize — break everything down into granular pieces. 
@@ -535,11 +594,12 @@ You MUST respond with ONLY a valid JSON object. No preamble, no explanation — 
 }}"""
 
     # v6.9.1 FIX: Proper error handling instead of silent swallowing
+    call_params = params_override or MEMORY_PARAMS
     try:
         response = await http_client.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {openrouter_key}", "Content-Type": "application/json"},
-            json={"model": MEMORY_MODEL_ID, "messages": [{"role": "user", "content": prompt}], **MEMORY_PARAMS},
+            json={"model": MEMORY_MODEL_ID, "messages": [{"role": "user", "content": prompt}], **call_params},
             timeout=120.0
         )
         if response.status_code != 200:
@@ -576,10 +636,17 @@ You MUST respond with ONLY a valid JSON object. No preamble, no explanation — 
         return {"memories": [], "threads": [], "knots": []}, 0
 
 def extract_memories_from_file(content, filename, openrouter_key):
-    # v6.9 FIX: Huge chunk size for K2 long context (faster API turnaround)
-    CHUNK_SIZE = 40000
-    CHUNK_OVERLAP = 2000
-    MAX_CHUNKS = 5
+    """v6.9.1: Auto-scaling extraction — chunk count and max_tokens decided by file size."""
+    plan = calculate_extraction_plan(content)
+    
+    CHUNK_SIZE = plan["chunk_size"]
+    CHUNK_OVERLAP = plan["chunk_overlap"]
+    MAX_CHUNKS = plan["n_chunks"]
+    max_tokens_override = plan["max_tokens_per_call"]
+    
+    # Build extraction params with auto-scaled max_tokens
+    extract_params = {**MEMORY_PARAMS, "max_tokens": max_tokens_override}
+    
     chunks = []
     if len(content) <= CHUNK_SIZE:
         chunks = [content]
@@ -598,7 +665,8 @@ def extract_memories_from_file(content, filename, openrouter_key):
 
     async def run_all_chunks():
         async with httpx.AsyncClient() as http_client:
-            tasks = [process_chunk_async(http_client, chunk, filename, i, len(chunks), openrouter_key)
+            tasks = [process_chunk_async(http_client, chunk, filename, i, len(chunks),
+                                         openrouter_key, extract_params)
                      for i, chunk in enumerate(chunks)]
             return await asyncio.gather(*tasks)
 
@@ -627,7 +695,7 @@ def extract_memories_from_file(content, filename, openrouter_key):
             seen.add(key)
             unique_memories.append(mem)
             
-    return {"memories": unique_memories, "threads": all_threads, "knots": all_knots}, total_cost
+    return {"memories": unique_memories, "threads": all_threads, "knots": all_knots}, total_cost, plan
 
 def extract_memories_with_gpt(conversation, openrouter_key):
     prompt = """Extract structured memories from this conversation. Your PRIMARY goal is EXHAUSTIVE ATOMIC EXTRACTION. Do not summarize — break everything down into granular pieces.
@@ -1364,11 +1432,13 @@ def render_file_upload(mnemo_client, openrouter_key):
             with st.spinner("Reading file..."):
                 content = extract_text_from_file(uploaded_file)
             if content and not content.startswith("["):
-                n_chunks = max(1, (len(content) - 1) // 40000 + 1)
-                if n_chunks > 1:
-                    st.info(f"📄 {len(content):,} chars → splitting into {min(n_chunks, 5)} large chunks")
-                with st.spinner(f"K2 extracting ({min(n_chunks, 5)} call{'s' if n_chunks > 1 else ''})..."):
-                    extraction_data, cost = extract_memories_from_file(content, uploaded_file.name, openrouter_key)
+                # v6.9.1: Auto-scaling — let calculate_extraction_plan decide
+                plan = calculate_extraction_plan(content)
+                n_chunks = plan["n_chunks"]
+                st.info(f"📄 {plan['words']:,} words → ~{plan['estimated_memories']} memories → "
+                        f"{n_chunks} call{'s' if n_chunks > 1 else ''} @ max_tokens={plan['max_tokens_per_call']:,}")
+                with st.spinner(f"K2 extracting ({n_chunks} call{'s' if n_chunks > 1 else ''})..."):
+                    extraction_data, cost, _ = extract_memories_from_file(content, uploaded_file.name, openrouter_key)
                 memories = extraction_data.get("memories", [])
                 threads_data = extraction_data.get("threads", [])
                 knots_data = extraction_data.get("knots", [])
