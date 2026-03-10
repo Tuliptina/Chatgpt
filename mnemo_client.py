@@ -299,6 +299,24 @@ class MnemoClient:
             return result.get("deleted", False)
         return False
 
+    def update_point(self, cp_id: str, entity: str = None, value: str = None,
+                     connects_to: str = None, reason: str = None,
+                     weight: float = None, category: str = None,
+                     point_type: str = None) -> Optional[Dict]:
+        """Update fields on an existing ConnectionPoint. Returns updated CP dict."""
+        # Pack as JSON since Gradio API takes a single string for flexibility
+        updates = json.dumps({
+            k: v for k, v in {
+                "cp_id": cp_id, "entity": entity, "value": value,
+                "connects_to": connects_to, "reason": reason,
+                "weight": weight, "category": category, "point_type": point_type,
+            }.items() if v is not None
+        })
+        result = self._call("update_point_api", updates)
+        if result and isinstance(result, dict) and "error" not in result:
+            return result
+        return None
+
     def list_points(self, limit: int = 200) -> List[Dict]:
         """List all ConnectionPoints."""
         result = self._call("list_points", str(limit))
@@ -525,6 +543,14 @@ class LocalMnemoClient:
 
     def delete_point(self, cp_id: str) -> bool:
         return self._engine.delete_point(cp_id)
+
+    def update_point(self, cp_id: str, entity: str = None, value: str = None,
+                     connects_to: str = None, reason: str = None,
+                     weight: float = None, category: str = None,
+                     point_type: str = None) -> Optional[Dict]:
+        return self._engine.update_point(
+            cp_id, entity=entity, value=value, connects_to=connects_to,
+            reason=reason, weight=weight, category=category, point_type=point_type)
 
     def list_points(self, limit: int = 200) -> List[Dict]:
         return self._engine.list_points(limit=limit)
@@ -780,6 +806,10 @@ class ResilientMnemoClient:
         return self._call("get_point", cp_id)
     def delete_point(self, cp_id):
         return self._call("delete_point", cp_id)
+    def update_point(self, cp_id, entity=None, value=None, connects_to=None,
+                     reason=None, weight=None, category=None, point_type=None):
+        return self._call("update_point", cp_id, entity, value, connects_to,
+                          reason, weight, category, point_type)
     def list_points(self, limit=200):
         return self._call("list_points", limit)
 
