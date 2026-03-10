@@ -1,13 +1,10 @@
 """
-4o with Memory v6.7 — Dual-Processor Creative Writing Engine
+4o with Memory v6.8 — Dual-Processor Creative Writing Engine
 
-v6.7 changes:
-- FIX: Removed repetition_penalty and max_tokens for better long-form generation.
-- FIX: Context-aware Graph Search for continuations (appends recent story context).
-- FIX: Added "Slow-Burn" Pacing Mandate to force 4o to write long, immersive scenes.
-- FIX: Brute-force regex stripping of trailing <signal> hallucination tags.
-
-Prior fixes: Auto-Threading, Auto-Knotting, Thread/Knot Retrieval, Vectorized Search.
+v6.8 changes:
+- FIX: Restored strict categorization mapping to K2 extraction prompts (stops "FACT" fallback).
+- FIX: Formatted LoopManager text as ConnectionPoints before caching (stops blob caching).
+- FIX: Fixed string matching for Threads & Knots so multi-word names match correctly (UI icons restored).
 """
 
 import streamlit as st
@@ -53,7 +50,6 @@ MNEMO_URL = "https://athelaperk-mnemo.hf.space"
 WRITING_MODEL_ID = "openai/gpt-4o-2024-11-20"
 MEMORY_MODEL_ID = "moonshotai/kimi-k2"
 
-# v6.7 FIX: Removed repetition_penalty and max_tokens
 WRITING_PARAMS = {
     "temperature": 0.85,
     "frequency_penalty": 0.2,
@@ -397,7 +393,7 @@ def copy_response_dialog(content):
         st.rerun()
 
 # ============================================================================
-# FILE PROCESSING & K2 AUTO-EXTRACTION (v6.6 Relational JSON)
+# FILE PROCESSING & K2 AUTO-EXTRACTION (v6.8 Relational JSON)
 # ============================================================================
 
 def extract_text_from_file(uploaded_file):
@@ -444,7 +440,7 @@ CONTENT:
 {chunk}
 
 METHOD:
-1. Extract individual facts as "memories" by asking WHO, WHAT, WHOM, WHY, WHERE, WHEN, HOW.
+1. Extract individual facts as "memories". Classify the "category" strictly as one of: CHARACTER, PLOT, RELATIONSHIP (must have connects_to), SETTING, TONE, CLARIFICATION, FACT.
 2. If multiple memories form a narrative arc or sequence, group them into a "thread".
 3. If storylines collide or tone shifts drastically, create a "knot".
 
@@ -455,7 +451,7 @@ CRITICAL ENTITY NAMING RULES:
 ENTRY FORMAT:
 {{
   "memories": [
-    {{"local_id": "m1", "entity": "Name", "category": "CATEGORY", "content": "1-3 sentence answer"}}
+    {{"local_id": "m1", "entity": "Name", "category": "CHARACTER", "content": "1-3 sentence answer"}}
   ],
   "threads": [
     {{"name": "Captivity Arc", "entity": "Sebastian", "type": "plot_line", "memory_local_ids": ["m1"]}}
@@ -550,7 +546,7 @@ CONVERSATION:
 {conversation}
 
 METHOD:
-1. Extract individual facts as "memories" by asking WHO, WHAT, WHOM, WHY, WHERE, WHEN, HOW.
+1. Extract individual facts as "memories". Classify the "category" strictly as one of: CHARACTER, PLOT, RELATIONSHIP (must have connects_to), SETTING, TONE, CLARIFICATION, FACT.
 2. If multiple memories form a narrative arc or sequence, group them into a "thread".
 3. If storylines collide or tone shifts drastically, create a "knot".
 
@@ -561,7 +557,7 @@ CRITICAL ENTITY NAMING RULES:
 ENTRY FORMAT:
 {
   "memories": [
-    {"local_id": "m1", "entity": "Name", "category": "CATEGORY", "content": "1-3 sentence answer"}
+    {"local_id": "m1", "entity": "Name", "category": "PLOT", "content": "1-3 sentence answer"}
   ],
   "threads": [
     {"name": "Captivity Arc", "entity": "Sebastian", "type": "plot_line", "memory_local_ids": ["m1"]}
@@ -682,16 +678,25 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
             isolate = st.session_state.get("isolate_sessions", False)
             active_sessions = [current_session_id] if isolate and current_session_id else None
 
-            # THREAD RETRIEVAL
+            # =====================================================================
+            # FIX: ROBUST STRING MATCHING FOR THREADS & KNOTS
+            # Now matches exact names anywhere in the prompt string, fixing the UI.
+            # =====================================================================
+            query_words = set(re.sub(r'[^\w\s]', '', prompt_lower).split())
+            
             try:
                 active_threads = mnemo_client.get_active_threads()
                 if active_threads:
-                    query_words = set(re.sub(r'[^\w\s]', '', prompt_lower).split())
                     matched_threads = []
                     for t in active_threads:
-                        t_name_words = set(t.get("name", "").lower().split())
+                        t_name = t.get("name", "").lower()
+                        t_name_words = set(t_name.split())
                         t_entity = t.get("entity", "").lower()
-                        if t_entity in query_words or any(w in query_words for w in t_name_words if len(w) > 3):
+                        
+                        # Match if the exact name or entity is in the prompt, or words heavily overlap
+                        if (t_entity and t_entity in prompt_lower) or \
+                           (t_name and t_name in prompt_lower) or \
+                           any(w in query_words for w in t_name_words if len(w) > 3):
                             matched_threads.append(t)
                     
                     if matched_threads:
@@ -722,11 +727,14 @@ def build_memory_context(prompt, mnemo_client, cross_session_enabled, use_loops,
                 all_knots = mnemo_client.list_knots()
                 if all_knots:
                     matched_knots = []
-                    query_words = set(re.sub(r'[^\w\s]', '', prompt_lower).split())
                     for k in all_knots:
-                        k_name_words = set(k.get("name", "").lower().split())
-                        k_reason_words = set(k.get("reason", "").lower().split())
-                        if any(w in query_words for w in k_name_words if len(w) > 3) or \
+                        k_name = k.get("name", "").lower()
+                        k_reason = k.get("reason", "").lower()
+                        k_name_words = set(k_name.split())
+                        k_reason_words = set(k_reason.split())
+                        
+                        if (k_name and k_name in prompt_lower) or \
+                           any(w in query_words for w in k_name_words if len(w) > 3) or \
                            any(w in query_words for w in k_reason_words if len(w) > 4):
                             matched_knots.append(k.get("id"))
                             
@@ -801,11 +809,6 @@ def handle_message(prompt, openrouter_key, mnemo_client):
     )
     needs_memory = gate.should_retrieve
 
-    # ==============================================================
-    # FIX: CONTEXT-AWARE SEARCH FOR CONTINUATIONS
-    # If the user just says "continue", append the last paragraph 
-    # of the story so the Graph Search can extract Character names!
-    # ==============================================================
     search_query = prompt
     if gate.query_type.value == "continuation" and len(st.session_state.messages) > 0:
         last_ai_msg = st.session_state.messages[-1].get("content", "")
@@ -833,10 +836,6 @@ def handle_message(prompt, openrouter_key, mnemo_client):
 
     full_system_prompt = SYSTEM_PROMPT + past_conversation_context
 
-    # ==============================================================
-    # FIX: THE SLOW-BURN MANDATE
-    # Forces 4o to stop summarizing and expand deeply on writing tasks
-    # ==============================================================
     if gate.query_type.value in ["creative", "continuation"]:
         full_system_prompt += "\n\n" + get_signal_instruction()
         full_system_prompt += (
@@ -883,10 +882,6 @@ def handle_message(prompt, openrouter_key, mnemo_client):
 
     clean_response, signals = parse_signals_from_response(response)
     
-    # ==============================================================
-    # FIX: BRUTE-FORCE SIGNAL STRIPPING
-    # Obliterates any bleeding <signal> or <abstract> tags 
-    # ==============================================================
     clean_response = re.sub(r'<signal.*?>.*?(</signal>)?', '', clean_response, flags=re.IGNORECASE | re.DOTALL)
     clean_response = re.sub(r'["\']?\s*<signal.*', '', clean_response, flags=re.IGNORECASE | re.DOTALL)
     clean_response = re.sub(r'<abstract.*', '', clean_response, flags=re.IGNORECASE | re.DOTALL)
@@ -952,11 +947,26 @@ def handle_message(prompt, openrouter_key, mnemo_client):
                         if cp_id:
                             extracted += 1
                             local_to_real_cp[mem["local_id"]] = cp_id
-                            st.session_state.loop_manager.add_to_loop(content=mem.get("content", ""), category=mem.get("category", "FACT").lower(), session_id=current_session_id, memory_id=cp_id)
+                            
+                            # ==============================================================
+                            # FIX: FORMAT LOOP MANAGER CACHE AS CONNECTION POINTS
+                            # ==============================================================
+                            cat_upper = mem.get("category", "FACT").upper()
+                            ent = mem.get("entity", "Story")
+                            conn = mem.get("connects_to", "")
+                            val = mem.get("content", "")
+                            
+                            if conn:
+                                loop_content = f"[{cat_upper}] {ent} → {conn}: {val}"
+                            elif ent and ent != "Story":
+                                loop_content = f"[{cat_upper}] {ent}: {val}"
+                            else:
+                                loop_content = f"[{cat_upper}] {val}"
+                                
+                            st.session_state.loop_manager.add_to_loop(content=loop_content, category=cat_upper.lower(), session_id=current_session_id, memory_id=cp_id)
                     except Exception:
                         pass
                         
-            # Create Threads from extraction
             thread_name_to_id = {}
             for th in threads_data:
                 t_name = th.get("name", "")
@@ -966,7 +976,6 @@ def handle_message(prompt, openrouter_key, mnemo_client):
                 cp_ids = [local_to_real_cp[m_id] for m_id in th.get("memory_local_ids", []) if m_id in local_to_real_cp]
                 mnemo_client.add_thread(thread_id=t_id, name=t_name, entity=th.get("entity", ""), thread_type=th.get("type", "plot_line"), session_id=current_session_id, point_ids=cp_ids)
                 
-            # Create Knots from extraction
             for kn in knots_data:
                 k_name = kn.get("name", "")
                 if not k_name: continue
@@ -1147,8 +1156,18 @@ def render_memory_management(mnemo_client):
                                     session_id=current_session, source="manual")
                 if cp_id:
                     st.success(f"✅ Saved [{memory_category}] for {memory_entity}")
+                    
+                    # FIX: Format manual memories correctly before caching
+                    cat = memory_category.upper()
+                    ent = memory_entity.strip() or "Story"
+                    val = memory_content.strip()
+                    if ent and ent != "Story":
+                        loop_content = f"[{cat}] {ent}: {val}"
+                    else:
+                        loop_content = f"[{cat}] {val}"
+                        
                     st.session_state.loop_manager.add_to_loop(
-                        content=memory_content, category=memory_category.lower(),
+                        content=loop_content, category=memory_category.lower(),
                         session_id=current_session, memory_id=cp_id)
                 else:
                     st.error("Failed to save")
@@ -1284,7 +1303,20 @@ def render_file_upload(mnemo_client, openrouter_key):
                                     if cp_id:
                                         stored += 1
                                         local_to_real_cp[mem["local_id"]] = cp_id
-                                        st.session_state.loop_manager.add_to_loop(content=mem.get("content", ""), category=mem.get("category", "FACT").lower(), session_id=current_session, memory_id=cp_id)
+                                        
+                                        # FIX: Format before sending to fast cache
+                                        cat_upper = mem.get("category", "FACT").upper()
+                                        ent = mem.get("entity", "Story")
+                                        conn = mem.get("connects_to", "")
+                                        val = mem.get("content", "")
+                                        if conn:
+                                            loop_content = f"[{cat_upper}] {ent} → {conn}: {val}"
+                                        elif ent and ent != "Story":
+                                            loop_content = f"[{cat_upper}] {ent}: {val}"
+                                        else:
+                                            loop_content = f"[{cat_upper}] {val}"
+                                            
+                                        st.session_state.loop_manager.add_to_loop(content=loop_content, category=cat_upper.lower(), session_id=current_session, memory_id=cp_id)
                                 except Exception:
                                     pass
                                     
@@ -1477,7 +1509,7 @@ def main():
         <div class="brand-icon">🧠</div>
         <div class="brand-text">
             <h1>4o with Memory</h1>
-            <p>GPT-4o writer · K2 memory curator · Mnemo v6.7</p>
+            <p>GPT-4o writer · K2 memory curator · Mnemo v6.8</p>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1560,7 +1592,7 @@ def main():
 
     st.markdown(f"""
     <div class="status-bar">
-        4o with Memory v6.7 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Threads & Knots &nbsp;·&nbsp; Graph Search
+        4o with Memory v6.8 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Threads & Knots &nbsp;·&nbsp; Graph Search
     </div>
     """, unsafe_allow_html=True)
 
