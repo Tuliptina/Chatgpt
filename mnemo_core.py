@@ -1037,6 +1037,10 @@ class MnemoEngine:
             """, (cp_id, entity, point_type, value, connects_to, reason, weight,
                   category, session_id, source, thread_id, position, namespace,
                   time.time(), emb_blob))
+          if thread_id:
+                conn.execute(
+                    "INSERT OR REPLACE INTO thread_points (thread_id, cp_id, position) VALUES (?, ?, ?)",
+                    (thread_id, cp_id, position))
 
         # Update FAISS
         self._cp_faiss.add(cp_id, embedding)
