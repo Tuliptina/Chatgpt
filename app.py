@@ -1,10 +1,13 @@
 """
-4o with Memory v6.6 — Dual-Processor Creative Writing Engine
+4o with Memory v6.7 — Dual-Processor Creative Writing Engine
 
-v6.6 changes:
-- FEATURE: Auto-Threading & Auto-Knotting! K2 now structures its extractions
-  into Relational JSON, automatically building Threads and Knots in the background.
-- Prior fixes: Entity normalization, Thread/Knot Retrieval, Vectorized Graph Search.
+v6.7 changes:
+- FIX: Removed repetition_penalty and max_tokens for better long-form generation.
+- FIX: Context-aware Graph Search for continuations (appends recent story context).
+- FIX: Added "Slow-Burn" Pacing Mandate to force 4o to write long, immersive scenes.
+- FIX: Brute-force regex stripping of trailing <signal> hallucination tags.
+
+Prior fixes: Auto-Threading, Auto-Knotting, Thread/Knot Retrieval, Vectorized Search.
 """
 
 import streamlit as st
@@ -50,9 +53,9 @@ MNEMO_URL = "https://athelaperk-mnemo.hf.space"
 WRITING_MODEL_ID = "openai/gpt-4o-2024-11-20"
 MEMORY_MODEL_ID = "moonshotai/kimi-k2"
 
+# v6.7 FIX: Removed repetition_penalty and max_tokens
 WRITING_PARAMS = {
-    "temperature": 1.0,
-    "repetition_penalty": 1.1,
+    "temperature": 0.85,
     "frequency_penalty": 0.2,
     "presence_penalty": 0.3,
 }
@@ -206,27 +209,35 @@ def auto_convert_blobs(mnemo_client):
 SYSTEM_PROMPT = """You are a sharp, well-read creative collaborator with genuine enthusiasm for storytelling craft. You have three modes — detect which one the user needs and switch seamlessly.
 
 MODE 1 — CONVERSATION (chatting about the project, brainstorming, planning):
-- You're the kind of collaborator writers actually enjoy working with.
-- Have real opinions. Pitch better ideas if a plot is predictable.
-- Reference stored characters and plot points naturally.
-- CRITICAL — know the difference between RECALLING and CREATING. Do not present invented details as established canon.
+- You're the kind of collaborator writers actually enjoy working with — curious, opinionated about craft, and genuinely invested in their story.
+- Have real opinions. If a plot idea is predictable, say so with charm, then pitch something better. If a character detail is brilliant, get excited about it.
+- Be witty when the moment allows, but never at the expense of the work.
+- Ask questions that show you're thinking ahead.
+- Use casual, intelligent language. You're a peer, not a tutor. Skip the preambles.
+- Reference their stored characters and plot points naturally.
+- CRITICAL — know the difference between RECALLING and CREATING.
 
 MODE 2 — RECALL & RETRIEVAL (user asks to recall, list, summarize):
 - Give clean, factual answers drawn ONLY from your memory context.
-- Do NOT embellish or fill gaps with imagination.
+- Use EXACT details from memory — do NOT embellish, infer, or fill gaps with imagination.
 
 MODE 3 — CREATIVE WRITING (scenes, chapters, dialogue, prose):
-- Your personality DISAPPEARS. You are the story.
-- Match the tonal register from the [TONE DIRECTIVE] in your context.
-- Deep psychological complexity in characters. Setting-accurate language.
+- Your personality DISAPPEARS. You are not "witty" — you are the story.
+- Match the tonal register from the [TONE DIRECTIVE] in your context. Dark stays dark. Humor cuts. Tension holds.
+- Deep psychological complexity in characters.
+- Setting-accurate language for the project's period/genre.
 - Show don't tell. Sensory detail. Subtext in dialogue.
-- NEVER soften emotional edges. DO NOT resolve tension prematurely.
+- Default to third person past tense unless user or memory specifies otherwise.
+- Match the user's writing voice if VOICE/PROSE_SAMPLE memories exist.
+- NEVER soften emotional edges.
+- DO NOT resolve tension prematurely. DO NOT add reassuring internal monologue unless the brief says to.
 
-PROSE RHYTHM:
-- Vary sentence length deliberately. Follow a long sentence with a short one. Then a fragment.
-- Do NOT write in choppy, staccato bursts.
-- Paragraphs should BREATHE. Mix action beats, interiority, and dialogue.
-- Let scenes have rhythm: tension builds in longer sentences, snaps in short ones."""
+PROSE RHYTHM — this is critical:
+- Vary sentence length deliberately. Follow a long, winding sentence with a short one. Then a fragment. Then build again.
+- Do NOT write in choppy, staccato bursts — that reads like a screenplay, not a novel.
+- Do NOT write in dense, breathless paragraphs with no white space — that exhausts the reader.
+- Paragraphs should BREATHE. Mix action beats, sensory detail, interiority, and dialogue across paragraphs.
+- Let scenes have rhythm: tension builds in longer sentences, snaps in short ones. Quiet moments drift. Shock is blunt."""
 
 # ============================================================================
 # INITIALIZATION & SESSION MANAGEMENT
@@ -252,9 +263,9 @@ def get_session_title(messages):
     for msg in messages:
         if msg["role"] == "user":
             content = msg["content"].strip()
-            prefixes = ["can you", "could you", "please", "help me", "i want to", "i need to", "let's"]
+            prefixes_to_remove = ["can you", "could you", "please", "help me", "i want to", "i need to", "let's"]
             content_lower = content.lower()
-            for prefix in prefixes:
+            for prefix in prefixes_to_remove:
                 if content_lower.startswith(prefix):
                     content = content[len(prefix):].strip()
                     break
@@ -262,7 +273,10 @@ def get_session_title(messages):
                 content = content[0].upper() + content[1:] if len(content) > 1 else content.upper()
             if len(content) > 40:
                 last_space = content[:40].rfind(' ')
-                content = content[:last_space] + "..." if last_space > 20 else content[:40] + "..."
+                if last_space > 20:
+                    content = content[:last_space] + "..."
+                else:
+                    content = content[:40] + "..."
             return content if content else "New Chat"
     return "New Chat"
 
@@ -787,6 +801,16 @@ def handle_message(prompt, openrouter_key, mnemo_client):
     )
     needs_memory = gate.should_retrieve
 
+    # ==============================================================
+    # FIX: CONTEXT-AWARE SEARCH FOR CONTINUATIONS
+    # If the user just says "continue", append the last paragraph 
+    # of the story so the Graph Search can extract Character names!
+    # ==============================================================
+    search_query = prompt
+    if gate.query_type.value == "continuation" and len(st.session_state.messages) > 0:
+        last_ai_msg = st.session_state.messages[-1].get("content", "")
+        search_query = f"{prompt}. Context: {last_ai_msg[-500:]}"
+
     past_conversation_context = ""
     skip_loops_for_this_query = False
     sessions_found = 0
@@ -794,7 +818,7 @@ def handle_message(prompt, openrouter_key, mnemo_client):
     if needs_memory and cross_session_enabled:
         try:
             past_conversation_context, ctx_meta, skip_loops_for_this_query = build_memory_context(
-                prompt, mnemo_client,
+                search_query, mnemo_client,
                 cross_session_enabled=cross_session_enabled,
                 use_loops=use_loops,
                 loop_manager=st.session_state.get("loop_manager"),
@@ -809,8 +833,18 @@ def handle_message(prompt, openrouter_key, mnemo_client):
 
     full_system_prompt = SYSTEM_PROMPT + past_conversation_context
 
-    if gate.query_type.value == "creative":
+    # ==============================================================
+    # FIX: THE SLOW-BURN MANDATE
+    # Forces 4o to stop summarizing and expand deeply on writing tasks
+    # ==============================================================
+    if gate.query_type.value in ["creative", "continuation"]:
         full_system_prompt += "\n\n" + get_signal_instruction()
+        full_system_prompt += (
+            "\n\nCRITICAL PACING MANDATE: You are writing a book, not a summary. "
+            "You MUST write a long, fully fleshed-out scene. DO NOT rush to the conclusion. "
+            "Take your time expanding on micro-actions, sensory details, atmospheric tension, "
+            "and internal monologue. Every line of dialogue must breathe. Make the output as lengthy and immersive as possible."
+        )
 
     cached_brief = None
     if "prefetch_engine" in st.session_state and "signal_processor" in st.session_state:
@@ -848,6 +882,15 @@ def handle_message(prompt, openrouter_key, mnemo_client):
         return None, error, {}
 
     clean_response, signals = parse_signals_from_response(response)
+    
+    # ==============================================================
+    # FIX: BRUTE-FORCE SIGNAL STRIPPING
+    # Obliterates any bleeding <signal> or <abstract> tags 
+    # ==============================================================
+    clean_response = re.sub(r'<signal.*?>.*?(</signal>)?', '', clean_response, flags=re.IGNORECASE | re.DOTALL)
+    clean_response = re.sub(r'["\']?\s*<signal.*', '', clean_response, flags=re.IGNORECASE | re.DOTALL)
+    clean_response = re.sub(r'<abstract.*', '', clean_response, flags=re.IGNORECASE | re.DOTALL)
+    clean_response = clean_response.strip()
     
     if signals and "signal_processor" in st.session_state:
         st.session_state.signal_processor.process(
@@ -1434,7 +1477,7 @@ def main():
         <div class="brand-icon">🧠</div>
         <div class="brand-text">
             <h1>4o with Memory</h1>
-            <p>GPT-4o writer · K2 memory curator · Mnemo v6.6</p>
+            <p>GPT-4o writer · K2 memory curator · Mnemo v6.7</p>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1517,7 +1560,7 @@ def main():
 
     st.markdown(f"""
     <div class="status-bar">
-        4o with Memory v6.6 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Threads & Knots &nbsp;·&nbsp; Graph Search
+        4o with Memory v6.7 &nbsp;·&nbsp; GPT-4o + K2 + Mnemo &nbsp;·&nbsp; Threads & Knots &nbsp;·&nbsp; Graph Search
     </div>
     """, unsafe_allow_html=True)
 
