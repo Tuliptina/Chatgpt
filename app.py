@@ -1,10 +1,10 @@
 """
-4o with Memory v7.1 — Dual-Processor Creative Writing Engine
+4o with Memory v7.1.1 — Dual-Processor Creative Writing Engine
 
-v7.1 changes:
+v7.1.1 changes:
+- FIX: Memory Editor now correctly uses the update_point API endpoint
+  instead of the legacy Delete+Re-Insert hack.
 - NEW: Integrated Memory Editor directly into app.py. No external dependencies.
-- NEW: Inline editing for ConnectionPoints with dynamic ID re-hashing (Delete + Insert).
-- NEW: Auto-syncs manual edits to the fast-cache Loop Manager.
 - OPTIMIZED: Removed Thread/Knot synthesis from real-time chat extraction. 
   Chat extraction is now purely for atomic facts (faster, cheaper), leaving 
   structural narrative generation to the asynchronous Consolidation pass.
@@ -1198,7 +1198,6 @@ def handle_message(prompt, openrouter_key, mnemo_client):
         if memories:
             msg_cost += extract_cost
             
-            # v7.1.1: Pruned Thread and Knot extraction loop logic from here
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                 futures = {}
                 for mem in memories:
@@ -1387,32 +1386,33 @@ def _save_changes(mnemo_client, original_cp: dict, entity: str, value: str,
                   connects_to: str, reason: str, weight: float, category: str, key: str):
     cp_id = original_cp.get("id", "")
 
-    if (entity == original_cp.get("entity", "") and
-        value == original_cp.get("value", "") and
-        connects_to == original_cp.get("connects_to", "") and
-        reason == original_cp.get("reason", "") and
-        abs(weight - float(original_cp.get("weight", 0.5))) < 0.01 and
-        category == original_cp.get("category", "fact").lower()):
+    # Only send fields that actually changed
+    kwargs = {}
+    if entity != original_cp.get("entity", ""):
+        kwargs["entity"] = entity
+    if value != original_cp.get("value", ""):
+        kwargs["value"] = value
+    if connects_to != original_cp.get("connects_to", ""):
+        kwargs["connects_to"] = connects_to
+    if reason != original_cp.get("reason", ""):
+        kwargs["reason"] = reason
+    if abs(weight - float(original_cp.get("weight", 0.5))) > 0.01:
+        kwargs["weight"] = weight
+    if category.lower() != original_cp.get("category", "fact").lower():
+        kwargs["category"] = category.lower()
+
+    if not kwargs:
         st.info("No changes to save.")
         return
 
     try:
-        mnemo_client.delete_point(cp_id)
-        new_id = mnemo_client.add_point(
-            entity=entity,
-            point_type=original_cp.get("point_type", "fact"),
-            value=value,
-            connects_to=connects_to,
-            reason=reason,
-            weight=weight,
-            category=category.upper(),
-            source="manual_correction",
-            session_id=original_cp.get("session_id", ""),
-            thread_id=original_cp.get("thread_id", ""),
-            position=original_cp.get("position", -1)
-        )
-        if new_id:
-            st.success("Saved successfully!")
+        # V7.1.1: Uses the new clean update_point API
+        result = mnemo_client.update_point(cp_id, **kwargs)
+        if result and "error" not in result:
+            changed_fields = ", ".join(kwargs.keys())
+            st.success(f"Saved! Updated: {changed_fields}")
+            
+            # Sync the new values into the fast-cache loop manager
             cat_upper = category.upper()
             ent = entity.strip() or "Story"
             val = value.strip()
@@ -1425,7 +1425,7 @@ def _save_changes(mnemo_client, original_cp: dict, entity: str, value: str,
                 
             st.session_state.loop_manager.add_to_loop(
                 content=loop_content, category=category.lower(),
-                session_id=original_cp.get("session_id", ""), memory_id=new_id)
+                session_id=original_cp.get("session_id", ""), memory_id=cp_id)
         else:
             st.error("Failed to save changes.")
     except Exception as e:
@@ -1453,7 +1453,7 @@ def _render_add_new(mnemo_client, key_prefix: str):
                     cp_id = mnemo_client.add_point(
                         entity=entity, point_type="fact", value=value,
                         connects_to=connects_to, reason=reason,
-                        weight=weight, category=category.upper(), source="manual",
+                        weight=weight, category=category.lower(), source="manual",
                     )
                     if cp_id:
                         st.success(f"Added: {cp_id}")
