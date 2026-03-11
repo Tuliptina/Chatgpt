@@ -1844,9 +1844,11 @@ def render_chat(openrouter_key, mnemo_client):
 def main():
     st.set_page_config(page_title="4o with Memory", page_icon="🧠", layout="wide", initial_sidebar_state="expanded")
 
+    # 1. RENDER CSS AND HEADER IMMEDIATELY
+    # This prevents the mobile browser from timing out on a white screen
     st.markdown("""
     <style>
-    @import url('[https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap](https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap)');
+    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap');
     .stApp { font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif; }
     .stApp > header { background: transparent !important; }
     #MainMenu, footer, .stDeployButton { display: none !important; }
@@ -1903,61 +1905,62 @@ def main():
         """)
         st.stop()
 
-    mnemo_client = init_client(DEFAULT_HF_KEY)
+    # 2. LAZY LOAD THE HEAVY BACKEND
+    # This shows a spinner while the database downloads and PyTorch initializes
+    if "app_initialized" not in st.session_state:
+        with st.spinner("⏳ Waking up the Memory Engine (syncing DB & indexing)..."):
+            mnemo_client = init_client(DEFAULT_HF_KEY)
+            st.session_state.mnemo_client = mnemo_client
 
-    if "blobs_auto_converted" not in st.session_state:
-        st.session_state.blobs_auto_converted = True
-        try:
-            converted = auto_convert_blobs(mnemo_client)
-            if converted > 0:
-                st.toast(f"🔄 Auto-migrated {converted} legacy memories → ConnectionPoints")
-        except Exception as e:
-            print(f"[WARN] auto_convert_blobs: {type(e).__name__}: {e}")
+            # Auto-migrate legacy blobs
+            if "blobs_auto_converted" not in st.session_state:
+                st.session_state.blobs_auto_converted = True
+                try:
+                    converted = auto_convert_blobs(mnemo_client)
+                    if converted > 0:
+                        st.toast(f"🔄 Auto-migrated {converted} legacy memories → ConnectionPoints")
+                except Exception as e:
+                    print(f"[WARN] auto_convert_blobs: {type(e).__name__}: {e}")
 
-    if "session_history_loaded" not in st.session_state:
-        st.session_state.session_history_loaded = True
-        st.session_state.session_history = []
-        try:
-            storage = get_persistent_storage(DEFAULT_HF_KEY, mnemo_client)
-            if storage:
-                sessions = storage.load_sessions(limit=MAX_SESSIONS_STORED)
-                if sessions:
-                    st.session_state.session_history = sessions
-                if hasattr(storage, 'load_folder_state'):
-                    st.session_state.session_folders = storage.load_folder_state()
-        except Exception as e:
-            print(f"[WARN] session history load: {type(e).__name__}: {e}")
+            # Load Session History
+            st.session_state.session_history_loaded = True
+            st.session_state.session_history = []
+            try:
+                storage = get_persistent_storage(DEFAULT_HF_KEY, mnemo_client)
+                if storage:
+                    sessions = storage.load_sessions(limit=MAX_SESSIONS_STORED)
+                    if sessions:
+                        st.session_state.session_history = sessions
+                    if hasattr(storage, 'load_folder_state'):
+                        st.session_state.session_folders = storage.load_folder_state()
+            except Exception as e:
+                print(f"[WARN] session history load: {type(e).__name__}: {e}")
 
-    if "current_session_id" not in st.session_state:
-        st.session_state.current_session_id = generate_session_id()
-    if "custom_titles" not in st.session_state:
-        st.session_state.custom_titles = {}
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+            # Setup state defaults
+            st.session_state.current_session_id = generate_session_id()
+            st.session_state.custom_titles = {}
+            st.session_state.messages = []
 
-    if "loop_manager" not in st.session_state:
-        st.session_state.loop_manager = LoopManager(mnemo_client=mnemo_client, openrouter_key=DEFAULT_OPENROUTER_KEY)
-        st.session_state.loop_manager.load_from_mnemo(use_smart_extraction=False)
-    if "smart_memory" not in st.session_state:
-        st.session_state.smart_memory = SmartMemory()
-    if "context_engine" not in st.session_state:
-        st.session_state.context_engine = ContextEngine(mnemo_client=mnemo_client, openrouter_key=DEFAULT_OPENROUTER_KEY)
-    
-    if "context_manager" not in st.session_state:
-        st.session_state.context_manager = ContextWindowManager(loop_manager=st.session_state.loop_manager)
-    else:
-        st.session_state.context_manager.set_loop_manager(st.session_state.loop_manager)
-        
-    if "signal_processor" not in st.session_state:
-        st.session_state.signal_processor = SignalProcessor()
-        try:
-            st.session_state.signal_processor.update_threads_from_server(mnemo_client)
-        except Exception as e:
-            print(f"[WARN] signal processor init: {type(e).__name__}: {e}")
+            # Initialize Brain Engines
+            st.session_state.loop_manager = LoopManager(mnemo_client=mnemo_client, openrouter_key=DEFAULT_OPENROUTER_KEY)
+            st.session_state.loop_manager.load_from_mnemo(use_smart_extraction=False)
+            st.session_state.smart_memory = SmartMemory()
+            st.session_state.context_engine = ContextEngine(mnemo_client=mnemo_client, openrouter_key=DEFAULT_OPENROUTER_KEY)
+            st.session_state.context_manager = ContextWindowManager(loop_manager=st.session_state.loop_manager)
             
-    if "prefetch_engine" not in st.session_state:
-        st.session_state.prefetch_engine = PrefetchEngine()
+            st.session_state.signal_processor = SignalProcessor()
+            try:
+                st.session_state.signal_processor.update_threads_from_server(mnemo_client)
+            except Exception as e:
+                print(f"[WARN] signal processor init: {type(e).__name__}: {e}")
+                
+            st.session_state.prefetch_engine = PrefetchEngine()
 
+            # Mark as initialized so this only runs once per user session
+            st.session_state.app_initialized = True
+
+    # 3. RENDER THE REST OF THE UI
+    mnemo_client = st.session_state.mnemo_client
     openrouter_key, hf_key = render_sidebar(mnemo_client, DEFAULT_OPENROUTER_KEY, DEFAULT_HF_KEY)
 
     if mnemo_client.token != hf_key:
