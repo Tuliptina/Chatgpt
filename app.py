@@ -1191,9 +1191,42 @@ def handle_message(prompt, openrouter_key, mnemo_client):
     if (st.session_state.get("auto_extract", True)
             and cross_session_enabled
             and not skip_loops_for_this_query):
+        
+        # --- REPLACE THE EXTRACTION BLOCK WITH THIS ---
+        def background_extraction_task(convo, skey, sid, client, lm):
+            try:
+                ex_data, _ = extract_memories_with_gpt(convo, skey)
+                mems = ex_data.get("memories", [])
+                if not mems: return
+                
+                for mem in mems:
+                    cat = mem.get("category", "FACT").upper()
+                    txt = mem.get("content", "")
+                    ent = mem.get("entity", "Story")
+                    conn = mem.get("connects_to", "")
+                    if txt:
+                        # 1. Save to SQLite/FAISS
+                        cp_id = store_as_cp(client, entity=ent, category=cat, content=txt, session_id=sid, source="auto_extract", connects_to=conn)
+                        
+                        # 2. Update fast cache
+                        if cp_id:
+                            if conn: loop_content = f"[{cat}] {ent} → {conn}: {txt}"
+                            elif ent and ent != "Story": loop_content = f"[{cat}] {ent}: {txt}"
+                            else: loop_content = f"[{cat}] {txt}"
+                            lm.add_to_loop(content=loop_content, category=cat.lower(), session_id=sid, memory_id=cp_id)
+            except Exception as e:
+                print(f"Background extraction failed: {e}")
+
         conversation = f"User: {prompt}\n\nAssistant: {response}"
-        extraction_data, extract_cost = extract_memories_with_gpt(conversation, openrouter_key)
-        memories = extraction_data.get("memories", [])
+        
+        # Spin up a background thread so the UI doesn't have to wait!
+        import threading
+        bg_thread = threading.Thread(
+            target=background_extraction_task, 
+            args=(conversation, openrouter_key, current_session_id, mnemo_client, st.session_state.loop_manager)
+        )
+        bg_thread.start()
+        # --- END REPLACEMENT ---
         
         if memories:
             msg_cost += extract_cost
