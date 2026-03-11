@@ -1249,21 +1249,30 @@ def handle_message(prompt, openrouter_key, mnemo_client):
 
 
 # ============================================================================
-# MEMORY EDITOR COMPONENT
+# MEMORY EDITOR COMPONENT (LAZY LOADED via Dialog)
 # ============================================================================
 
 EDITOR_CATEGORIES = ["character", "motivation", "plot", "setting", "timeline", "theme", "tone", "style", "fact", "clarification", "relationship"]
 
 def render_memory_management(mnemo_client, key_prefix: str = "memedit"):
-    st.markdown("### 🧠 Memory Editor")
+    """This renders in the sidebar. It is now just a lightweight button."""
+    if st.button("🛠️ Open Memory Editor", use_container_width=True, type="primary"):
+        memory_editor_dialog(mnemo_client, key_prefix)
 
-    col1, col2 = st.columns([3, 1])
+
+@st.dialog("🧠 Memory Editor", width="large")
+def memory_editor_dialog(mnemo_client, key_prefix: str):
+    """This ONLY executes and renders HTML when the user clicks the button."""
+    col1, col2, col3 = st.columns([5, 3, 2])
     with col1:
         search = st.text_input("Search memories", placeholder="Type to filter...",
                                 key=f"{key_prefix}_search", label_visibility="collapsed")
     with col2:
         cat_filter = st.selectbox("Category", ["All"] + EDITOR_CATEGORIES, key=f"{key_prefix}_cat_filter",
                                    label_visibility="collapsed")
+    with col3:
+        # Lazy Loading Pagination: Prevents mobile crash even when editor is open
+        max_display = st.selectbox("Show limit", [10, 30, 50, 100, 500], index=1, key=f"{key_prefix}_limit", label_visibility="collapsed")
 
     try:
         all_points = mnemo_client.list_points(limit=500)
@@ -1289,9 +1298,12 @@ def render_memory_management(mnemo_client, key_prefix: str = "memedit"):
     if cat_filter != "All":
         filtered = [cp for cp in filtered if cp.get("category", "").lower() == cat_filter.lower()]
 
-    st.caption(f"Showing {len(filtered)} of {len(all_points)} memories")
+    # Apply Pagination limit
+    display_points = filtered[:max_display]
+    
+    st.caption(f"Showing {len(display_points)} of {len(filtered)} matching memories (Total: {len(all_points)})")
 
-    for i, cp in enumerate(filtered):
+    for i, cp in enumerate(display_points):
         _render_cp_card(mnemo_client, cp, i, key_prefix)
 
     st.divider()
@@ -1301,10 +1313,10 @@ def render_memory_management(mnemo_client, key_prefix: str = "memedit"):
     if st.button("🧹 Clear ALL Memories", use_container_width=True):
         st.session_state.confirm_clear = True
     if st.session_state.get("confirm_clear"):
-        st.warning("⚠️ Delete ALL memories?")
+        st.warning("⚠️ Delete ALL memories? This cannot be undone.")
         ccol1, ccol2 = st.columns(2)
         with ccol1:
-            if st.button("Yes, delete all"):
+            if st.button("Yes, delete all", type="primary"):
                 mnemo_client.clear()
                 st.session_state.confirm_clear = False
                 st.rerun()
@@ -1312,6 +1324,7 @@ def render_memory_management(mnemo_client, key_prefix: str = "memedit"):
             if st.button("Cancel"):
                 st.session_state.confirm_clear = False
                 st.rerun()
+
 
 def _render_cp_card(mnemo_client, cp: dict, index: int, key_prefix: str):
     cp_id = cp.get("id", "")
@@ -1385,6 +1398,95 @@ def _render_edit_form(mnemo_client, cp: dict, index: int, key_prefix: str):
 def _save_changes(mnemo_client, original_cp: dict, entity: str, value: str,
                   connects_to: str, reason: str, weight: float, category: str, key: str):
     cp_id = original_cp.get("id", "")
+
+    # Only send fields that actually changed
+    kwargs = {}
+    if entity != original_cp.get("entity", ""):
+        kwargs["entity"] = entity
+    if value != original_cp.get("value", ""):
+        kwargs["value"] = value
+    if connects_to != original_cp.get("connects_to", ""):
+        kwargs["connects_to"] = connects_to
+    if reason != original_cp.get("reason", ""):
+        kwargs["reason"] = reason
+    if abs(weight - float(original_cp.get("weight", 0.5))) > 0.01:
+        kwargs["weight"] = weight
+    if category.lower() != original_cp.get("category", "fact").lower():
+        kwargs["category"] = category.lower()
+
+    if not kwargs:
+        st.info("No changes to save.")
+        return
+
+    try:
+        result = mnemo_client.update_point(cp_id, **kwargs)
+        if result and "error" not in result:
+            changed_fields = ", ".join(kwargs.keys())
+            st.success(f"Saved! Updated: {changed_fields}")
+            
+            cat_upper = category.upper()
+            ent = entity.strip() or "Story"
+            val = value.strip()
+            if connects_to:
+                loop_content = f"[{cat_upper}] {ent} → {connects_to}: {val}"
+            elif ent and ent != "Story":
+                loop_content = f"[{cat_upper}] {ent}: {val}"
+            else:
+                loop_content = f"[{cat_upper}] {val}"
+                
+            st.session_state.loop_manager.add_to_loop(
+                content=loop_content, category=category.lower(),
+                session_id=original_cp.get("session_id", ""), memory_id=cp_id)
+        else:
+            st.error("Failed to save changes.")
+    except Exception as e:
+        st.error(f"Save failed: {e}")
+
+def _render_add_new(mnemo_client, key_prefix: str):
+    k = f"{key_prefix}_new"
+    with st.expander("➕ Add new memory", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            entity = st.text_input("Entity", placeholder="e.g. Sebastian Carlisle", key=f"{k}_entity")
+            category = st.selectbox("Category", EDITOR_CATEGORIES, key=f"{k}_cat")
+        with col2:
+            connects_to = st.text_input("Connects to", placeholder="e.g. Alistair Fitzroy", key=f"{k}_conn")
+            weight = st.slider("Weight", 0.0, 1.0, 0.5, 0.05, key=f"{k}_weight")
+
+        value = st.text_area("Value", placeholder="What do you want to remember?", height=100, key=f"{k}_value")
+        reason = st.text_input("Reason (optional)", key=f"{k}_reason")
+
+        if st.button("Add Memory", key=f"{k}_add", type="primary"):
+            if not entity or not value:
+                st.warning("Entity and Value are required.")
+            else:
+                try:
+                    cp_id = mnemo_client.add_point(
+                        entity=entity, point_type="fact", value=value,
+                        connects_to=connects_to, reason=reason,
+                        weight=weight, category=category.lower(), source="manual",
+                    )
+                    if cp_id:
+                        st.success(f"Added: {cp_id}")
+                        
+                        cat_upper = category.upper()
+                        ent = entity.strip() or "Story"
+                        val = value.strip()
+                        if connects_to:
+                            loop_content = f"[{cat_upper}] {ent} → {connects_to}: {val}"
+                        elif ent and ent != "Story":
+                            loop_content = f"[{cat_upper}] {ent}: {val}"
+                        else:
+                            loop_content = f"[{cat_upper}] {val}"
+                            
+                        st.session_state.loop_manager.add_to_loop(
+                            content=loop_content, category=category.lower(),
+                            session_id=st.session_state.get("current_session_id", ""), memory_id=cp_id)
+                        st.rerun()
+                    else:
+                        st.error("Failed to add — may be a duplicate.")
+                except Exception as e:
+                    st.error(f"Add failed: {e}")
 
     # Only send fields that actually changed
     kwargs = {}
